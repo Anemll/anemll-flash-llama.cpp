@@ -14,6 +14,8 @@ Override that root with `FLASH_ROOT=/some/other/path` or set `SIDECAR_DIR` direc
 
 Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](../../docs/moe-bank-modeling-workflow.md)
 
+Detailed MiniMax M2.7 note: [`tools/flashmoe-sidecar/MINIMAX_M2.md`](./MINIMAX_M2.md)
+
 ## Model index
 
 Per-model extract + run recipes in this document:
@@ -23,6 +25,7 @@ Per-model extract + run recipes in this document:
 | Qwen3.5-35B-A3B | qwen3moe | [Extract](#extract-a-qwen35-sidecar) | [Run](#run-with-the-sidecar) |
 | Gemma4-26B-A4B | gemma4 | [Extract](#extract-a-gemma4-26b-a4b-sidecar) | [Run](#run-gemma4-26b-a4b-with-the-sidecar) |
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
+| MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 
 ## Current scope
@@ -71,6 +74,48 @@ PYTHON=python3 \
 ```
 
 The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
+
+## Export a MiniMax M2.7 Flash package
+
+MiniMax M2.7 (`minimax-m2` arch) currently uses a dense-package workflow in this fork:
+
+- routed experts are extracted into `sidecar/`
+- dense and shared tensors are exported into `model-dense.gguf`
+- package defaults are written to `flashmoe-package.json`
+
+Tested quantisations:
+
+| Quant | Shards | Dense GGUF | Routed sidecar |
+|-------|--------|-----------|----------------|
+| UD-IQ2_XXS | 3 | ~2.58 GiB | ~58.3 GiB |
+| UD-Q4_K_XL | 4 | (4-bit) | (4-bit routed) |
+
+Build the package in one step:
+
+```bash
+# UD-IQ2_XXS (2-bit)
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS/MiniMax-M2.7-UD-IQ2_XXS-00001-of-00003.gguf \
+  --out-dir ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  --force
+
+# UD-Q4_K_XL (4-bit)
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL/MiniMax-M2.7-UD-Q4_K_XL-00001-of-00004.gguf \
+  --out-dir /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  --force
+```
+
+Generic form:
+
+```bash
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model /path/to/MiniMax-M2.7-00001-of-00003.gguf \
+  --out-dir /path/to/MiniMax-M2.7-Flash \
+  --force
+```
+
+For more background and sizing notes, see [`MINIMAX_M2.md`](./MINIMAX_M2.md).
 
 ## Export a dense-only GGUF (experimental)
 
@@ -121,6 +166,87 @@ Run the compact dense GGUF with the same sidecar:
 ```
 
 Compared with the full GLM shard set, the compact dense GGUF is about 14 GiB on disk while routed expert bytes continue to come from the sidecar.
+
+## Run MiniMax M2.7 with Flash-MoE
+
+Important: MiniMax routed-expert width is controlled here by `--moe-topk`, or `MOE_TOPK=...` when using the wrapper. That is different from the sampler flag `--top-k`.
+
+MiniMax M2.7 natively routes to `8` of its 256 experts per layer. The router still scores all 256 experts every layer — `--moe-topk 4` simply keeps only the top 4 scoring experts instead of 8, cutting per-token expert I/O roughly in half for ~2× decode speedup with minor quality degradation. Use `MOE_TOPK=8` when you want full native routing fidelity.
+
+M5 Max, native MiniMax routing width:
+
+```bash
+MOE_TOPK=8 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st \
+  -n 128 \
+  -p "What is Apple Neural Engine? Answer in 3 sentences."
+```
+
+This path was smoke-tested locally on an M5 Max with:
+
+- `MOE_TOPK=8`
+- `MOE_SLOT_BANK=64`
+- `CTX=4096`
+- `BATCH=64`
+- `UBATCH=1`
+- `N_GPU_LAYERS=999`
+
+Lower-memory starting point for a 24 GB-class M5:
+
+```bash
+MOE_TOPK=8 \
+MOE_SLOT_BANK=32 \
+CTX=2048 \
+BATCH=32 \
+UBATCH=1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st \
+  -n 96 \
+  -p "Summarize Apple Neural Engine in 3 sentences."
+```
+
+Practical MiniMax memory notes for this exact `UD-IQ2_XXS-Flash` package:
+
+- `MOE_SLOT_BANK=64` reserves about `17.15 GiB` before context/runtime overhead
+- `MOE_SLOT_BANK=32` reserves about `9.87 GiB`
+- `MOE_SLOT_BANK=24` reserves about `8.04 GiB`
+- `MOE_SLOT_BANK=16` reserves about `6.22 GiB`
+
+If a smaller-memory system is tight, reduce in this order:
+
+- `MOE_SLOT_BANK` from `32` to `24`, then `16`
+- `CTX` from `2048` to `1024`
+- `BATCH` from `32` to `16`
+- `N_GPU_LAYERS=0` only as a last resort
+
+Reproducible comparison runs:
+
+- pin `LLAMA_BIN` so the wrapper uses the exact binary you want to compare
+- pin `SEED` and `TEMP`
+- keep prompt text and `-n` identical across runs
+- prefer `TEMP=0.2` over `TEMP=0` for long code prompts, because greedy decode can fall into repeats
+
+```bash
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=2 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=8 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
 
 ## Run GLM-5.1 with the sidecar
 
