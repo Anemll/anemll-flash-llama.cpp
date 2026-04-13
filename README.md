@@ -299,18 +299,31 @@ MOE_TOPK=8 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -st -n 128 \
   -p "What is Apple Neural Engine? Answer in 3 sentences."
 
-# 3. Smaller-memory starting point for a 24 GB-class Apple Silicon machine
+# 3. M1 Max 64 GB (MOE_TOPK=4 for ~2× speedup, large slot bank)
+MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+# 4. Low-memory example: M4 Pro 24 GB (MOE_TOPK=4 for ~2× speedup)
+#    Note: MOE_SLOT_BANK > 32 may stall on 24 GB machines — use 32 or lower.
+MOE_TOPK=4 MOE_SLOT_BANK=32 TEMP=0.2 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+# 5. Smaller-memory starting point with native routing width
 MOE_TOPK=8 MOE_SLOT_BANK=32 CTX=2048 BATCH=32 UBATCH=1 \
 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
   -st -n 96 \
   -p "Summarize Apple Neural Engine in 3 sentences."
 
-# 4. Reproducible comparison runs
+# 6. Reproducible comparison runs
 # Pin the binary, seed, and temperature. TEMP=0.2 avoids the repetition that
 # TEMP=0 can trigger on long code generations while keeping runs comparable.
 LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
-MOE_TOPK=2 \
+MOE_TOPK=4 \
 SEED=123 \
 TEMP=0.2 \
 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \

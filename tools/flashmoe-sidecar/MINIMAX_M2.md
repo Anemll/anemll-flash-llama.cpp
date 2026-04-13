@@ -116,7 +116,7 @@ This was smoke-tested locally with:
 - `CTX=4096`
 - `BATCH=64`
 - `UBATCH=1`
-- `N_GPU_LAYERS=999`
+- `N_GPU_LAYERS=999` (try `N_GPU_LAYERS=0` on systems with weaker GPUs or if you see stalls — dense layers run on CPU instead, avoiding Metal synchronization overhead)
 
 On the checked `M5 Max`, the observed Flash-MoE load reported about:
 
@@ -124,11 +124,19 @@ On the checked `M5 Max`, the observed Flash-MoE load reported about:
 - `992 MiB` context memory on `MTL0`
 - about `18560 MiB` total device allocation for the test run
 
-### Lower-memory profile for a 24 GB-class M5
+### M1 Max 64 GB
 
-For a smaller unified-memory Apple Silicon system, reduce slot-bank reserve first, then context and batch.
+With 64 GB unified memory, a larger slot bank fits comfortably:
 
-Recommended starting point:
+```bash
+MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
+
+
+If you need full native routing fidelity (K=8), reduce slot-bank and context instead:
 
 ```bash
 MOE_TOPK=8 \
@@ -163,7 +171,7 @@ For side-by-side MiniMax branch comparisons, pin the binary, seed, and temperatu
 
 ```bash
 LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
-MOE_TOPK=2 \
+MOE_TOPK=4 \
 SEED=123 \
 TEMP=0.2 \
 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \

@@ -192,7 +192,50 @@ This path was smoke-tested locally on an M5 Max with:
 - `UBATCH=1`
 - `N_GPU_LAYERS=999`
 
-Lower-memory starting point for a 24 GB-class M5:
+All wrapper environment variables for `run_minimax_m2_flash.sh`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOE_TOPK` | 4 (package) | Routed experts per token (not sampler `--top-k`) |
+| `MOE_SLOT_BANK` | 64 (package) | Host-memory expert cache size (slots) |
+| `MOE_CACHE_IO_SPLIT` | 4 (package) | Split each expert pread into N page-aligned chunks; `1` = single read, higher = more I/O parallelism |
+| `MOE_PREFETCH_TEMPORAL` | 1 (package) | Set `0` to disable temporal prefetch (refreshes current token's experts after decode to bias slot residency) |
+| `CTX` | 4096 | Context size |
+| `BATCH` | 64 | Batch size |
+| `UBATCH` | 1 | Micro-batch size |
+| `N_GPU_LAYERS` | 999 | GPU layer count (`0` = CPU only) |
+| `SEED` | (unset) | RNG seed for reproducibility |
+| `TEMP` | (unset) | Sampling temperature |
+| `LLAMA_BIN` | `./build/bin/llama-cli` | Path to the llama-cli binary |
+
+Examples:
+
+```bash
+# Disable prefetch, single-threaded I/O
+MOE_TOPK=4 MOE_SLOT_BANK=64 MOE_CACHE_IO_SPLIT=1 MOE_PREFETCH_TEMPORAL=0 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 128 -p "Hello"
+
+# High I/O parallelism on fast SSD
+MOE_TOPK=8 MOE_SLOT_BANK=64 MOE_CACHE_IO_SPLIT=8 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 128 -p "Hello"
+```
+
+M1 Max 64 GB — `MOE_TOPK=4` for ~2× decode speedup with a large slot bank:
+
+```bash
+MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
+
+
+
+Lower-memory starting point with native routing width (K=8):
 
 ```bash
 MOE_TOPK=8 \
@@ -230,7 +273,7 @@ Reproducible comparison runs:
 
 ```bash
 LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
-MOE_TOPK=2 \
+MOE_TOPK=4 \
 SEED=123 \
 TEMP=0.2 \
 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
