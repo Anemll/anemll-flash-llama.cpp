@@ -151,7 +151,6 @@ Rule of thumb: bank should be 5-15% of available RAM. On machines where the GGUF
 |---------|----:|-------------|-------|
 | M1/M2 8 GB | 8 GB | `--moe-slot-bank 16 -ngl 0` | Dense on CPU, experts streamed |
 | M1/M2 16 GB | 16 GB | `--moe-slot-bank 32 -ngl 99` | Dense on GPU if it fits |
-| M3/M4 Pro 36 GB | 36 GB | `--moe-slot-bank 64 -ngl 99` | 35B fits resident — use stock |
 | M4/M5 Max 128 GB | 128 GB | `--moe-slot-bank 128 -ngl 99` | 35B: use stock. 397B: slot-bank |
 
 ## How It Works: Dense + Experts Split
@@ -305,12 +304,6 @@ MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.
   -st -n 4096 \
   -p "Make a game of Space Invaders in pygame"
 
-# 4. Low-memory example: M4 Pro 24 GB (MOE_TOPK=4 for ~2× speedup)
-#    Note: MOE_SLOT_BANK > 32 may stall on 24 GB machines — use 32 or lower.
-MOE_TOPK=4 MOE_SLOT_BANK=32 TEMP=0.2 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
-  ~/Models/UD-IQ2_XXS-Flash \
-  -st -n 4096 \
-  -p "Make a game of Space Invaders in pygame"
 
 # 5. Smaller-memory starting point with native routing width
 MOE_TOPK=8 MOE_SLOT_BANK=32 CTX=2048 BATCH=32 UBATCH=1 \
