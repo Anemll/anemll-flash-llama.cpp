@@ -2234,6 +2234,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SIDECAR"));
     add_opt(common_arg(
+        {"--moe-prefetch-sidecar", "--prefetch-sidecar", "--prefetch"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used only for prefetch loads (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_SIDECAR"));
+    add_opt(common_arg(
+        {"--moe-secondary-sidecar", "--secondary-sidecar"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used only for the last miss in a 4-miss routed call experiment (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_secondary_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SECONDARY_SIDECAR"));
+    add_opt(common_arg(
+        {"--moe-tertiary-sidecar", "--tertiary-sidecar"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used as the third lane for experimental weighted demand striping (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_tertiary_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TERTIARY_SIDECAR"));
+    add_opt(common_arg(
         {"--moe-mode"}, "{stock,resident,resident-bank,resident-slot-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
         "Flash-MoE runtime mode",
         [](common_params & params, const std::string & value) {
@@ -2283,6 +2304,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_IO_SPLIT"));
     add_opt(common_arg(
+        {"--moe-prefetch-cache-io-split"}, "N",
+        "split prefetch-sidecar expert preads into N page-aligned chunks during slot-bank installs (0 = follow --moe-cache-io-split, 1 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch_cache_io_split = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_CACHE_IO_SPLIT"));
+    add_opt(common_arg(
+        {"--moe-demand-stripe"}, "A:B:C",
+        "experimental weighted demand striping across primary:secondary:tertiary sidecars for routed family reads, e.g. 5:1:1 or 4:1:1",
+        [](common_params & params, const std::string & value) {
+            params.moe_demand_stripe = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DEMAND_STRIPE"));
+    add_opt(common_arg(
+        {"--moe-prefetch-stripe", "--moe-preftech-stripe"}, "A:B:C",
+        "experimental weighted prefetch striping across prefetch:secondary:tertiary sidecars for prefetch-family reads, e.g. 0:1:1",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_stripe = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_STRIPE"));
+    add_opt(common_arg(
         {"--moe-force-expert"}, "N",
         "force routed expert selection to a single expert id for every token (implies K=1 inside the routed path, -1 disables)",
         [](common_params & params, int value) {
@@ -2300,6 +2345,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_prefetch_temporal = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
+    add_opt(common_arg(
+        {"--moe-prefetch-temporal-sparse"},
+        {"--no-moe-prefetch-temporal-sparse"},
+        string_format("alternate temporal prefetch between even and odd routed layers on successive decode steps for slower prefetch media (implies --moe-prefetch-temporal, default: %s)", params.moe_prefetch_temporal_sparse ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefetch_temporal_sparse = value;
+            if (value) {
+                params.moe_prefetch_temporal = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL_SPARSE"));
     add_opt(common_arg(
         {"--moe-predict-prev-token"},
         {"--no-moe-predict-prev-token"},

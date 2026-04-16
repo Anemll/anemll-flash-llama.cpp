@@ -291,6 +291,19 @@ extern "C" {
         // Optional Flash-MoE sidecar directory or manifest path used to override routed expert tensors.
         const char * moe_sidecar_path;
 
+        // Optional Flash-MoE sidecar directory or manifest path used only for prefetch loads.
+        // Falls back to moe_sidecar_path when unset.
+        const char * moe_prefetch_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used only for the last
+        // miss in a 4-miss routed call experiment. Falls back to moe_sidecar_path when unset.
+        const char * moe_secondary_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used as the third
+        // lane for experimental weighted demand striping tests. Falls back to
+        // moe_sidecar_path when unset.
+        const char * moe_tertiary_sidecar_path;
+
         // Optional Flash-MoE execution mode.
         // Supported in this build: "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch".
         const char * moe_mode;
@@ -300,6 +313,14 @@ extern "C" {
 
         // Optional dynamic-quant policy file reserved for future bank selection work.
         const char * moe_quant_map;
+
+        // Optional experimental weighted demand striping ratio across
+        // primary:secondary:tertiary sidecars, for example "5:1:1".
+        const char * moe_demand_stripe;
+
+        // Optional experimental weighted prefetch striping ratio across
+        // prefetch:secondary:tertiary sidecars, for example "0:1:1".
+        const char * moe_prefetch_stripe;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -332,12 +353,14 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool moe_verify_sidecar; // validate sidecar metadata parity during model load
         bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
+        bool moe_prefetch_temporal_sparse; // alternate even/odd layers for temporal prefetch on slow media
         bool moe_predict_prev_token; // prefetch previous token's same-layer routed experts for the next token
         bool moe_predict_top1_prev; // prefetch only the first previous-token same-layer routed expert for the next token
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
+        int32_t moe_prefetch_cache_io_split; // prefetch-only split override; 0 follows moe_cache_io_split
     };
 
     struct llama_sampler_seq_config {

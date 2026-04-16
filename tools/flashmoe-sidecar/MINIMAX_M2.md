@@ -47,21 +47,21 @@ This creates:
 - `OUT_DIR/sidecar/manifest.json`
 - `OUT_DIR/sidecar/layer_XXX.bin`
 - `OUT_DIR/model-dense.gguf`
-- `OUT_DIR/flashmoe-package.json`
+- `OUT_DIR/flashmoe-package.json` with package metadata and runtime defaults for the wrapper
 
-Tested quantisations:
+Checked MiniMax package shapes in this workspace:
+
+| Quant | Shards | Dense GGUF | Routed sidecar |
+|-------|--------|-----------|----------------|
+| UD-IQ2_XXS | 3 | ~2.58 GiB | ~58.3 GiB |
+| UD-Q4_K_XL | 4 | (4-bit) | (4-bit routed) |
+
+For the checked `UD-IQ2_XXS` package in this workspace:
 
 ```bash
-# UD-IQ2_XXS (2-bit, 3-shard)
 python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
   --model ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS/MiniMax-M2.7-UD-IQ2_XXS-00001-of-00003.gguf \
   --out-dir ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
-  --force
-
-# UD-Q4_K_XL (4-bit, 4-shard)
-python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
-  --model /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL/MiniMax-M2.7-UD-Q4_K_XL-00001-of-00004.gguf \
-  --out-dir /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
   --force
 ```
 
@@ -69,8 +69,17 @@ Generic form:
 
 ```bash
 python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
-  --model /path/to/MiniMax-M2-00001-of-00003.gguf \
+  --model /path/to/MiniMax-M2.7-00001-of-00003.gguf \
   --out-dir /path/to/MiniMax-M2.7-IQ2_XXS-Flash \
+  --force
+```
+
+Alternate checked quantisation:
+
+```bash
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL/MiniMax-M2.7-UD-Q4_K_XL-00001-of-00004.gguf \
+  --out-dir /Volumes/X2T/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
   --force
 ```
 
@@ -78,15 +87,22 @@ For partial validation only, you can scope routed layers:
 
 ```bash
 python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
-  --model /path/to/MiniMax-M2-00001-of-00003.gguf \
+  --model /path/to/MiniMax-M2.7-00001-of-00003.gguf \
   --out-dir /tmp/minimax-layer0-check \
   --layers 0 \
   --force
 ```
 
+Useful export flags:
+
+- `--skip-sidecar` to reuse `OUT_DIR/sidecar` and rebuild only `model-dense.gguf` plus `flashmoe-package.json`
+- `--skip-dense` to refresh only `OUT_DIR/sidecar`
+
+The wrapper reads `moe_topk`, `moe_slot_bank`, `moe_cache_io_split`, and `moe_prefetch_temporal` from `flashmoe-package.json` when it is present. Environment variables override those package defaults.
+
 ## Inference Examples
 
-The wrapper script defaults to a speed-oriented MiniMax IQ2_XXS preset:
+The current MiniMax package defaults are speed-oriented, and `run_minimax_m2_flash.sh` reads them from `flashmoe-package.json`:
 
 - `--moe-mode slot-bank`
 - `--moe-topk 4`
@@ -95,11 +111,11 @@ The wrapper script defaults to a speed-oriented MiniMax IQ2_XXS preset:
 - `--moe-prefetch-temporal`
 - Metal replay and CPU-visible slot writes enabled by default
 
-Important: the Flash-MoE routed-expert width is controlled by `--moe-topk`, or `MOE_TOPK=...` when using the wrapper. That is different from the sampling flag `--top-k`. MiniMax M2.7 natively routes to `8` of its 256 experts per layer. The router still scores all 256 experts every layer — `--moe-topk 4` simply keeps only the top 4 scoring experts instead of 8, cutting per-token expert I/O roughly in half for ~2× decode speedup with minor quality degradation.
+Important: the Flash-MoE routed-expert width is controlled by `--moe-topk`, or `MOE_TOPK=...` when using the wrapper. That is different from the sampling flag `--top-k`.
 
 ### M5 Max, native MiniMax routing width
 
-To match the full native routing width on an `M5 Max`, use `MOE_TOPK=8`:
+MiniMax M2.7 natively uses `8` experts per token. To match the model default on an `M5 Max`, use:
 
 ```bash
 MOE_TOPK=8 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
@@ -116,7 +132,7 @@ This was smoke-tested locally with:
 - `CTX=4096`
 - `BATCH=64`
 - `UBATCH=1`
-- `N_GPU_LAYERS=999` (try `N_GPU_LAYERS=0` on systems with weaker GPUs or if you see stalls — dense layers run on CPU instead, avoiding Metal synchronization overhead)
+- `N_GPU_LAYERS=999`
 
 On the checked `M5 Max`, the observed Flash-MoE load reported about:
 
@@ -135,8 +151,11 @@ MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.
   -p "Make a game of Space Invaders in pygame"
 ```
 
+### Lower-memory profile for a 24 GB-class Apple Silicon machine
 
-If you need full native routing fidelity (K=8), reduce slot-bank and context instead:
+For a smaller unified-memory Apple Silicon system, reduce slot-bank reserve first, then context and batch.
+
+Recommended starting point:
 
 ```bash
 MOE_TOPK=8 \
@@ -195,4 +214,5 @@ Useful overrides:
 
 - `MOE_TOPK=8` to keep the native MiniMax routing width
 - `MOE_SLOT_BANK=96` for larger-memory Apple Silicon systems
+- `PREFETCH_SIDECAR=/Volumes/OtherSSD/MiniMax-sidecar` to split prefetch traffic onto another drive
 - `LLAMA_BIN=/abs/path/to/llama-cli` if you do not want the default `./build/bin/llama-cli`

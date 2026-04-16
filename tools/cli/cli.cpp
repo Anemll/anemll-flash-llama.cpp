@@ -783,10 +783,25 @@ int main(int argc, char ** argv) {
         if (!params.moe_sidecar.empty()) {
             fprintf(stderr, "  sidecar          = %s\n", params.moe_sidecar.c_str());
         }
+        if (!params.moe_prefetch_sidecar.empty()) {
+            fprintf(stderr, "  prefetch-sidecar = %s\n", params.moe_prefetch_sidecar.c_str());
+        }
+        if (!params.moe_secondary_sidecar.empty()) {
+            fprintf(stderr, "  secondary-sidecar = %s\n", params.moe_secondary_sidecar.c_str());
+        }
+        if (!params.moe_tertiary_sidecar.empty()) {
+            fprintf(stderr, "  tertiary-sidecar = %s\n", params.moe_tertiary_sidecar.c_str());
+        }
         fprintf(stderr, "  slot-bank        = %d\n", params.moe_slot_bank);
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
-        fprintf(stderr, "  prefetch-temporal = %s\n", params.moe_prefetch_temporal ? "on" : "off");
+        fprintf(stderr, "  prefetch-cache-io-split = %d%s\n",
+                params.moe_prefetch_cache_io_split > 0 ? params.moe_prefetch_cache_io_split : params.moe_cache_io_split,
+                params.moe_prefetch_cache_io_split > 0 ? "" : " (follows cache-io-split)");
+        fprintf(stderr, "  demand-stripe    = %s\n", params.moe_demand_stripe.empty() ? "off" : params.moe_demand_stripe.c_str());
+        fprintf(stderr, "  prefetch-stripe  = %s\n", params.moe_prefetch_stripe.empty() ? "off" : params.moe_prefetch_stripe.c_str());
+        fprintf(stderr, "  prefetch-temporal = %s\n", (params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse) ? "on" : "off");
+        fprintf(stderr, "  prefetch-temporal-sparse = %s\n", params.moe_prefetch_temporal_sparse ? "on" : "off");
         fprintf(stderr, "  predict-prev-token = %s\n", params.moe_predict_prev_token ? "on" : "off");
         fprintf(stderr, "  predict-top1-prev = %s\n", params.moe_predict_top1_prev ? "on" : "off");
         fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");

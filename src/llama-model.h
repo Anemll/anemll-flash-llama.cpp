@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -590,13 +591,24 @@ struct llama_model {
     bool flash_moe_oracle_all_hit_enabled() const;
     bool flash_moe_oracle_prefetch_enabled() const;
     bool flash_moe_temporal_prefetch_enabled() const;
+    bool flash_moe_temporal_prefetch_sparse_enabled() const;
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
+    bool flash_moe_secondary_sidecar_enabled() const;
+    bool flash_moe_demand_stripe_requested() const;
+    bool flash_moe_demand_stripe_enabled() const;
+    bool flash_moe_prefetch_stripe_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
     int32_t flash_moe_cache_io_split() const;
+    int32_t flash_moe_prefetch_cache_io_split() const;
+    std::array<int32_t, 3> flash_moe_demand_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_prefetch_stripe_weights() const;
     int32_t moe_n_expert_used() const;
     const char * flash_moe_trace_file() const;
     const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_prefetch_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_secondary_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_tertiary_sidecar_entry_for(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

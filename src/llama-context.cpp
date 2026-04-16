@@ -16,6 +16,7 @@
 #include "../vendor/nlohmann/json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <chrono>
 #include <cmath>
@@ -65,13 +66,21 @@ public:
               oracle_all_hit(model.flash_moe_oracle_all_hit_enabled()),
               oracle_prefetch(model.flash_moe_oracle_prefetch_enabled()),
               temporal_prefetch(model.flash_moe_temporal_prefetch_enabled()),
+              temporal_prefetch_sparse(model.flash_moe_temporal_prefetch_sparse_enabled()),
               predict_prev_token(model.flash_moe_predict_prev_token_enabled()),
               predict_top1_prev(model.flash_moe_predict_top1_prev_enabled()),
+              secondary_sidecar_enabled(model.flash_moe_secondary_sidecar_enabled()),
+              demand_stripe_requested(model.flash_moe_demand_stripe_requested()),
+              demand_stripe_enabled(model.flash_moe_demand_stripe_enabled()),
+              prefetch_stripe_enabled(model.flash_moe_prefetch_stripe_enabled()),
               perf_profile(perf_profile),
               async_slot_upload(async_slot_upload_enabled()),
               parallel_slot_reads(parallel_slot_reads_enabled()),
               mixed_slot_buffer(mixed_slot_buffer_enabled()),
-              cache_io_split(std::max<int32_t>(model.flash_moe_cache_io_split(), cache_io_split_from_env())) {
+              cache_io_split(std::max<int32_t>(model.flash_moe_cache_io_split(), cache_io_split_from_env())),
+              prefetch_cache_io_split(std::max<int32_t>(model.flash_moe_prefetch_cache_io_split(), cache_io_split_from_env())),
+              demand_stripe_weights(model.flash_moe_demand_stripe_weights()),
+              prefetch_stripe_weights(model.flash_moe_prefetch_stripe_weights()) {
         if (const char * path = model.flash_moe_trace_file(); oracle_all_hit || oracle_prefetch) {
             if (path == nullptr || path[0] == '\0') {
                 throw std::runtime_error("Flash-MoE oracle replay mode requires a replay trace file");
@@ -101,10 +110,10 @@ public:
             state.current_token_experts.reserve(std::max<int32_t>(1, model.moe_n_expert_used()));
 
             const auto & layer = model.layers[il];
-            bind_tensor(layer.ffn_gate_up_exps, state.gate_up_tensor, state.gate_up_entry, state.enabled);
-            bind_tensor(layer.ffn_gate_exps,    state.gate_tensor,    state.gate_entry,    state.enabled);
-            bind_tensor(layer.ffn_up_exps,      state.up_tensor,      state.up_entry,      state.enabled);
-            bind_tensor(layer.ffn_down_exps,    state.down_tensor,    state.down_entry,    state.enabled);
+            bind_tensor(layer.ffn_gate_up_exps, state.gate_up_tensor, state.gate_up_entry, state.prefetch_gate_up_entry, state.secondary_gate_up_entry, state.tertiary_gate_up_entry, state.enabled);
+            bind_tensor(layer.ffn_gate_exps,    state.gate_tensor,    state.gate_entry,    state.prefetch_gate_entry,    state.secondary_gate_entry,    state.tertiary_gate_entry,    state.enabled);
+            bind_tensor(layer.ffn_up_exps,      state.up_tensor,      state.up_entry,      state.prefetch_up_entry,      state.secondary_up_entry,      state.tertiary_up_entry,      state.enabled);
+            bind_tensor(layer.ffn_down_exps,    state.down_tensor,    state.down_entry,    state.prefetch_down_entry,    state.secondary_down_entry,    state.tertiary_down_entry,    state.enabled);
 
             auto bind_mixed_field = [&](ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
                 if (tensor == nullptr || entry == nullptr) {
@@ -119,6 +128,34 @@ public:
             bind_mixed_field(state.gate_tensor,    state.gate_entry,    routed_family::gate);
             bind_mixed_field(state.up_tensor,      state.up_entry,      routed_family::up);
             bind_mixed_field(state.down_tensor,    state.down_entry,    routed_family::down);
+
+            auto bind_prefetch_mixed_field = [&](ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                if (tensor == nullptr || entry == nullptr) {
+                    return;
+                }
+
+                state.mixed_prefetch_slot_fields.push_back({ tensor, entry, family, state.mixed_prefetch_slot_bytes });
+                state.mixed_prefetch_slot_bytes += entry->bytes_per_expert;
+            };
+
+            bind_prefetch_mixed_field(state.gate_up_tensor, state.prefetch_gate_up_entry, routed_family::gate_up);
+            bind_prefetch_mixed_field(state.gate_tensor,    state.prefetch_gate_entry,    routed_family::gate);
+            bind_prefetch_mixed_field(state.up_tensor,      state.prefetch_up_entry,      routed_family::up);
+            bind_prefetch_mixed_field(state.down_tensor,    state.prefetch_down_entry,    routed_family::down);
+
+            auto bind_secondary_mixed_field = [&](ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
+                if (tensor == nullptr || entry == nullptr) {
+                    return;
+                }
+
+                state.mixed_secondary_slot_fields.push_back({ tensor, entry, family, state.mixed_secondary_slot_bytes });
+                state.mixed_secondary_slot_bytes += entry->bytes_per_expert;
+            };
+
+            bind_secondary_mixed_field(state.gate_up_tensor, state.secondary_gate_up_entry, routed_family::gate_up);
+            bind_secondary_mixed_field(state.gate_tensor,    state.secondary_gate_entry,    routed_family::gate);
+            bind_secondary_mixed_field(state.up_tensor,      state.secondary_up_entry,      routed_family::up);
+            bind_secondary_mixed_field(state.down_tensor,    state.secondary_down_entry,    routed_family::down);
         }
 
         touched_slots.reserve(slot_count);
@@ -132,7 +169,7 @@ public:
             resident_full_bank_pending = slot_count == expert_count;
         }
 
-        if (parallel_slot_reads || cache_io_split > 1) {
+        if (parallel_slot_reads || cache_io_split > 1 || demand_stripe_enabled || prefetch_stripe_enabled) {
             start_read_pool();
         }
 
@@ -225,6 +262,9 @@ public:
             return;
         }
 
+        const bool use_temporal_sparse = temporal_prefetch && temporal_prefetch_sparse && !prediction_enabled();
+        const size_t sparse_layer_parity = temporal_prefetch_sparse_even_layers ? 0 : 1;
+
         for (size_t layer = 0; layer < layers.size(); ++layer) {
             auto & state = layers[layer];
             if (!state.enabled) {
@@ -238,8 +278,15 @@ public:
 
                 prefetch_experts(state, (int) layer, state.predicted_experts, prediction_mode_name(), predictor_prefetch_stats);
             } else if (!state.temporal_prefetch_experts.empty()) {
+                if (use_temporal_sparse && ((layer & 1U) != sparse_layer_parity)) {
+                    continue;
+                }
                 prefetch_experts(state, (int) layer, state.temporal_prefetch_experts, "temporal-prefetch", prefetch_stats);
             }
+        }
+
+        if (use_temporal_sparse) {
+            temporal_prefetch_sparse_even_layers = !temporal_prefetch_sparse_even_layers;
         }
     }
 
@@ -271,6 +318,7 @@ public:
                 oracle_prime_stats.resident_copy_ops += install.resident_copy_ops;
                 oracle_prime_stats.install_us += install.install_us;
                 oracle_prime_stats.source_us += install.source_us;
+                oracle_prime_stats.source_wall_us += install.source_wall_us;
                 oracle_prime_stats.upload_us += install.upload_us;
                 accumulate_install_breakdown(oracle_prime_stats, install);
                 oracle_prime_stats.total_us += install.install_us;
@@ -477,6 +525,7 @@ private:
         state.stats.evict_loads += install.evict_loads;
         state.stats.install_us += install.install_us;
         state.stats.source_us += install.source_us;
+        state.stats.source_wall_us += install.source_wall_us;
         state.stats.upload_us += install.upload_us;
         accumulate_install_breakdown(state.stats, install);
 
@@ -519,11 +568,13 @@ private:
     struct install_metrics {
         size_t  experts = 0;
         size_t  bytes = 0;
+        std::array<uint64_t, 3> source_lane_bytes = { 0, 0, 0 };
         size_t  pread_ops = 0;
         size_t  resident_copy_ops = 0;
         size_t  cold_loads = 0;
         size_t  evict_loads = 0;
         int64_t source_us = 0;
+        int64_t source_wall_us = 0;
         int64_t upload_us = 0;
         int64_t install_us = 0;
         int64_t gate_up_install_us = 0;
@@ -543,6 +594,7 @@ private:
         uint64_t hit_experts = 0;
         uint64_t miss_experts = 0;
         uint64_t bytes_loaded = 0;
+        std::array<uint64_t, 3> source_lane_bytes = { 0, 0, 0 };
         uint64_t pread_ops = 0;
         uint64_t resident_copy_ops = 0;
         uint64_t cold_loads = 0;
@@ -552,6 +604,7 @@ private:
         int64_t slot_resolve_us = 0;
         int64_t install_us = 0;
         int64_t source_us = 0;
+        int64_t source_wall_us = 0;
         int64_t upload_us = 0;
         int64_t slot_write_us = 0;
         int64_t trace_write_us = 0;
@@ -608,6 +661,9 @@ private:
     struct install_chunk {
         ggml_tensor * tensor = nullptr;
         const llama_flash_moe_sidecar_entry * entry = nullptr;
+        const llama_flash_moe_sidecar_entry * secondary_entry = nullptr;
+        const llama_flash_moe_sidecar_entry * tertiary_entry = nullptr;
+        int source_lane = 0;
         routed_family family = routed_family::gate;
         int32_t expert = -1;
         int32_t slot = -1;
@@ -615,6 +671,7 @@ private:
         int32_t task_count = 0;
         uint8_t * direct_dst = nullptr;
         std::vector<uint8_t> bytes;
+        bool use_striped_read = false;
     };
 
     struct install_slot_field {
@@ -626,6 +683,7 @@ private:
     struct install_slot_buffer {
         int32_t expert = -1;
         int32_t slot = -1;
+        int source_lane = 0;
         std::vector<uint8_t> bytes;
         std::vector<install_slot_field> fields;
     };
@@ -633,6 +691,7 @@ private:
     struct pending_slot_load {
         int32_t expert = -1;
         int32_t slot = -1;
+        bool use_secondary = false;
     };
 
     struct pread_result {
@@ -676,6 +735,18 @@ private:
         const llama_flash_moe_sidecar_entry * gate_entry    = nullptr;
         const llama_flash_moe_sidecar_entry * up_entry      = nullptr;
         const llama_flash_moe_sidecar_entry * down_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * prefetch_gate_up_entry = nullptr;
+        const llama_flash_moe_sidecar_entry * prefetch_gate_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * prefetch_up_entry      = nullptr;
+        const llama_flash_moe_sidecar_entry * prefetch_down_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * secondary_gate_up_entry = nullptr;
+        const llama_flash_moe_sidecar_entry * secondary_gate_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * secondary_up_entry      = nullptr;
+        const llama_flash_moe_sidecar_entry * secondary_down_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * tertiary_gate_up_entry = nullptr;
+        const llama_flash_moe_sidecar_entry * tertiary_gate_entry    = nullptr;
+        const llama_flash_moe_sidecar_entry * tertiary_up_entry      = nullptr;
+        const llama_flash_moe_sidecar_entry * tertiary_down_entry    = nullptr;
 
         std::vector<int32_t>  slot_to_expert;
         std::vector<int32_t>  expert_to_slot;
@@ -688,7 +759,11 @@ private:
         std::vector<int32_t>  current_token_experts;
         bool predicted_valid = false;
         std::vector<mixed_slot_field> mixed_slot_fields;
+        std::vector<mixed_slot_field> mixed_prefetch_slot_fields;
+        std::vector<mixed_slot_field> mixed_secondary_slot_fields;
         size_t mixed_slot_bytes = 0;
+        size_t mixed_prefetch_slot_bytes = 0;
+        size_t mixed_secondary_slot_bytes = 0;
         int32_t resident_count = 0;
         int32_t peak_resident_count = 0;
         routed_metrics stats;
@@ -704,13 +779,22 @@ private:
     bool oracle_all_hit = false;
     bool oracle_prefetch = false;
     bool temporal_prefetch = false;
+    bool temporal_prefetch_sparse = false;
+    bool temporal_prefetch_sparse_even_layers = true;
     bool predict_prev_token = false;
     bool predict_top1_prev = false;
+    bool secondary_sidecar_enabled = false;
+    bool demand_stripe_requested = false;
+    bool demand_stripe_enabled = false;
+    bool prefetch_stripe_enabled = false;
     bool perf_profile = false;
     bool async_slot_upload = false;
     bool parallel_slot_reads = false;
     bool mixed_slot_buffer = false;
     int32_t cache_io_split = 1;
+    int32_t prefetch_cache_io_split = 1;
+    std::array<int32_t, 3> demand_stripe_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> prefetch_stripe_weights = { 1, 0, 0 };
     bool oracle_primed = false;
     bool oracle_prefetch_primed = false;
     size_t oracle_prefetch_repairs = 0;
@@ -810,13 +894,13 @@ private:
         };
 
         const int64_t routing_us = total.topk_read_us + total.slot_resolve_us;
-        const int64_t install_overhead_us = total.install_us - total.source_us - total.upload_us;
+        const int64_t install_overhead_us = total.install_us - total.source_wall_us - total.upload_us;
         const int64_t slot_meta_us = total.slot_write_us + total.trace_write_us;
         const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
 
         const int64_t breakdown_total_us =
                 std::max<int64_t>(0, routing_us) +
-                std::max<int64_t>(0, total.source_us) +
+                std::max<int64_t>(0, total.source_wall_us) +
                 std::max<int64_t>(0, total.upload_us) +
                 std::max<int64_t>(0, install_overhead_us) +
                 std::max<int64_t>(0, slot_meta_us) +
@@ -838,7 +922,7 @@ private:
         LLAMA_LOG_INFO("%s: Component                 ms/layer   MB/layer   Layers   ms/token      %%\n", __func__);
         LLAMA_LOG_INFO("%s: -----------------------------------------------------------------------------\n", __func__);
         log_row("Routing + slot resolve", routing_us, 0);
-        log_row("Expert I/O source", total.source_us, total.bytes_loaded);
+        log_row("Expert I/O source", total.source_wall_us, total.bytes_loaded);
         log_row("Expert upload", total.upload_us, total.bytes_loaded);
         log_row("Install overhead", install_overhead_us, 0);
         log_row("Slot/meta writes", slot_meta_us, 0);
@@ -848,7 +932,7 @@ private:
         const double total_ms_per_token = us_to_ms_per_token(breakdown_total_us);
         const double total_bytes_per_token_gib = double(total.bytes_loaded) / (1024.0 * 1024.0 * 1024.0) / token_estimate;
         LLAMA_LOG_INFO("%s: Routed total%49.2f  100.0%%\n", __func__, total_ms_per_token);
-        LLAMA_LOG_INFO("%s: Accumulated per token: %.2f ms, %.2f GiB routed expert bytes (source/upload may exceed wall time under split/overlap)\n",
+        LLAMA_LOG_INFO("%s: Accumulated per token: %.2f ms, %.2f GiB routed expert bytes\n",
                 __func__, total_ms_per_token, total_bytes_per_token_gib);
 
         const bool use_colors = flash_moe_log_colors_enabled();
@@ -860,6 +944,10 @@ private:
         LLAMA_LOG_INFO("%s: %sLegend%s\n", __func__, ansi_label, ansi_reset);
         LLAMA_LOG_INFO("%s:   %sslot-bank cached expert hit rate:%s %s%.1f%%%s\n",
                 __func__, ansi_label, ansi_reset, ansi_slot_hit, hit_pct, ansi_reset);
+        if (total.source_us != total.source_wall_us) {
+            LLAMA_LOG_INFO("%s:   %scumulative source task time:%s %.2f ms/token (wall I/O source above, cumulative can exceed wall under split/stripe overlap)\n",
+                    __func__, ansi_label, ansi_reset, us_to_ms_per_token(total.source_us));
+        }
 
 #ifdef GGML_USE_METAL
         struct ggml_metal_mul_mat_id_stats metal_stats = {};
@@ -879,7 +967,7 @@ private:
     }
 
     bool effective_batched_install_reads() const {
-        return parallel_slot_reads && (batched_install_reads_enabled() || cache_io_split > 1);
+        return !demand_stripe_enabled && parallel_slot_reads && (batched_install_reads_enabled() || cache_io_split > 1);
     }
 
     static int32_t cache_io_split_from_env() {
@@ -915,6 +1003,63 @@ private:
             chunks = (int32_t) pages;
         }
         return std::max<int32_t>(1, chunks);
+    }
+
+    static std::array<size_t, 3> active_stripe_bytes(
+            size_t bytes_per_expert,
+            bool stripe_enabled,
+            const std::array<int32_t, 3> & stripe_weights) {
+        if (!stripe_enabled || bytes_per_expert == 0) {
+            return { bytes_per_expert, 0, 0 };
+        }
+
+        const int64_t total_weight =
+                int64_t(stripe_weights[0]) +
+                int64_t(stripe_weights[1]) +
+                int64_t(stripe_weights[2]);
+        if (total_weight <= 0) {
+            return { bytes_per_expert, 0, 0 };
+        }
+
+        std::array<size_t, 3> bytes = { 0, 0, 0 };
+        std::array<int64_t, 3> remainders = { 0, 0, 0 };
+        size_t assigned_bytes = 0;
+
+        for (size_t lane = 0; lane < bytes.size(); ++lane) {
+            const int64_t weight = std::max<int32_t>(0, stripe_weights[lane]);
+            if (weight == 0) {
+                continue;
+            }
+
+            const uint64_t scaled = uint64_t(bytes_per_expert) * uint64_t(weight);
+            bytes[lane] = size_t(scaled / uint64_t(total_weight));
+            remainders[lane] = scaled % total_weight;
+            assigned_bytes += bytes[lane];
+        }
+
+        size_t remaining_bytes = bytes_per_expert - assigned_bytes;
+        while (remaining_bytes > 0) {
+            size_t best_lane = 0;
+            bool found_lane = false;
+            for (size_t lane = 0; lane < bytes.size(); ++lane) {
+                if (stripe_weights[lane] <= 0) {
+                    continue;
+                }
+                if (!found_lane || remainders[lane] > remainders[best_lane]) {
+                    best_lane = lane;
+                    found_lane = true;
+                }
+            }
+            if (!found_lane) {
+                bytes[0] += remaining_bytes;
+                break;
+            }
+            bytes[best_lane]++;
+            remainders[best_lane] = -1;
+            remaining_bytes--;
+        }
+
+        return bytes;
     }
 
     void start_read_pool() {
@@ -1191,7 +1336,7 @@ private:
             touched_slots.push_back(slot);
         }
 
-        const install_metrics install = install_loads(state, loads);
+        const install_metrics install = install_loads(state, loads, true);
 
         for (const int32_t slot : touched_slots) {
             state.slot_age[slot] = ++age;
@@ -1209,6 +1354,7 @@ private:
         stats_out.total_us += ggml_time_us() - t_prefetch_start_us;
         stats_out.install_us += install.install_us;
         stats_out.source_us += install.source_us;
+        stats_out.source_wall_us += install.source_wall_us;
         stats_out.upload_us += install.upload_us;
         accumulate_install_breakdown(stats_out, install);
     }
@@ -1268,7 +1414,7 @@ private:
             touched_slots.push_back(slot);
         }
 
-        const install_metrics install = install_loads(state, loads);
+        const install_metrics install = install_loads(state, loads, true);
 
         for (const int32_t slot : touched_slots) {
             state.slot_age[slot] = ++age;
@@ -1285,6 +1431,7 @@ private:
         prefetch_stats.evict_loads += install.evict_loads;
         prefetch_stats.install_us += install.install_us;
         prefetch_stats.source_us += install.source_us;
+        prefetch_stats.source_wall_us += install.source_wall_us;
         prefetch_stats.upload_us += install.upload_us;
         accumulate_install_breakdown(prefetch_stats, install);
         prefetch_stats.total_us += ggml_time_us() - t_prefetch_start_us;
@@ -1294,6 +1441,9 @@ private:
             ggml_tensor * tensor,
             ggml_tensor *& tensor_out,
             const llama_flash_moe_sidecar_entry *& entry_out,
+            const llama_flash_moe_sidecar_entry *& prefetch_entry_out,
+            const llama_flash_moe_sidecar_entry *& secondary_entry_out,
+            const llama_flash_moe_sidecar_entry *& tertiary_entry_out,
             bool & enabled_out) {
         if (tensor == nullptr) {
             return;
@@ -1311,8 +1461,53 @@ private:
                 ggml_get_name(tensor), ggml_nbytes(tensor), expected_slot_bytes, slot_count));
         }
 
+        const auto * prefetch_entry = model.flash_moe_prefetch_sidecar_entry_for(ggml_get_name(tensor));
+        if (prefetch_entry == nullptr) {
+            throw std::runtime_error(format("missing Flash-MoE prefetch sidecar entry for '%s'", ggml_get_name(tensor)));
+        }
+
+        if (prefetch_entry->bytes_per_expert != entry->bytes_per_expert ||
+            prefetch_entry->exact_byte_length != entry->exact_byte_length ||
+            prefetch_entry->source_format != entry->source_format ||
+            prefetch_entry->quant_type != entry->quant_type) {
+            throw std::runtime_error(format(
+                "Flash-MoE prefetch sidecar entry '%s' is incompatible with the primary sidecar",
+                ggml_get_name(tensor)));
+        }
+
+        const auto * secondary_entry = model.flash_moe_secondary_sidecar_entry_for(ggml_get_name(tensor));
+        if (secondary_entry == nullptr) {
+            throw std::runtime_error(format("missing Flash-MoE secondary sidecar entry for '%s'", ggml_get_name(tensor)));
+        }
+
+        if (secondary_entry->bytes_per_expert != entry->bytes_per_expert ||
+            secondary_entry->exact_byte_length != entry->exact_byte_length ||
+            secondary_entry->source_format != entry->source_format ||
+            secondary_entry->quant_type != entry->quant_type) {
+            throw std::runtime_error(format(
+                "Flash-MoE secondary sidecar entry '%s' is incompatible with the primary sidecar",
+                ggml_get_name(tensor)));
+        }
+
+        const auto * tertiary_entry = model.flash_moe_tertiary_sidecar_entry_for(ggml_get_name(tensor));
+        if (tertiary_entry == nullptr) {
+            throw std::runtime_error(format("missing Flash-MoE tertiary sidecar entry for '%s'", ggml_get_name(tensor)));
+        }
+
+        if (tertiary_entry->bytes_per_expert != entry->bytes_per_expert ||
+            tertiary_entry->exact_byte_length != entry->exact_byte_length ||
+            tertiary_entry->source_format != entry->source_format ||
+            tertiary_entry->quant_type != entry->quant_type) {
+            throw std::runtime_error(format(
+                "Flash-MoE tertiary sidecar entry '%s' is incompatible with the primary sidecar",
+                ggml_get_name(tensor)));
+        }
+
         tensor_out = tensor;
         entry_out = entry;
+        prefetch_entry_out = prefetch_entry;
+        secondary_entry_out = secondary_entry;
+        tertiary_entry_out = tertiary_entry;
         enabled_out = true;
         async_slot_upload_buffer_size = std::max(async_slot_upload_buffer_size, entry->bytes_per_expert);
     }
@@ -1448,6 +1643,9 @@ private:
         dst.gate_bytes += src.gate_bytes;
         dst.up_bytes += src.up_bytes;
         dst.down_bytes += src.down_bytes;
+        for (size_t lane = 0; lane < dst.source_lane_bytes.size(); ++lane) {
+            dst.source_lane_bytes[lane] += src.source_lane_bytes[lane];
+        }
     }
 
     void accumulate_metrics(routed_metrics & dst, const routed_metrics & src) const {
@@ -1457,6 +1655,9 @@ private:
         dst.hit_experts += src.hit_experts;
         dst.miss_experts += src.miss_experts;
         dst.bytes_loaded += src.bytes_loaded;
+        for (size_t lane = 0; lane < dst.source_lane_bytes.size(); ++lane) {
+            dst.source_lane_bytes[lane] += src.source_lane_bytes[lane];
+        }
         dst.pread_ops += src.pread_ops;
         dst.resident_copy_ops += src.resident_copy_ops;
         dst.cold_loads += src.cold_loads;
@@ -1466,6 +1667,7 @@ private:
         dst.slot_resolve_us += src.slot_resolve_us;
         dst.install_us += src.install_us;
         dst.source_us += src.source_us;
+        dst.source_wall_us += src.source_wall_us;
         dst.upload_us += src.upload_us;
         dst.slot_write_us += src.slot_write_us;
         dst.trace_write_us += src.trace_write_us;
@@ -1554,6 +1756,7 @@ private:
             resident_prime_stats.evict_loads += install.evict_loads;
             resident_prime_stats.install_us += install.install_us;
             resident_prime_stats.source_us += install.source_us;
+            resident_prime_stats.source_wall_us += install.source_wall_us;
             resident_prime_stats.upload_us += install.upload_us;
             accumulate_install_breakdown(resident_prime_stats, install);
             resident_prime_stats.total_us += install.install_us;
@@ -1588,15 +1791,29 @@ private:
         const double miss_per_call = total.calls > 0 ? double(total.miss_experts) / double(total.calls) : 0.0;
         const double miss_bytes_gib = total.bytes_loaded / 1024.0 / 1024.0 / 1024.0;
         const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
+        const auto log_lane_breakdown = [](const char * label, const routed_metrics & stats) {
+            const auto lane_gib = [&stats](size_t lane) {
+                return stats.source_lane_bytes[lane] / 1024.0 / 1024.0 / 1024.0;
+            };
+            const auto lane_pct = [&stats](size_t lane) {
+                return stats.bytes_loaded > 0 ? 100.0 * double(stats.source_lane_bytes[lane]) / double(stats.bytes_loaded) : 0.0;
+            };
+            LLAMA_LOG_INFO("%s: Flash-MoE %s lanes primary=%.2f GiB (%.1f%%) secondary=%.2f GiB (%.1f%%) tertiary=%.2f GiB (%.1f%%)\n",
+                    __func__,
+                    label,
+                    lane_gib(0), lane_pct(0),
+                    lane_gib(1), lane_pct(1),
+                    lane_gib(2), lane_pct(2));
+        };
 
-        LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s\n",
+        LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms source_sum=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s\n",
                 __func__,
                 resident_bank_source ? "resident-packed" :
                 oracle_all_hit ? "oracle-all-hit" :
                 oracle_prefetch ? "oracle-prefetch" : "pread-slot-bank",
                 total.calls, total.token_refs, total.unique_experts, hit_pct, miss_per_call, miss_bytes_gib,
                 total.topk_read_us / 1000.0, total.slot_resolve_us / 1000.0, total.install_us / 1000.0,
-                total.source_us / 1000.0, total.upload_us / 1000.0, total.slot_write_us / 1000.0,
+                total.source_wall_us / 1000.0, total.source_us / 1000.0, total.upload_us / 1000.0, total.slot_write_us / 1000.0,
                 total.trace_write_us / 1000.0, std::max<int64_t>(0, other_us) / 1000.0,
                 total.pread_ops, total.resident_copy_ops,
                 cache_io_split,
@@ -1612,6 +1829,7 @@ private:
                     total.gate_install_us / 1000.0, total.gate_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.up_install_us / 1000.0, total.up_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.down_install_us / 1000.0, total.down_bytes / 1024.0 / 1024.0 / 1024.0);
+            log_lane_breakdown("on-demand", total);
         }
         LLAMA_LOG_INFO("%s: Flash-MoE residency cold=%" PRIu64 " evict=%" PRIu64 "\n",
                 __func__, total.cold_loads, total.evict_loads);
@@ -1620,25 +1838,27 @@ private:
         if (prefetch_stats.calls > 0) {
             const double prefetch_hit_pct = prefetch_stats.unique_experts > 0 ?
                     100.0 * double(prefetch_stats.hit_experts) / double(prefetch_stats.unique_experts) : 0.0;
-            LLAMA_LOG_INFO("%s: Flash-MoE prefetch calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 "\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE prefetch calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms source_sum=%.3f ms upload=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 "\n",
                     __func__,
                     prefetch_stats.calls, prefetch_stats.unique_experts, prefetch_hit_pct, prefetch_stats.miss_experts,
                     prefetch_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
                     prefetch_stats.total_us / 1000.0, prefetch_stats.install_us / 1000.0,
-                    prefetch_stats.source_us / 1000.0, prefetch_stats.upload_us / 1000.0,
+                    prefetch_stats.source_wall_us / 1000.0, prefetch_stats.source_us / 1000.0, prefetch_stats.upload_us / 1000.0,
                     prefetch_stats.pread_ops, prefetch_stats.resident_copy_ops);
+            log_lane_breakdown("prefetch", prefetch_stats);
         }
         if (predictor_prefetch_stats.calls > 0) {
             const double predict_prefetch_hit_pct = predictor_prefetch_stats.unique_experts > 0 ?
                     100.0 * double(predictor_prefetch_stats.hit_experts) / double(predictor_prefetch_stats.unique_experts) : 0.0;
-            LLAMA_LOG_INFO("%s: Flash-MoE %s calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 "\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE %s calls=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms source_sum=%.3f ms upload=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 "\n",
                     __func__,
                     prediction_mode_name(),
                     predictor_prefetch_stats.calls, predictor_prefetch_stats.unique_experts, predict_prefetch_hit_pct, predictor_prefetch_stats.miss_experts,
                     predictor_prefetch_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
                     predictor_prefetch_stats.total_us / 1000.0, predictor_prefetch_stats.install_us / 1000.0,
-                    predictor_prefetch_stats.source_us / 1000.0, predictor_prefetch_stats.upload_us / 1000.0,
+                    predictor_prefetch_stats.source_wall_us / 1000.0, predictor_prefetch_stats.source_us / 1000.0, predictor_prefetch_stats.upload_us / 1000.0,
                     predictor_prefetch_stats.pread_ops, predictor_prefetch_stats.resident_copy_ops);
+            log_lane_breakdown(prediction_mode_name(), predictor_prefetch_stats);
         }
         if (predictor_stats.layer_calls > 0) {
             const double predictor_precision = predictor_stats.predicted_experts > 0 ?
@@ -1653,22 +1873,22 @@ private:
         }
 
         if (resident_prime_stats.miss_experts > 0) {
-            LLAMA_LOG_INFO("%s: Flash-MoE resident-slot-bank prime installs=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms resident_copy_ops=%" PRIu64 "\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE resident-slot-bank prime installs=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms source_sum=%.3f ms upload=%.3f ms resident_copy_ops=%" PRIu64 "\n",
                     __func__,
                     resident_prime_stats.miss_experts,
                     resident_prime_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
                     resident_prime_stats.total_us / 1000.0, resident_prime_stats.install_us / 1000.0,
-                    resident_prime_stats.source_us / 1000.0, resident_prime_stats.upload_us / 1000.0,
+                    resident_prime_stats.source_wall_us / 1000.0, resident_prime_stats.source_us / 1000.0, resident_prime_stats.upload_us / 1000.0,
                     resident_prime_stats.resident_copy_ops);
         }
 
         if (oracle_prime_stats.miss_experts > 0) {
-            LLAMA_LOG_INFO("%s: Flash-MoE oracle-all-hit prime installs=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms\n",
+            LLAMA_LOG_INFO("%s: Flash-MoE oracle-all-hit prime installs=%" PRIu64 " bytes=%.2f GiB total=%.3f ms install=%.3f ms source=%.3f ms source_sum=%.3f ms upload=%.3f ms\n",
                     __func__,
                     oracle_prime_stats.miss_experts,
                     oracle_prime_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
                     oracle_prime_stats.total_us / 1000.0, oracle_prime_stats.install_us / 1000.0,
-                    oracle_prime_stats.source_us / 1000.0, oracle_prime_stats.upload_us / 1000.0);
+                    oracle_prime_stats.source_wall_us / 1000.0, oracle_prime_stats.source_us / 1000.0, oracle_prime_stats.upload_us / 1000.0);
         }
 
         std::stable_sort(layer_metrics.begin(), layer_metrics.end(),
@@ -2012,6 +2232,7 @@ private:
         }
 
         metrics.source_us += ggml_time_us() - t_read_start_us;
+        metrics.source_wall_us += metrics.source_us;
         metrics.install_us += metrics.source_us;
         return metrics;
     }
@@ -2019,15 +2240,25 @@ private:
     install_metrics read_expert_bytes(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
+            const llama_flash_moe_sidecar_entry * secondary_entry,
+            const llama_flash_moe_sidecar_entry * tertiary_entry,
+            int source_lane,
             int32_t expert,
-            uint8_t * out) {
+            uint8_t * out,
+            int32_t requested_cache_io_split,
+            bool use_striped_read,
+            bool use_prefetch_stripe) {
         install_metrics metrics;
         if (entry == nullptr || out == nullptr) {
             return metrics;
         }
 
         if (entry->source_format == llama_flash_moe_sidecar_format::affine_2bit_qwen397b) {
-            return transcode_affine_2bit_qwen397b(tensor, entry, expert, out);
+            metrics = transcode_affine_2bit_qwen397b(tensor, entry, expert, out);
+            if (source_lane >= 0 && source_lane < (int) metrics.source_lane_bytes.size()) {
+                metrics.source_lane_bytes[(size_t) source_lane] += metrics.bytes;
+            }
+            return metrics;
         }
 
         const off_t offset = static_cast<off_t>(entry->repacked_offset + size_t(expert) * entry->bytes_per_expert);
@@ -2052,13 +2283,80 @@ private:
 
             std::memcpy(out, bank.data() + copy_offset, entry->bytes_per_expert);
             metrics.source_us += ggml_time_us() - t_read_start_us;
+            metrics.source_wall_us += ggml_time_us() - t_read_start_us;
             metrics.resident_copy_ops++;
             metrics.install_us += metrics.source_us;
+            metrics.source_lane_bytes[0] += metrics.bytes;
             return metrics;
         }
 
         const int fd = fd_for(entry->repacked_path);
-        const int32_t chunks = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
+        const bool use_striped_demand_read =
+                use_striped_read &&
+                entry->source_format == llama_flash_moe_sidecar_format::gguf_bytes &&
+                secondary_entry != nullptr &&
+                tertiary_entry != nullptr;
+
+        if (use_striped_demand_read) {
+            const auto stripe_bytes = active_stripe_bytes(
+                    entry->bytes_per_expert,
+                    true,
+                    use_prefetch_stripe ? prefetch_stripe_weights : demand_stripe_weights);
+            const llama_flash_moe_sidecar_entry * stripe_entries[3] = { entry, secondary_entry, tertiary_entry };
+            size_t byte_cursor = 0;
+            ssize_t total_read = 0;
+            std::vector<pread_task> tasks;
+            tasks.reserve(3);
+
+            for (size_t lane = 0; lane < 3; ++lane) {
+                if (stripe_bytes[lane] == 0) {
+                    continue;
+                }
+
+                const auto * lane_entry = stripe_entries[lane];
+                const size_t chunk_offset = byte_cursor;
+                const size_t chunk_size = stripe_bytes[lane];
+                const off_t lane_offset = static_cast<off_t>(
+                        lane_entry->repacked_offset + size_t(expert) * lane_entry->bytes_per_expert + chunk_offset);
+                byte_cursor += stripe_bytes[lane];
+                metrics.source_lane_bytes[lane] += chunk_size;
+
+                tasks.push_back({
+                        fd_for(lane_entry->repacked_path),
+                        out + chunk_offset,
+                        lane_offset,
+                        chunk_size,
+                        0,
+                        0,
+                });
+            }
+
+            execute_pread_tasks(tasks);
+
+            for (const auto & task : tasks) {
+                metrics.pread_ops++;
+                metrics.source_us += task.elapsed_us;
+                if (task.result > 0) {
+                    total_read += task.result;
+                }
+            }
+
+            if (total_read != (ssize_t) entry->bytes_per_expert) {
+                throw std::runtime_error(format(
+                    "failed to striped-read expert %d for tensor '%s' across '%s', '%s', '%s'",
+                    expert,
+                    entry->tensor_name.c_str(),
+                    entry->repacked_path.c_str(),
+                    secondary_entry->repacked_path.c_str(),
+                    tertiary_entry->repacked_path.c_str()));
+            }
+
+            metrics.source_wall_us += ggml_time_us() - t_read_start_us;
+            metrics.install_us += metrics.source_us;
+            return metrics;
+        }
+
+        const int32_t chunks = active_cache_io_split(entry->bytes_per_expert, requested_cache_io_split);
 
         if (chunks <= 1) {
             const ssize_t n_read = pread(fd, out, entry->bytes_per_expert, offset);
@@ -2112,7 +2410,11 @@ private:
             }
         }
 
+        metrics.source_wall_us += ggml_time_us() - t_read_start_us;
         metrics.install_us += metrics.source_us;
+        if (source_lane >= 0 && source_lane < (int) metrics.source_lane_bytes.size()) {
+            metrics.source_lane_bytes[(size_t) source_lane] += metrics.bytes;
+        }
         return metrics;
     }
 
@@ -2172,8 +2474,14 @@ private:
     install_metrics load_into_slot(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
+            const llama_flash_moe_sidecar_entry * secondary_entry,
+            const llama_flash_moe_sidecar_entry * tertiary_entry,
+            int source_lane,
             int32_t expert,
-            int32_t slot) {
+            int32_t slot,
+            int32_t requested_cache_io_split,
+            bool use_striped_read,
+            bool use_prefetch_stripe) {
         install_metrics metrics;
         const int64_t t_install_start_us = ggml_time_us();
         if (tensor == nullptr || entry == nullptr) {
@@ -2182,30 +2490,74 @@ private:
 
         if (!force_backend_tensor_writes_enabled()) {
             if (uint8_t * dst = tensor_slot_cpu_visible_data(tensor, entry, slot)) {
-                metrics = read_expert_bytes(tensor, entry, expert, dst);
+                metrics = read_expert_bytes(tensor, entry, secondary_entry, tertiary_entry, source_lane, expert, dst, requested_cache_io_split, use_striped_read, use_prefetch_stripe);
                 metrics.install_us = ggml_time_us() - t_install_start_us;
                 return metrics;
             }
         }
 
         staging.resize(entry->bytes_per_expert);
-        metrics = read_expert_bytes(tensor, entry, expert, staging.data());
+        metrics = read_expert_bytes(tensor, entry, secondary_entry, tertiary_entry, source_lane, expert, staging.data(), requested_cache_io_split, use_striped_read, use_prefetch_stripe);
         const auto upload = upload_expert_bytes(tensor, entry, slot, staging.data());
         metrics.upload_us += upload.upload_us;
         metrics.install_us = ggml_time_us() - t_install_start_us;
         return metrics;
     }
 
-    install_metrics install_loads(layer_state & state, const std::vector<std::pair<int32_t, int32_t>> & pending_loads) {
+    install_metrics install_loads(
+            layer_state & state,
+            const std::vector<std::pair<int32_t, int32_t>> & pending_loads,
+            bool use_prefetch_entries = false) {
+        struct sidecar_entry_set {
+            const llama_flash_moe_sidecar_entry * gate_up = nullptr;
+            const llama_flash_moe_sidecar_entry * gate = nullptr;
+            const llama_flash_moe_sidecar_entry * up = nullptr;
+            const llama_flash_moe_sidecar_entry * down = nullptr;
+            const std::vector<mixed_slot_field> * mixed_fields = nullptr;
+            size_t mixed_bytes = 0;
+        };
+
         install_metrics totals;
         totals.experts = pending_loads.size();
 
         const int64_t t_install_start_us = ggml_time_us();
         const bool has_runtime_transcode = layer_has_runtime_transcode(state);
+        const sidecar_entry_set primary_entries = {
+            state.gate_up_entry,
+            state.gate_entry,
+            state.up_entry,
+            state.down_entry,
+            &state.mixed_slot_fields,
+            state.mixed_slot_bytes,
+        };
+        const sidecar_entry_set prefetch_entries = {
+            state.prefetch_gate_up_entry,
+            state.prefetch_gate_entry,
+            state.prefetch_up_entry,
+            state.prefetch_down_entry,
+            &state.mixed_prefetch_slot_fields,
+            state.mixed_prefetch_slot_bytes,
+        };
+        const sidecar_entry_set secondary_entries = {
+            state.secondary_gate_up_entry,
+            state.secondary_gate_entry,
+            state.secondary_up_entry,
+            state.secondary_down_entry,
+            &state.mixed_secondary_slot_fields,
+            state.mixed_secondary_slot_bytes,
+        };
+        const sidecar_entry_set & default_entries = use_prefetch_entries ? prefetch_entries : primary_entries;
+        const bool use_secondary_last_miss =
+                !use_prefetch_entries &&
+                !demand_stripe_requested &&
+                !demand_stripe_enabled &&
+                secondary_sidecar_enabled &&
+                pending_loads.size() == 4;
         std::vector<pending_slot_load> scheduled_loads;
         scheduled_loads.reserve(pending_loads.size());
 
-        for (const auto & [expert, slot] : pending_loads) {
+        for (size_t load_idx = 0; load_idx < pending_loads.size(); ++load_idx) {
+            const auto & [expert, slot] = pending_loads[load_idx];
             const int32_t evicted = state.slot_to_expert[slot];
             if (evicted >= 0 && evicted < expert_count) {
                 state.expert_to_slot[evicted] = -1;
@@ -2215,42 +2567,95 @@ private:
                 state.resident_count++;
                 state.peak_resident_count = std::max(state.peak_resident_count, state.resident_count);
             }
-            scheduled_loads.push_back({ expert, slot });
+            scheduled_loads.push_back({ expert, slot, use_secondary_last_miss && load_idx + 1 == pending_loads.size() });
         }
+
+        auto entries_for_load = [&](const pending_slot_load & load) -> const sidecar_entry_set & {
+            if (load.use_secondary) {
+                return secondary_entries;
+            }
+            return default_entries;
+        };
+
+        auto cache_io_split_for_load = [&](const pending_slot_load & load) -> int32_t {
+            if (load.use_secondary) {
+                return cache_io_split;
+            }
+            return use_prefetch_entries ? prefetch_cache_io_split : cache_io_split;
+        };
+
+        auto source_lane_for_load = [&](const pending_slot_load & load) -> int {
+            return load.use_secondary ? 1 : 0;
+        };
+
+        auto use_stripe_for_load = [&](const pending_slot_load & load) -> bool {
+            return (use_prefetch_entries ? prefetch_stripe_enabled : demand_stripe_enabled) && !load.use_secondary;
+        };
+
+        auto use_prefetch_stripe_for_load = [&](const pending_slot_load & load) -> bool {
+            return use_prefetch_entries && prefetch_stripe_enabled && !load.use_secondary;
+        };
+
+        auto secondary_entry_for_family = [&](routed_family family) -> const llama_flash_moe_sidecar_entry * {
+            switch (family) {
+                case routed_family::gate_up: return state.secondary_gate_up_entry;
+                case routed_family::gate:    return state.secondary_gate_entry;
+                case routed_family::up:      return state.secondary_up_entry;
+                case routed_family::down:    return state.secondary_down_entry;
+            }
+            return nullptr;
+        };
+
+        auto tertiary_entry_for_family = [&](routed_family family) -> const llama_flash_moe_sidecar_entry * {
+            switch (family) {
+                case routed_family::gate_up: return state.tertiary_gate_up_entry;
+                case routed_family::gate:    return state.tertiary_gate_entry;
+                case routed_family::up:      return state.tertiary_up_entry;
+                case routed_family::down:    return state.tertiary_down_entry;
+            }
+            return nullptr;
+        };
 
         auto accumulate_install = [&](const install_metrics & metrics, int64_t & dst_us, uint64_t & dst_bytes) {
             totals.bytes += metrics.bytes;
+            for (size_t lane = 0; lane < totals.source_lane_bytes.size(); ++lane) {
+                totals.source_lane_bytes[lane] += metrics.source_lane_bytes[lane];
+            }
             totals.pread_ops += metrics.pread_ops;
             totals.resident_copy_ops += metrics.resident_copy_ops;
             totals.source_us += metrics.source_us;
+            totals.source_wall_us += metrics.source_wall_us;
             totals.upload_us += metrics.upload_us;
             dst_us += metrics.install_us;
             dst_bytes += metrics.bytes;
         };
 
         if (parallel_slot_reads && !resident_bank_source) {
-            if (!has_runtime_transcode && effective_batched_install_reads()) {
-                if (mixed_slot_buffer && state.mixed_slot_bytes > 0 && !state.mixed_slot_fields.empty()) {
+            if (!has_runtime_transcode && !(use_prefetch_entries ? prefetch_stripe_enabled : demand_stripe_enabled) && effective_batched_install_reads()) {
+                if (mixed_slot_buffer && default_entries.mixed_bytes > 0 && default_entries.mixed_fields != nullptr && !default_entries.mixed_fields->empty()) {
                     std::vector<install_slot_buffer> slot_buffers;
                     std::vector<pread_task> tasks;
+                    const int32_t reserve_split = use_prefetch_entries ? prefetch_cache_io_split : cache_io_split;
                     slot_buffers.reserve(scheduled_loads.size());
-                    tasks.reserve(scheduled_loads.size() * state.mixed_slot_fields.size() * std::max<int32_t>(1, cache_io_split));
+                    tasks.reserve(scheduled_loads.size() * default_entries.mixed_fields->size() * std::max<int32_t>(1, reserve_split));
 
                     for (const auto & load : scheduled_loads) {
+                        const auto & entries = entries_for_load(load);
                         auto & slot_buffer = slot_buffers.emplace_back();
                         slot_buffer.expert = load.expert;
                         slot_buffer.slot = load.slot;
-                        slot_buffer.bytes.resize(state.mixed_slot_bytes);
-                        slot_buffer.fields.reserve(state.mixed_slot_fields.size());
+                        slot_buffer.source_lane = source_lane_for_load(load);
+                        slot_buffer.bytes.resize(entries.mixed_bytes);
+                        slot_buffer.fields.reserve(entries.mixed_fields != nullptr ? entries.mixed_fields->size() : 0);
 
-                        for (const auto & field : state.mixed_slot_fields) {
+                        for (const auto & field : *entries.mixed_fields) {
                             auto & install_field = slot_buffer.fields.emplace_back();
                             install_field.field = &field;
                             install_field.task_begin = tasks.size();
 
                             const int fd = fd_for(field.entry->repacked_path);
                             const off_t expert_offset = static_cast<off_t>(field.entry->repacked_offset + size_t(load.expert) * field.entry->bytes_per_expert);
-                            const int32_t split = active_cache_io_split(field.entry->bytes_per_expert, cache_io_split);
+                            const int32_t split = active_cache_io_split(field.entry->bytes_per_expert, cache_io_split_for_load(load));
                             install_field.task_count = split;
 
                             if (split <= 1) {
@@ -2288,13 +2693,18 @@ private:
                         }
                     }
 
+                    const int64_t t_source_start_us = ggml_time_us();
                     execute_pread_tasks(tasks);
+                    const int64_t source_wall_us = ggml_time_us() - t_source_start_us;
+
+                    totals.source_wall_us += source_wall_us;
 
                     for (auto & slot_buffer : slot_buffers) {
                         for (const auto & install_field : slot_buffer.fields) {
                             const auto & field = *install_field.field;
                             install_metrics metrics;
                             metrics.bytes = field.entry->bytes_per_expert;
+                            metrics.source_lane_bytes[(size_t) slot_buffer.source_lane] += metrics.bytes;
 
                             ssize_t total_read = 0;
                             for (int32_t task_idx = 0; task_idx < install_field.task_count; ++task_idx) {
@@ -2341,18 +2751,20 @@ private:
                 } else {
                     std::vector<install_chunk> chunks;
                     std::vector<pread_task> tasks;
+                    const int32_t reserve_split = use_prefetch_entries ? prefetch_cache_io_split : cache_io_split;
                     chunks.reserve(scheduled_loads.size() * 4);
-                    tasks.reserve(scheduled_loads.size() * 4 * std::max<int32_t>(1, cache_io_split));
+                    tasks.reserve(scheduled_loads.size() * 4 * std::max<int32_t>(1, reserve_split));
 
                     auto queue_chunk = [&](const pending_slot_load & load, ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry, routed_family family) {
                         if (tensor == nullptr || entry == nullptr) {
                             return;
                         }
 
-                        auto & chunk = chunks.emplace_back();
-                        chunk.tensor = tensor;
-                        chunk.entry = entry;
-                        chunk.family = family;
+                            auto & chunk = chunks.emplace_back();
+                            chunk.tensor = tensor;
+                            chunk.entry = entry;
+                            chunk.source_lane = source_lane_for_load(load);
+                            chunk.family = family;
                         chunk.expert = load.expert;
                         chunk.slot = load.slot;
                         chunk.direct_dst = force_backend_tensor_writes_enabled() ? nullptr : tensor_slot_cpu_visible_data(tensor, entry, load.slot);
@@ -2363,7 +2775,7 @@ private:
 
                         const int fd = fd_for(entry->repacked_path);
                         const off_t expert_offset = static_cast<off_t>(entry->repacked_offset + size_t(load.expert) * entry->bytes_per_expert);
-                        const int32_t split = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
+                        const int32_t split = active_cache_io_split(entry->bytes_per_expert, cache_io_split_for_load(load));
                         chunk.task_count = split;
 
                         if (split <= 1) {
@@ -2401,17 +2813,23 @@ private:
                     };
 
                     for (const auto & load : scheduled_loads) {
-                        queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
-                        queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
-                        queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
-                        queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
+                        const auto & entries = entries_for_load(load);
+                        queue_chunk(load, state.gate_up_tensor, entries.gate_up, routed_family::gate_up);
+                        queue_chunk(load, state.gate_tensor,    entries.gate,    routed_family::gate);
+                        queue_chunk(load, state.up_tensor,      entries.up,      routed_family::up);
+                        queue_chunk(load, state.down_tensor,    entries.down,    routed_family::down);
                     }
 
+                    const int64_t t_source_start_us = ggml_time_us();
                     execute_pread_tasks(tasks);
+                    const int64_t source_wall_us = ggml_time_us() - t_source_start_us;
+
+                    totals.source_wall_us += source_wall_us;
 
                     for (auto & chunk : chunks) {
                         install_metrics metrics;
                         metrics.bytes = chunk.entry->bytes_per_expert;
+                        metrics.source_lane_bytes[(size_t) chunk.source_lane] += metrics.bytes;
 
                         ssize_t total_read = 0;
                         for (int32_t task_idx = 0; task_idx < chunk.task_count; ++task_idx) {
@@ -2465,30 +2883,42 @@ private:
                         }
 
                     auto & chunk = chunks.emplace_back();
-                    chunk.tensor = tensor;
-                    chunk.entry = entry;
+                        chunk.tensor = tensor;
+                        chunk.entry = entry;
+                        chunk.secondary_entry = use_stripe_for_load(load) ? secondary_entry_for_family(family) : nullptr;
+                        chunk.tertiary_entry = use_stripe_for_load(load) ? tertiary_entry_for_family(family) : nullptr;
                         chunk.family = family;
                         chunk.expert = load.expert;
                         chunk.slot = load.slot;
+                        chunk.use_striped_read = use_stripe_for_load(load);
                         chunk.direct_dst = force_backend_tensor_writes_enabled() ? nullptr : tensor_slot_cpu_visible_data(tensor, entry, load.slot);
                         if (chunk.direct_dst == nullptr) {
                             chunk.bytes.resize(entry->bytes_per_expert);
                         }
 
-                        futures.emplace_back(std::async(std::launch::async, [this, &chunk]() {
+                        const int32_t requested_split = cache_io_split_for_load(load);
+                        const bool use_prefetch_stripe = use_prefetch_stripe_for_load(load);
+                        futures.emplace_back(std::async(std::launch::async, [this, &chunk, requested_split, use_prefetch_stripe]() {
                         return read_expert_bytes(
                                 chunk.tensor,
                                 chunk.entry,
+                                chunk.secondary_entry,
+                                chunk.tertiary_entry,
+                                chunk.source_lane,
                                 chunk.expert,
-                                chunk.direct_dst != nullptr ? chunk.direct_dst : chunk.bytes.data());
+                                chunk.direct_dst != nullptr ? chunk.direct_dst : chunk.bytes.data(),
+                                requested_split,
+                                chunk.use_striped_read,
+                                use_prefetch_stripe);
                     }));
                 };
 
                 for (const auto & load : scheduled_loads) {
-                    queue_chunk(load, state.gate_up_tensor, state.gate_up_entry, routed_family::gate_up);
-                    queue_chunk(load, state.gate_tensor,    state.gate_entry,    routed_family::gate);
-                    queue_chunk(load, state.up_tensor,      state.up_entry,      routed_family::up);
-                    queue_chunk(load, state.down_tensor,    state.down_entry,    routed_family::down);
+                    const auto & entries = entries_for_load(load);
+                    queue_chunk(load, state.gate_up_tensor, entries.gate_up, routed_family::gate_up);
+                    queue_chunk(load, state.gate_tensor,    entries.gate,    routed_family::gate);
+                    queue_chunk(load, state.up_tensor,      entries.up,      routed_family::up);
+                    queue_chunk(load, state.down_tensor,    entries.down,    routed_family::down);
                 }
 
                 std::vector<bool> chunk_done(chunks.size(), false);
@@ -2548,20 +2978,64 @@ private:
             }
         } else {
             for (const auto & load : scheduled_loads) {
+                const auto & entries = entries_for_load(load);
+                const int32_t requested_split = cache_io_split_for_load(load);
+                const bool use_striped_read = use_stripe_for_load(load);
+                const bool use_prefetch_stripe = use_prefetch_stripe_for_load(load);
                 {
-                    const auto metrics = load_into_slot(state.gate_up_tensor, state.gate_up_entry, load.expert, load.slot);
+                    const auto metrics = load_into_slot(
+                            state.gate_up_tensor,
+                            entries.gate_up,
+                            use_striped_read ? state.secondary_gate_up_entry : nullptr,
+                            use_striped_read ? state.tertiary_gate_up_entry : nullptr,
+                            source_lane_for_load(load),
+                            load.expert,
+                            load.slot,
+                            requested_split,
+                            use_striped_read,
+                            use_prefetch_stripe);
                     accumulate_install(metrics, totals.gate_up_install_us, totals.gate_up_bytes);
                 }
                 {
-                    const auto metrics = load_into_slot(state.gate_tensor, state.gate_entry, load.expert, load.slot);
+                    const auto metrics = load_into_slot(
+                            state.gate_tensor,
+                            entries.gate,
+                            use_striped_read ? state.secondary_gate_entry : nullptr,
+                            use_striped_read ? state.tertiary_gate_entry : nullptr,
+                            source_lane_for_load(load),
+                            load.expert,
+                            load.slot,
+                            requested_split,
+                            use_striped_read,
+                            use_prefetch_stripe);
                     accumulate_install(metrics, totals.gate_install_us, totals.gate_bytes);
                 }
                 {
-                    const auto metrics = load_into_slot(state.up_tensor, state.up_entry, load.expert, load.slot);
+                    const auto metrics = load_into_slot(
+                            state.up_tensor,
+                            entries.up,
+                            use_striped_read ? state.secondary_up_entry : nullptr,
+                            use_striped_read ? state.tertiary_up_entry : nullptr,
+                            source_lane_for_load(load),
+                            load.expert,
+                            load.slot,
+                            requested_split,
+                            use_striped_read,
+                            use_prefetch_stripe);
                     accumulate_install(metrics, totals.up_install_us, totals.up_bytes);
                 }
                 {
-                    const auto metrics = load_into_slot(state.down_tensor, state.down_entry, load.expert, load.slot);
+                    const auto metrics = load_into_slot(
+                            state.down_tensor,
+                            entries.down,
+                            use_striped_read ? state.secondary_down_entry : nullptr,
+                            use_striped_read ? state.tertiary_down_entry : nullptr,
+                            source_lane_for_load(load),
+                            load.expert,
+                            load.slot,
+                            requested_split,
+                            use_striped_read,
+                            use_prefetch_stripe);
                     accumulate_install(metrics, totals.down_install_us, totals.down_bytes);
                 }
             }
@@ -2688,6 +3162,10 @@ llama_context::llama_context(
 
     if (model.flash_moe_temporal_prefetch_enabled()) {
         LLAMA_LOG_WARN("%s: --moe-prefetch-temporal currently refreshes the current token's routed experts after decode to bias slot residency; it is not a future expert predictor in this build\n",
+                __func__);
+    }
+    if (model.flash_moe_temporal_prefetch_sparse_enabled()) {
+        LLAMA_LOG_INFO("%s: --moe-prefetch-temporal-sparse is enabled; temporal prefetch alternates even and odd routed layers on successive decode steps\n",
                 __func__);
     }
     if (model.flash_moe_predict_prev_token_enabled()) {

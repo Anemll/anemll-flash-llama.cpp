@@ -1072,12 +1072,29 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory; for Flash-MoE sidecar runs keep --fit on so dense/shared offload is clamped against the routed slot-bank budget\n", __func__);
-        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
+        auto mparams_fit = mparams;
+
+        // Experimental multi-sidecar routing knobs do not affect the dense/shared
+        // memory footprint that --fit is sizing against, and passing them through
+        // the fit probe can destabilize the repeated probe loads.
+        mparams_fit.moe_prefetch_sidecar_path = nullptr;
+        mparams_fit.moe_secondary_sidecar_path = nullptr;
+        mparams_fit.moe_tertiary_sidecar_path = nullptr;
+        mparams_fit.moe_demand_stripe = nullptr;
+        mparams_fit.moe_prefetch_stripe = nullptr;
+
+        llama_params_fit(params.model.path.c_str(), &mparams_fit, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        mparams.n_gpu_layers = mparams_fit.n_gpu_layers;
+        mparams.split_mode = mparams_fit.split_mode;
+        mparams.main_gpu = mparams_fit.main_gpu;
+        mparams.tensor_split = mparams_fit.tensor_split;
+        mparams.tensor_buft_overrides = mparams_fit.tensor_buft_overrides;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1348,17 +1365,24 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
-    mparams.moe_sidecar_path   = params.moe_sidecar.empty() ? nullptr : params.moe_sidecar.c_str();
-    mparams.moe_mode           = params.moe_mode.empty() ? nullptr : params.moe_mode.c_str();
-    mparams.moe_trace_file     = params.moe_trace.empty() ? nullptr : params.moe_trace.c_str();
-    mparams.moe_quant_map      = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
-    mparams.moe_verify_sidecar = params.moe_verify_sidecar;
-    mparams.moe_prefetch_temporal = params.moe_prefetch_temporal;
+    mparams.moe_sidecar_path          = params.moe_sidecar.empty() ? nullptr : params.moe_sidecar.c_str();
+    mparams.moe_prefetch_sidecar_path = params.moe_prefetch_sidecar.empty() ? nullptr : params.moe_prefetch_sidecar.c_str();
+    mparams.moe_secondary_sidecar_path = params.moe_secondary_sidecar.empty() ? nullptr : params.moe_secondary_sidecar.c_str();
+    mparams.moe_tertiary_sidecar_path = params.moe_tertiary_sidecar.empty() ? nullptr : params.moe_tertiary_sidecar.c_str();
+    mparams.moe_mode                  = params.moe_mode.empty() ? nullptr : params.moe_mode.c_str();
+    mparams.moe_trace_file            = params.moe_trace.empty() ? nullptr : params.moe_trace.c_str();
+    mparams.moe_quant_map             = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
+    mparams.moe_demand_stripe         = params.moe_demand_stripe.empty() ? nullptr : params.moe_demand_stripe.c_str();
+    mparams.moe_prefetch_stripe       = params.moe_prefetch_stripe.empty() ? nullptr : params.moe_prefetch_stripe.c_str();
+    mparams.moe_verify_sidecar        = params.moe_verify_sidecar;
+    mparams.moe_prefetch_temporal = params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse;
+    mparams.moe_prefetch_temporal_sparse = params.moe_prefetch_temporal_sparse;
     mparams.moe_predict_prev_token = params.moe_predict_prev_token;
     mparams.moe_predict_top1_prev = params.moe_predict_top1_prev;
     mparams.moe_slot_bank      = params.moe_slot_bank;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
+    mparams.moe_prefetch_cache_io_split = params.moe_prefetch_cache_io_split;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -187,11 +188,7 @@ def write_dense_model(
     first_reader: GGUFReader,
     output_model: Path,
 ) -> tuple[int, int]:
-    writer = GGUFWriter(
-        output_model,
-        arch=reader_scalar(first_reader, gguf.Keys.General.ARCHITECTURE),
-        endianess=first_reader.endianess,
-    )
+    writer = GGUFWriter(output_model, arch=reader_scalar(first_reader, gguf.Keys.General.ARCHITECTURE), endianess=first_reader.endianess)
     copy_metadata(first_reader, writer)
 
     total_bytes = 0

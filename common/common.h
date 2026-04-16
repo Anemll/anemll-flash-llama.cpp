@@ -636,17 +636,24 @@ struct common_params {
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
 
-    std::string moe_sidecar   = "";      // Flash-MoE sidecar directory or manifest path              // NOLINT
-    std::string moe_mode      = "stock"; // Flash-MoE runtime mode                                     // NOLINT
-    std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
-    std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
-    std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
+    std::string moe_sidecar           = "";      // Flash-MoE sidecar directory or manifest path                // NOLINT
+    std::string moe_prefetch_sidecar  = "";      // optional alternate sidecar used only for prefetch           // NOLINT
+    std::string moe_secondary_sidecar = "";      // optional alternate sidecar used for last-miss spill loads   // NOLINT
+    std::string moe_tertiary_sidecar  = "";      // optional alternate sidecar used for striped demand tests    // NOLINT
+    std::string moe_mode              = "stock"; // Flash-MoE runtime mode                                       // NOLINT
+    std::string moe_trace             = "";      // reserved trace output path                                   // NOLINT
+    std::string moe_quant_map         = "";      // reserved dynamic-quant policy path                           // NOLINT
+    std::string moe_demand_stripe     = "";      // experimental weighted demand striping, e.g. 5:1:1          // NOLINT
+    std::string moe_prefetch_stripe   = "";      // experimental weighted prefetch striping, e.g. 0:1:1        // NOLINT
+    std::string oracle_dump           = "";      // llama-cli tensor oracle dump directory                       // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
     int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
+    int32_t     moe_prefetch_cache_io_split = 0; // override split count for prefetch sidecar reads     // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
     int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
+    bool        moe_prefetch_temporal_sparse = false; // alternate even/odd layer temporal prefetch   // NOLINT
     bool        moe_predict_prev_token = false; // prev-token same-layer expert predictor              // NOLINT
     bool        moe_predict_top1_prev = false; // prev-token top-1 same-layer predictor               // NOLINT
     bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT
