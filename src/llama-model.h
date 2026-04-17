@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -527,6 +528,8 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    std::unordered_map<std::string, struct ggml_tensor *> flash_moe_prefill_scratch_tensors;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
@@ -590,13 +593,35 @@ struct llama_model {
     bool flash_moe_oracle_all_hit_enabled() const;
     bool flash_moe_oracle_prefetch_enabled() const;
     bool flash_moe_temporal_prefetch_enabled() const;
+    bool flash_moe_temporal_prefetch_sparse_enabled() const;
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
+    bool flash_moe_secondary_sidecar_enabled() const;
+    bool flash_moe_demand_stripe_enabled() const;
+    bool flash_moe_demand_distribute_enabled() const;
+    bool flash_moe_prefill_stripe_enabled() const;
+    bool flash_moe_prefill_distribute_enabled() const;
+    bool flash_moe_prefetch_stripe_enabled() const;
+    bool flash_moe_prefetch_distribute_enabled() const;
+    bool flash_moe_prefill_layer_major_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
+    int32_t flash_moe_prefill_banks() const;
     int32_t flash_moe_cache_io_split() const;
+    int32_t flash_moe_prefill_cache_io_split() const;
+    int32_t flash_moe_prefetch_cache_io_split() const;
+    std::array<int32_t, 3> flash_moe_demand_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_demand_distribute_weights() const;
+    std::array<int32_t, 3> flash_moe_prefill_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_prefill_distribute_weights() const;
+    std::array<int32_t, 3> flash_moe_prefetch_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_prefetch_distribute_weights() const;
     int32_t moe_n_expert_used() const;
     const char * flash_moe_trace_file() const;
     const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_prefetch_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_secondary_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_tertiary_sidecar_entry_for(const char * name) const;
+    struct ggml_tensor * flash_moe_prefill_scratch_tensor_for(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

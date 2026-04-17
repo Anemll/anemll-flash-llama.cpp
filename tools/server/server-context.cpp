@@ -2127,9 +2127,30 @@ private:
             }
         }
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx);
-        int32_t n_ubatch = llama_n_ubatch(ctx);
+        // process prompt batches with the prefill-layer-major override when requested,
+        // but keep normal decode batching on the user's -b / -ub settings.
+        const int32_t n_batch_ctx  = llama_n_batch(ctx);
+        const int32_t n_ubatch_ctx = llama_n_ubatch(ctx);
+        const int32_t n_batch_decode = std::min<int32_t>(n_batch_ctx, params_base.n_batch);
+        const int32_t n_ubatch_decode = std::min<int32_t>(n_ubatch_ctx, params_base.n_ubatch);
+        const bool use_layer_major_prefill_batch =
+            params_base.moe_prefill_layer_major &&
+            params_base.moe_prefill_batch > 0;
+        int32_t n_batch  = n_batch_decode;
+        int32_t n_ubatch = n_ubatch_decode;
+
+        if (use_layer_major_prefill_batch) {
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    n_batch = std::min<int32_t>(n_batch_ctx, params_base.moe_prefill_batch);
+                    const int32_t configured_micro = params_base.moe_prefill_micro_batch > 0 ?
+                            params_base.moe_prefill_micro_batch :
+                            n_batch;
+                    n_ubatch = std::min<int32_t>(n_ubatch_ctx, configured_micro);
+                    break;
+                }
+            }
+        }
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
@@ -2549,7 +2570,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        {
+                        if (!use_layer_major_prefill_batch) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;

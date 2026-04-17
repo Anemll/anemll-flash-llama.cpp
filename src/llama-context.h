@@ -328,6 +328,8 @@ private:
     ggml_threadpool_t threadpool_batch = nullptr;
 
     std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_slot_runtime;
+    std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_prefill_runtime;
+    mutable llm_flash_moe_slot_runtime_i * flash_moe_active_runtime = nullptr;
     ggml_backend_sched_eval_callback flash_moe_cb_eval_downstream = nullptr;
     void * flash_moe_cb_eval_downstream_user_data = nullptr;
 

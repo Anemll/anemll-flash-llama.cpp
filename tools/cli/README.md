@@ -36,7 +36,7 @@
 | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
 | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
-| `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>prints the usual libllama timing summary, including model load time; Flash-MoE slot-bank runs also print the routed profile table, cached expert hit rate, and Metal replay cache hit rate<br/>(env: LLAMA_ARG_PERF) |
+| `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>in this `llama-cli` path, Flash-MoE slot-bank runs print the routed profile table, cached expert hit rate, Metal replay cache hit rate, and prompt/generation throughput summary; it does not currently print the standard libllama `load time` footer on exit<br/>(env: LLAMA_ARG_PERF) |
 | `-f, --file FNAME` | a file containing the prompt (default: none) |
 | `-bf, --binary-file FNAME` | binary file containing the prompt (default: none) |
 | `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |

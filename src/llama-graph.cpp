@@ -1405,6 +1405,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return moe_out;
     }
 
+    if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_dedicated_prefill_moe(il)) {
+        // Materialize the router/top-k subtree before the dedicated prompt-MoE
+        // callback returns early. The regular slot-map path expands `weights`
+        // just below, and skipping that expansion can leave the custom op
+        // reading garbage from scheduler-reused intermediates.
+        ggml_build_forward_expand(gf, weights);
+
+        ggml_tensor * moe_out = flash_moe_slot_runtime->build_prefill_moe_tensor(
+                ctx0,
+                cur,
+                selected_experts,
+                weights,
+                il);
+        if (moe_out != nullptr) {
+            cb(moe_out, "ffn_moe_prefill_tail", il);
+            if (sched != nullptr && backend_cpu != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
+            }
+            return moe_out;
+        }
+    }
+
     ggml_tensor * selected_experts_mm = selected_experts;
     if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_layer(il)) {
         if (flash_moe_slot_runtime->uses_native_slot_map(il)) {
@@ -1420,6 +1442,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             selected_experts_mm = build_inp_moe_slot_ids(il, selected_experts->ne[0], selected_experts->ne[1]);
             cb(selected_experts_mm, "ffn_moe_slot_ids", il);
+        }
+    }
+
+    ggml_tensor * gate_up_exps_mm = gate_up_exps;
+    ggml_tensor * up_exps_mm      = up_exps;
+    ggml_tensor * gate_exps_mm    = gate_exps;
+    ggml_tensor * down_exps_mm    = down_exps;
+    if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_layer(il)) {
+        if (gate_up_exps_mm != nullptr) {
+            gate_up_exps_mm = flash_moe_slot_runtime->select_routed_weight_tensor(il, gate_up_exps_mm);
+        }
+        if (up_exps_mm != nullptr) {
+            up_exps_mm = flash_moe_slot_runtime->select_routed_weight_tensor(il, up_exps_mm);
+        }
+        if (gate_exps_mm != nullptr) {
+            gate_exps_mm = flash_moe_slot_runtime->select_routed_weight_tensor(il, gate_exps_mm);
+        }
+        if (down_exps_mm != nullptr) {
+            down_exps_mm = flash_moe_slot_runtime->select_routed_weight_tensor(il, down_exps_mm);
         }
     }
 
@@ -1441,7 +1482,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        gate_up_merged = build_lora_mm_id(gate_up_exps, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
+        gate_up_merged = build_lora_mm_id(gate_up_exps_mm, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up_merged, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1465,7 +1506,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps_mm, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1483,7 +1524,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps_mm, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1576,7 +1617,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts_mm); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps_mm, cur, selected_experts_mm); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

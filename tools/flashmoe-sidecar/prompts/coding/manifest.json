@@ -1,0 +1,40 @@
+{
+  "tokenizer": "tokenizer.json (MiniMaxAI/MiniMax-M2:tokenizer.json)",
+  "tokenizer_json": null,
+  "tokenizer_repo": "MiniMaxAI/MiniMax-M2",
+  "notes": [
+    "Prompt files are exact token prefixes under the selected tokenizer.",
+    "The 22k sample uses 22528 tokens (22 * 1024).",
+    "Counts do not include any BOS or chat-template tokens that a runtime may inject separately."
+  ],
+  "prompts": [
+    {
+      "label": "1k",
+      "target_tokens": 1024,
+      "actual_tokens": 1024,
+      "bytes_utf8": 4344,
+      "path": "prompts/coding/coding_1k.txt"
+    },
+    {
+      "label": "4k",
+      "target_tokens": 4096,
+      "actual_tokens": 4096,
+      "bytes_utf8": 17018,
+      "path": "prompts/coding/coding_4k.txt"
+    },
+    {
+      "label": "16k",
+      "target_tokens": 16384,
+      "actual_tokens": 16384,
+      "bytes_utf8": 67650,
+      "path": "prompts/coding/coding_16k.txt"
+    },
+    {
+      "label": "22k",
+      "target_tokens": 22528,
+      "actual_tokens": 22528,
+      "bytes_utf8": 92910,
+      "path": "prompts/coding/coding_22k.txt"
+    }
+  ]
+}

@@ -1058,8 +1058,50 @@ common_init_result::common_init_result(common_params & params) :
         flash_moe_gpu_offload_requested &&
         !params.n_ubatch_explicit) {
         params.n_ubatch = 1;
-        LOG_INF("%s: defaulting Flash-MoE slot-bank GPU runs to -ub 1; pass -ub/--ubatch-size to override\n",
+        LOG_INF("%s: defaulting Flash-MoE slot-bank GPU runs to -ub 1 for conservative compatibility; pass -ub/--ubatch-size to override. Batched prefill can improve throughput when --moe-slot-bank is sized for the larger per-layer routed-expert set\n",
                 __func__);
+    }
+
+    if (flash_moe_sidecar_runtime &&
+        flash_moe_slot_bank_runtime &&
+        flash_moe_gpu_offload_requested &&
+        params.n_ubatch > 1 &&
+        params.moe_slot_bank > 0 &&
+        params.moe_topk_override > 0) {
+        const int64_t heuristic_slots =
+            (int64_t) params.n_ubatch * (int64_t) params.moe_topk_override;
+        if ((int64_t) params.moe_slot_bank < heuristic_slots) {
+            LOG_WRN("%s: Flash-MoE batched slot-bank prefill may overflow: -ub %d with --moe-topk %d can require up to %lld routed experts per layer, but --moe-slot-bank is %d. Increase --moe-slot-bank, or reduce -ub/--ubatch-size or --moe-topk\n",
+                    __func__,
+                    params.n_ubatch,
+                    params.moe_topk_override,
+                    (long long) heuristic_slots,
+                    params.moe_slot_bank);
+        }
+    }
+
+    if (params.moe_prefill_batch < 0 || params.moe_prefill_micro_batch < 0) {
+        throw std::invalid_argument("Flash-MoE prefill batch settings must be >= 0");
+    }
+
+    if (params.moe_prefill_layer_major) {
+        if (params.moe_prefill_batch == 0) {
+            params.moe_prefill_batch = params.n_batch;
+        }
+        if (params.moe_prefill_micro_batch == 0) {
+            params.moe_prefill_micro_batch = params.moe_prefill_batch;
+        }
+        if (params.moe_prefill_micro_batch > params.moe_prefill_batch) {
+            LOG_WRN("%s: clamping --moe-prefill-micro-batch %d to --moe-prefill-batch %d\n",
+                    __func__, params.moe_prefill_micro_batch, params.moe_prefill_batch);
+            params.moe_prefill_micro_batch = params.moe_prefill_batch;
+        }
+    } else {
+        if (params.moe_prefill_batch > 0 || params.moe_prefill_micro_batch > 0) {
+            LOG_INF("%s: ignoring prefill-only batching settings because --moe-prefill-layer-major is not enabled\n", __func__);
+            params.moe_prefill_batch = 0;
+            params.moe_prefill_micro_batch = 0;
+        }
     }
 
     auto mparams = common_model_params_to_llama(params);
@@ -1072,12 +1114,33 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory; for Flash-MoE sidecar runs keep --fit on so dense/shared offload is clamped against the routed slot-bank budget\n", __func__);
-        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
+        auto mparams_fit = mparams;
+
+        // Experimental multi-sidecar routing knobs do not affect the dense/shared
+        // memory footprint that --fit is sizing against, and passing them through
+        // the fit probe can destabilize the repeated probe loads.
+        mparams_fit.moe_prefetch_sidecar_path = nullptr;
+        mparams_fit.moe_secondary_sidecar_path = nullptr;
+        mparams_fit.moe_tertiary_sidecar_path = nullptr;
+        mparams_fit.moe_demand_stripe = nullptr;
+        mparams_fit.moe_demand_distribute = nullptr;
+        mparams_fit.moe_prefill_stripe = nullptr;
+        mparams_fit.moe_prefill_distribute = nullptr;
+        mparams_fit.moe_prefetch_stripe = nullptr;
+        mparams_fit.moe_prefetch_distribute = nullptr;
+
+        llama_params_fit(params.model.path.c_str(), &mparams_fit, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        mparams.n_gpu_layers = mparams_fit.n_gpu_layers;
+        mparams.split_mode = mparams_fit.split_mode;
+        mparams.main_gpu = mparams_fit.main_gpu;
+        mparams.tensor_split = mparams_fit.tensor_split;
+        mparams.tensor_buft_overrides = mparams_fit.tensor_buft_overrides;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1348,17 +1411,31 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
-    mparams.moe_sidecar_path   = params.moe_sidecar.empty() ? nullptr : params.moe_sidecar.c_str();
-    mparams.moe_mode           = params.moe_mode.empty() ? nullptr : params.moe_mode.c_str();
-    mparams.moe_trace_file     = params.moe_trace.empty() ? nullptr : params.moe_trace.c_str();
-    mparams.moe_quant_map      = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
-    mparams.moe_verify_sidecar = params.moe_verify_sidecar;
-    mparams.moe_prefetch_temporal = params.moe_prefetch_temporal;
+    mparams.moe_sidecar_path          = params.moe_sidecar.empty() ? nullptr : params.moe_sidecar.c_str();
+    mparams.moe_prefetch_sidecar_path = params.moe_prefetch_sidecar.empty() ? nullptr : params.moe_prefetch_sidecar.c_str();
+    mparams.moe_secondary_sidecar_path = params.moe_secondary_sidecar.empty() ? nullptr : params.moe_secondary_sidecar.c_str();
+    mparams.moe_tertiary_sidecar_path = params.moe_tertiary_sidecar.empty() ? nullptr : params.moe_tertiary_sidecar.c_str();
+    mparams.moe_mode                  = params.moe_mode.empty() ? nullptr : params.moe_mode.c_str();
+    mparams.moe_trace_file            = params.moe_trace.empty() ? nullptr : params.moe_trace.c_str();
+    mparams.moe_quant_map             = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
+    mparams.moe_demand_stripe         = params.moe_demand_stripe.empty() ? nullptr : params.moe_demand_stripe.c_str();
+    mparams.moe_demand_distribute     = params.moe_demand_distribute.empty() ? nullptr : params.moe_demand_distribute.c_str();
+    mparams.moe_prefill_stripe        = params.moe_prefill_stripe.empty() ? nullptr : params.moe_prefill_stripe.c_str();
+    mparams.moe_prefill_distribute    = params.moe_prefill_distribute.empty() ? nullptr : params.moe_prefill_distribute.c_str();
+    mparams.moe_prefetch_stripe       = params.moe_prefetch_stripe.empty() ? nullptr : params.moe_prefetch_stripe.c_str();
+    mparams.moe_prefetch_distribute   = params.moe_prefetch_distribute.empty() ? nullptr : params.moe_prefetch_distribute.c_str();
+    mparams.moe_verify_sidecar        = params.moe_verify_sidecar;
+    mparams.moe_prefetch_temporal = params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse;
+    mparams.moe_prefetch_temporal_sparse = params.moe_prefetch_temporal_sparse;
+    mparams.moe_prefill_layer_major = params.moe_prefill_layer_major;
     mparams.moe_predict_prev_token = params.moe_predict_prev_token;
     mparams.moe_predict_top1_prev = params.moe_predict_top1_prev;
     mparams.moe_slot_bank      = params.moe_slot_bank;
+    mparams.moe_prefill_banks  = params.moe_prefill_banks;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
+    mparams.moe_prefill_cache_io_split = params.moe_prefill_cache_io_split;
+    mparams.moe_prefetch_cache_io_split = params.moe_prefetch_cache_io_split;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1387,6 +1464,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.moe_prefill_batch = params.moe_prefill_batch;
+    cparams.moe_prefill_micro_batch = params.moe_prefill_micro_batch;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

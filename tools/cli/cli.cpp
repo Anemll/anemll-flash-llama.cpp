@@ -480,6 +480,84 @@ private:
         console::spinner::stop();
         std::string curr_content;
         bool is_thinking = false;
+        bool suppress_raw_thinking = enable_reasoning == 0;
+        bool defer_initial_content = suppress_raw_thinking && reasoning_format != COMMON_REASONING_FORMAT_NONE;
+        bool saw_reasoning_delta = false;
+        bool inside_raw_think = false;
+        std::string raw_think_scan_buf;
+        std::string deferred_content_buf;
+
+        auto emit_content = [&](const std::string & text) {
+            if (text.empty()) {
+                return;
+            }
+            if (is_thinking) {
+                console::log("\n[End thinking]\n\n");
+                console::set_display(DISPLAY_TYPE_RESET);
+                is_thinking = false;
+            }
+            curr_content += text;
+            console::log("%s", text.c_str());
+            console::flush();
+        };
+
+        auto handle_content_delta = [&](const std::string & delta) {
+            if (delta.empty()) {
+                return;
+            }
+
+            if (!suppress_raw_thinking) {
+                emit_content(delta);
+                return;
+            }
+
+            static const std::string think_open = "<think>";
+            static const std::string think_close = "</think>";
+
+            raw_think_scan_buf += delta;
+
+            while (!raw_think_scan_buf.empty()) {
+                if (inside_raw_think) {
+                    const size_t close_pos = raw_think_scan_buf.find(think_close);
+                    if (close_pos == std::string::npos) {
+                        const size_t keep = think_close.size() > 1 ? think_close.size() - 1 : 0;
+                        if (raw_think_scan_buf.size() > keep) {
+                            raw_think_scan_buf.erase(0, raw_think_scan_buf.size() - keep);
+                        }
+                        break;
+                    }
+
+                    raw_think_scan_buf.erase(0, close_pos + think_close.size());
+                    inside_raw_think = false;
+                    continue;
+                }
+
+                const size_t open_pos = raw_think_scan_buf.find(think_open);
+                const size_t close_pos = raw_think_scan_buf.find(think_close);
+
+                if (close_pos != std::string::npos &&
+                    (open_pos == std::string::npos || close_pos < open_pos) &&
+                    curr_content.empty()) {
+                    raw_think_scan_buf.erase(0, close_pos + think_close.size());
+                    continue;
+                }
+
+                if (open_pos == std::string::npos) {
+                    const size_t keep = think_open.size() > 1 ? think_open.size() - 1 : 0;
+                    if (raw_think_scan_buf.size() <= keep) {
+                        break;
+                    }
+                    const size_t emit_len = raw_think_scan_buf.size() - keep;
+                    emit_content(raw_think_scan_buf.substr(0, emit_len));
+                    raw_think_scan_buf.erase(0, emit_len);
+                    break;
+                }
+
+                emit_content(raw_think_scan_buf.substr(0, open_pos));
+                raw_think_scan_buf.erase(0, open_pos + think_open.size());
+                inside_raw_think = true;
+            }
+        };
 
         while (result) {
             if (should_stop()) {
@@ -497,18 +575,27 @@ private:
             auto res_partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get());
             if (res_partial) {
                 out_timings = std::move(res_partial->timings);
+                if (raw_prompt.has_value()) {
+                    emit_content(res_partial->content);
+                    result = rd.next(should_stop);
+                    continue;
+                }
                 for (const auto & diff : res_partial->oaicompat_msg_diffs) {
                     if (!diff.content_delta.empty()) {
-                        if (is_thinking) {
-                            console::log("\n[End thinking]\n\n");
-                            console::set_display(DISPLAY_TYPE_RESET);
-                            is_thinking = false;
+                        if (defer_initial_content && !saw_reasoning_delta && curr_content.empty()) {
+                            deferred_content_buf += diff.content_delta;
+                        } else {
+                            handle_content_delta(diff.content_delta);
                         }
-                        curr_content += diff.content_delta;
-                        console::log("%s", diff.content_delta.c_str());
-                        console::flush();
                     }
                     if (!diff.reasoning_content_delta.empty()) {
+                        saw_reasoning_delta = true;
+                        if (defer_initial_content) {
+                            deferred_content_buf.clear();
+                        }
+                        if (enable_reasoning == 0) {
+                            continue;
+                        }
                         console::set_display(DISPLAY_TYPE_REASONING);
                         if (!is_thinking) {
                             console::log("[Start thinking]\n");
@@ -526,6 +613,17 @@ private:
             }
             result = rd.next(should_stop);
         }
+
+        if (defer_initial_content && !saw_reasoning_delta && !deferred_content_buf.empty()) {
+            handle_content_delta(deferred_content_buf);
+            deferred_content_buf.clear();
+        }
+
+        if (suppress_raw_thinking && !inside_raw_think && !raw_think_scan_buf.empty()) {
+            emit_content(raw_think_scan_buf);
+            raw_think_scan_buf.clear();
+        }
+
         g_is_interrupted.store(false);
         // server_response_reader automatically cancels pending tasks upon destruction
         return curr_content;
@@ -783,10 +881,38 @@ int main(int argc, char ** argv) {
         if (!params.moe_sidecar.empty()) {
             fprintf(stderr, "  sidecar          = %s\n", params.moe_sidecar.c_str());
         }
+        if (!params.moe_prefetch_sidecar.empty()) {
+            fprintf(stderr, "  prefetch-sidecar = %s\n", params.moe_prefetch_sidecar.c_str());
+        }
+        if (!params.moe_secondary_sidecar.empty()) {
+            fprintf(stderr, "  secondary-sidecar = %s\n", params.moe_secondary_sidecar.c_str());
+        }
+        if (!params.moe_tertiary_sidecar.empty()) {
+            fprintf(stderr, "  tertiary-sidecar = %s\n", params.moe_tertiary_sidecar.c_str());
+        }
         fprintf(stderr, "  slot-bank        = %d\n", params.moe_slot_bank);
+        fprintf(stderr, "  prefill-banks    = %d\n", params.moe_prefill_banks);
+        fprintf(stderr, "  prefill-batch    = %d%s\n",
+                params.moe_prefill_batch > 0 ? params.moe_prefill_batch : params.n_batch,
+                params.moe_prefill_batch > 0 ? "" : " (follows -b)");
+        fprintf(stderr, "  prefill-micro-batch = %d%s\n",
+                params.moe_prefill_micro_batch > 0 ? params.moe_prefill_micro_batch :
+                        (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : params.n_batch),
+                params.moe_prefill_micro_batch > 0 ? "" : " (follows prefill-batch)");
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
-        fprintf(stderr, "  prefetch-temporal = %s\n", params.moe_prefetch_temporal ? "on" : "off");
+        fprintf(stderr, "  prefetch-cache-io-split = %d%s\n",
+                params.moe_prefetch_cache_io_split > 0 ? params.moe_prefetch_cache_io_split : params.moe_cache_io_split,
+                params.moe_prefetch_cache_io_split > 0 ? "" : " (follows cache-io-split)");
+        fprintf(stderr, "  demand-stripe    = %s\n", params.moe_demand_stripe.empty() ? "off" : params.moe_demand_stripe.c_str());
+        fprintf(stderr, "  demand-distribute = %s\n", params.moe_demand_distribute.empty() ? "off" : params.moe_demand_distribute.c_str());
+        fprintf(stderr, "  prefill-stripe   = %s\n", params.moe_prefill_stripe.empty() ? "follow demand" : params.moe_prefill_stripe.c_str());
+        fprintf(stderr, "  prefill-distribute = %s\n", params.moe_prefill_distribute.empty() ? "follow demand" : params.moe_prefill_distribute.c_str());
+        fprintf(stderr, "  prefetch-stripe  = %s\n", params.moe_prefetch_stripe.empty() ? "off" : params.moe_prefetch_stripe.c_str());
+        fprintf(stderr, "  prefetch-distribute = %s\n", params.moe_prefetch_distribute.empty() ? "off" : params.moe_prefetch_distribute.c_str());
+        fprintf(stderr, "  prefill-layer-major = %s\n", params.moe_prefill_layer_major ? "on" : "off");
+        fprintf(stderr, "  prefetch-temporal = %s\n", (params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse) ? "on" : "off");
+        fprintf(stderr, "  prefetch-temporal-sparse = %s\n", params.moe_prefetch_temporal_sparse ? "on" : "off");
         fprintf(stderr, "  predict-prev-token = %s\n", params.moe_predict_prev_token ? "on" : "off");
         fprintf(stderr, "  predict-top1-prev = %s\n", params.moe_predict_top1_prev ? "on" : "off");
         fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");
@@ -902,7 +1028,11 @@ int main(int argc, char ** argv) {
         }
 
         result_timings timings;
-        console::log("\n> %s\n\n", params.prompt.c_str());
+        if (params.display_prompt) {
+            console::log("\n> %s\n\n", params.prompt.c_str());
+        } else {
+            console::log("\n");
+        }
         std::string assistant_content = ctx_cli.generate_raw_completion(params.prompt, timings);
         (void) assistant_content;
         console::log("\n");
@@ -910,7 +1040,11 @@ int main(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ] [ tokens - prefill: %d, decode: %d ]\n",
+                    timings.prompt_per_second,
+                    timings.predicted_per_second,
+                    timings.prompt_n,
+                    timings.predicted_n);
             console::set_display(DISPLAY_TYPE_RESET);
         }
 
@@ -1054,7 +1188,11 @@ int main(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ] [ tokens - prefill: %d, decode: %d ]\n",
+                    timings.prompt_per_second,
+                    timings.predicted_per_second,
+                    timings.prompt_n,
+                    timings.predicted_n);
             console::set_display(DISPLAY_TYPE_RESET);
         }
 

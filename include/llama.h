@@ -291,6 +291,19 @@ extern "C" {
         // Optional Flash-MoE sidecar directory or manifest path used to override routed expert tensors.
         const char * moe_sidecar_path;
 
+        // Optional Flash-MoE sidecar directory or manifest path used only for prefetch loads.
+        // Falls back to moe_sidecar_path when unset.
+        const char * moe_prefetch_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used only for the last
+        // miss in a 4-miss routed call experiment. Falls back to moe_sidecar_path when unset.
+        const char * moe_secondary_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used as the third
+        // lane for experimental weighted demand striping tests. Falls back to
+        // moe_sidecar_path when unset.
+        const char * moe_tertiary_sidecar_path;
+
         // Optional Flash-MoE execution mode.
         // Supported in this build: "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch".
         const char * moe_mode;
@@ -300,6 +313,36 @@ extern "C" {
 
         // Optional dynamic-quant policy file reserved for future bank selection work.
         const char * moe_quant_map;
+
+        // Optional experimental weighted demand striping ratio across
+        // primary:secondary:tertiary sidecars, for example "5:1:1".
+        const char * moe_demand_stripe;
+
+        // Optional experimental weighted whole-expert demand distribution
+        // across primary:secondary:tertiary sidecars, for example "1:1:1" or
+        // "2:1:1". Unlike moe_demand_stripe, each expert is read entirely from
+        // one chosen sidecar.
+        const char * moe_demand_distribute;
+
+        // Optional experimental weighted prefill-only striping ratio across
+        // primary:secondary:tertiary sidecars for dedicated layer-major prompt
+        // reads, for example "3:2:2".
+        const char * moe_prefill_stripe;
+
+        // Optional experimental weighted whole-expert prefill-only
+        // distribution across primary:secondary:tertiary sidecars for
+        // dedicated layer-major prompt reads, for example "1:1:1" or "2:1:1".
+        const char * moe_prefill_distribute;
+
+        // Optional experimental weighted prefetch striping ratio across
+        // prefetch:secondary:tertiary sidecars, for example "0:1:1".
+        const char * moe_prefetch_stripe;
+
+        // Optional experimental weighted whole-expert prefetch distribution
+        // across prefetch:secondary:tertiary sidecars, for example "1:1:1" or
+        // "2:1:1". Unlike moe_prefetch_stripe, each expert is read entirely
+        // from one chosen sidecar.
+        const char * moe_prefetch_distribute;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -331,13 +374,18 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool moe_verify_sidecar; // validate sidecar metadata parity during model load
+        bool moe_prefill_layer_major; // enable shared scratch-bank routed prefill for multi-token prompt batches
         bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
+        bool moe_prefetch_temporal_sparse; // alternate even/odd layers for temporal prefetch on slow media
         bool moe_predict_prev_token; // prefetch previous token's same-layer routed experts for the next token
         bool moe_predict_top1_prev; // prefetch only the first previous-token same-layer routed expert for the next token
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
+        int32_t moe_prefill_banks; // in-flight prefill expert staging banks / read-batch depth
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
+        int32_t moe_prefill_cache_io_split; // prefill-only split override; 0 follows moe_cache_io_split
+        int32_t moe_prefetch_cache_io_split; // prefetch-only split override; 0 follows moe_cache_io_split
     };
 
     struct llama_sampler_seq_config {
@@ -351,6 +399,8 @@ extern "C" {
         uint32_t n_ctx;             // text context, 0 = from model
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
+        uint32_t moe_prefill_batch; // prefill-only logical batch override for layer-major MoE prompt processing
+        uint32_t moe_prefill_micro_batch; // prefill-only expert compute micro-batch inside the prefill batch
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing

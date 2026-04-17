@@ -94,7 +94,7 @@
                 {%- set content = content.split('</think>')[-1].strip('\n') %}
             {%- endif %}
         {%- endif %}
-        {%- if reasoning_content and loop.index0 > ns.last_user_index -%}
+        {%- if reasoning_content and loop.index0 > ns.last_user_index and (enable_thinking is not defined or enable_thinking) -%}
             {{- '<think>' ~ '\n' ~ reasoning_content ~ '\n' ~ '</think>' ~ '\n\n' }}
         {%- endif -%}
         {%- if content -%}
@@ -155,5 +155,8 @@
 
 {#- Generation prompt -#}
 {%- if add_generation_prompt -%}
-{{- ']~b]ai' ~ '\n' ~ '<think>' ~ '\n' }}
+{{- ']~b]ai' ~ '\n' }}
+{%- if enable_thinking is not defined or enable_thinking -%}
+{{- '<think>' ~ '\n' }}
+{%- endif -%}
 {%- endif -%}

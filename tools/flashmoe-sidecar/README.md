@@ -14,6 +14,10 @@ Override that root with `FLASH_ROOT=/some/other/path` or set `SIDECAR_DIR` direc
 
 Modeling workflow: [`docs/moe-bank-modeling-workflow.md`](../../docs/moe-bank-modeling-workflow.md)
 
+Detailed MiniMax M2.7 note: [`tools/flashmoe-sidecar/MINIMAX_M2.md`](./MINIMAX_M2.md)
+
+Layer-major prefill algorithm note: [`docs/flashmoe-layer-major-dedup-single-sidecar.md`](../../docs/flashmoe-layer-major-dedup-single-sidecar.md)
+
 ## Model index
 
 Per-model extract + run recipes in this document:
@@ -23,6 +27,7 @@ Per-model extract + run recipes in this document:
 | Qwen3.5-35B-A3B | qwen3moe | [Extract](#extract-a-qwen35-sidecar) | [Run](#run-with-the-sidecar) |
 | Gemma4-26B-A4B | gemma4 | [Extract](#extract-a-gemma4-26b-a4b-sidecar) | [Run](#run-gemma4-26b-a4b-with-the-sidecar) |
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
+| MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 
 ## Current scope
@@ -67,10 +72,43 @@ The extractor walks the 6 GGUF shards automatically — point it at the first sh
 PYTHON=python3 \
 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
   --model ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
-  --out-dir ~/Models/flash/GLM-5.1-sidecar
+  --out-dir ~/Models/GLM/GLM-5.1-sidecar
 ```
 
 The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
+
+## Export a MiniMax M2.7 Flash package
+
+MiniMax M2.7 (`minimax-m2` arch) currently uses a dense-package workflow in this fork:
+
+- routed experts are extracted into `sidecar/`
+- dense and shared tensors are exported into `model-dense.gguf`
+- package defaults are written to `flashmoe-package.json`
+
+For the checked `UD-IQ2_XXS` package in this workspace, the generated package is about:
+
+- `2.58 GiB` dense GGUF
+- `58.3 GiB` routed sidecar
+
+Build the package in one step:
+
+```bash
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS/MiniMax-M2.7-UD-IQ2_XXS-00001-of-00003.gguf \
+  --out-dir ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  --force
+```
+
+Generic form:
+
+```bash
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model /path/to/MiniMax-M2.7-00001-of-00003.gguf \
+  --out-dir /path/to/MiniMax-M2.7-Flash \
+  --force
+```
+
+For more background and sizing notes, see [`MINIMAX_M2.md`](./MINIMAX_M2.md).
 
 ## Export a dense-only GGUF (experimental)
 
@@ -85,14 +123,14 @@ This path is currently experimental:
 
 Keep the original GGUF shards until you have verified that the dense GGUF + sidecar pair loads correctly on your machine.
 
-Use `--perf` when comparing the compact dense GGUF against the original full GGUF shards. In this fork, `--perf` prints the standard libllama timing summary including `load time`, so it is the easiest way to confirm that `model-dense.gguf` reduces startup cost. On Flash-MoE `slot-bank` runs it also prints the routed profile table, cached expert hit rate, and Metal replay cache hit rate.
+Use `--perf` when comparing the compact dense GGUF against the original full GGUF shards. In the current `llama-cli` path it prints the Flash-MoE routed profile table, cached expert hit rate, and Metal replay cache hit rate, plus the prompt/generation throughput summary. It does not currently print the standard libllama `load time` footer on exit, so use shell timing or `/usr/bin/time` if you want an exact startup comparison for `model-dense.gguf`.
 
 GLM-5.1 example:
 
 ```bash
 python3 ../local_tools/export_dense_gguf.py \
   --model ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
-  --sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --sidecar ~/Models/GLM/GLM-5.1-sidecar \
   --out-dir ~/Models/GLM/GLM-5.1-IQ1-Dense \
   --force
 ```
@@ -108,7 +146,7 @@ Run the compact dense GGUF with the same sidecar:
 ./build/bin/llama-cli \
   -m ~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --moe-sidecar ~/Models/GLM/GLM-5.1-sidecar \
   --moe-slot-bank 64 \
   --moe-topk 4 \
   -fit on \
@@ -122,6 +160,183 @@ Run the compact dense GGUF with the same sidecar:
 
 Compared with the full GLM shard set, the compact dense GGUF is about 14 GiB on disk while routed expert bytes continue to come from the sidecar.
 
+## Run MiniMax M2.7 with Flash-MoE
+
+Important: MiniMax routed-expert width is controlled here by `--moe-topk`, or `MOE_TOPK=...` when using the wrapper. That is different from the sampler flag `--top-k`.
+
+The wrapper default is speed-oriented (`MOE_TOPK=4`). MiniMax M2.7 natively routes to `8` experts, so use `MOE_TOPK=8` when you want model-default behavior.
+
+M5 Max, native MiniMax routing width:
+
+```bash
+MOE_TOPK=8 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st \
+  -n 128 \
+  -p "What is Apple Neural Engine? Answer in 3 sentences."
+```
+
+This path was smoke-tested locally on an M5 Max with:
+
+- `MOE_TOPK=8`
+- `MOE_SLOT_BANK=64`
+- `CTX=4096`
+- `BATCH=64`
+- `UBATCH=1`
+- `N_GPU_LAYERS=999`
+
+All wrapper environment variables for `run_minimax_m2_flash.sh`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOE_TOPK` | 4 (package) | Routed experts per token (not sampler `--top-k`) |
+| `MOE_SLOT_BANK` | 64 (package) | Host-memory expert cache size (slots) |
+| `MOE_CACHE_IO_SPLIT` | 4 (package) | Split each expert pread into N page-aligned chunks; `1` = single read, higher = more I/O parallelism |
+| `MOE_PREFETCH_TEMPORAL` | 1 (package) | Set `0` to disable temporal prefetch |
+| `PREFETCH_SIDECAR` | (unset) | Alternate sidecar path for prefetch-only reads |
+| `CTX` | 4096 | Context size |
+| `BATCH` | 64 | Batch size |
+| `UBATCH` | 1 | Micro-batch size |
+| `N_GPU_LAYERS` | 999 | GPU layer count (`0` = CPU only) |
+| `SEED` | (unset) | RNG seed for reproducibility |
+| `TEMP` | (unset) | Sampling temperature |
+| `LLAMA_BIN` | `./build/bin/llama-cli` | Path to the llama-cli binary |
+
+Examples:
+
+```bash
+# Disable prefetch, single-read expert loads
+MOE_TOPK=4 MOE_SLOT_BANK=64 MOE_CACHE_IO_SPLIT=1 MOE_PREFETCH_TEMPORAL=0 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 128 -p "Hello"
+
+# Higher I/O parallelism on a fast SSD
+MOE_TOPK=8 MOE_SLOT_BANK=64 MOE_CACHE_IO_SPLIT=8 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 128 -p "Hello"
+```
+
+## Generate coding prompt sweep samples
+
+For prompt-throughput comparisons it helps to keep the content style fixed and only change prompt length.
+The helper below emits coding-task prompts at exact tokenizer lengths using the MiniMax tokenizer.
+
+Targets generated by default:
+
+- `1k` = `1024` tokens
+- `4k` = `4096` tokens
+- `16k` = `16384` tokens
+- `22k` = `22528` tokens
+
+Generate the prompt set:
+
+```bash
+python3 ./tools/flashmoe-sidecar/make_coding_prompts.py \
+  --out-dir ./tools/flashmoe-sidecar/prompts/coding \
+  --force
+```
+
+If you want to prefer runtime tokenization, pass a GGUF that works with `llama-tokenize --ids`:
+
+```bash
+python3 ./tools/flashmoe-sidecar/make_coding_prompts.py \
+  --llama-model ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash/model-dense.gguf \
+  --out-dir ./tools/flashmoe-sidecar/prompts/coding \
+  --force
+```
+
+Note: counts are plain tokenizer counts for the prompt text itself. If a runtime adds a BOS token or a chat wrapper separately, the evaluated prompt length may differ by a token or two.
+
+Run the four prompt sizes through the MiniMax wrapper:
+
+```bash
+bash ./tools/flashmoe-sidecar/run_minimax_m2_coding_prompt_sweep.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  --moe-prefill-layer-major \
+  --moe-prefill-stripe 3:2:2 \
+  --moe-prefill-batch 2048 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1 -st
+```
+
+You can also sweep a subset:
+
+```bash
+PROMPT_LABELS="1k 4k 16k" \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_coding_prompt_sweep.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -n 1 -st
+```
+
+M1 Max 64 GB — `MOE_TOPK=4` for lower expert I/O with a large slot bank:
+
+```bash
+MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
+
+Lower-memory starting point for a 24 GB-class M5:
+
+```bash
+MOE_TOPK=8 \
+MOE_SLOT_BANK=32 \
+CTX=2048 \
+BATCH=32 \
+UBATCH=1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st \
+  -n 96 \
+  -p "Summarize Apple Neural Engine in 3 sentences."
+```
+
+Practical MiniMax memory notes for this exact `UD-IQ2_XXS-Flash` package:
+
+- `MOE_SLOT_BANK=64` reserves about `17.15 GiB` before context/runtime overhead
+- `MOE_SLOT_BANK=32` reserves about `9.87 GiB`
+- `MOE_SLOT_BANK=24` reserves about `8.04 GiB`
+- `MOE_SLOT_BANK=16` reserves about `6.22 GiB`
+
+If a smaller-memory system is tight, reduce in this order:
+
+- `MOE_SLOT_BANK` from `32` to `24`, then `16`
+- `CTX` from `2048` to `1024`
+- `BATCH` from `32` to `16`
+- `N_GPU_LAYERS=0` only as a last resort
+
+Reproducible comparison runs:
+
+- pin `LLAMA_BIN` so the wrapper uses the exact binary you want to compare
+- pin `SEED` and `TEMP`
+- keep prompt text and `-n` identical across runs
+- prefer `TEMP=0.2` over `TEMP=0` for long code prompts, because greedy decode can fall into repeats
+
+```bash
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=4 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=8 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
+
 ## Run GLM-5.1 with the sidecar
 
 Portable slot-bank recipe:
@@ -130,7 +345,7 @@ Portable slot-bank recipe:
 ./build/bin/llama-cli \
   -m ~/Models/GLM/GLM-5.1-UD-IQ1_M-00001-of-00006.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --moe-sidecar ~/Models/GLM/GLM-5.1-sidecar \
   --moe-slot-bank 64 \
   --moe-topk 4 \
   --moe-prefetch-temporal \
@@ -150,7 +365,8 @@ Fast path on this branch for the current best GLM decode throughput on Apple Sil
 - keep `--moe-predict-prev-token` off
 - enable Metal replay plus CPU-visible slot writes
 - use a larger slot bank such as `90` or `96`
-- use `--perf` so you can confirm `load time`, routed source time, and cached expert hit rate
+- use `--perf` so you can confirm routed source time, cached expert hit rate, and replay hit rate
+- if you keep a second copy of the sidecar on another SSD, point `--moe-prefetch-sidecar` at that alternate location so prefetch reads can come from a different drive
 
 The recipe below is the end-user path we used to reproduce about `6.5` to `6.7 tok/s` on an M5 Max 128 GB with GLM-5.1 IQ1_M:
 
@@ -163,7 +379,8 @@ LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
 ./build/bin/llama-cli --perf \
   -m ~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
   --moe-mode slot-bank \
-  --moe-sidecar ~/Models/flash/GLM-5.1-sidecar \
+  --moe-sidecar ~/Models/GLM/GLM-5.1-sidecar \
+  --moe-prefetch-sidecar /Volumes/PrefetchSSD/GLM-5.1-sidecar \
   --moe-slot-bank 90 \
   --moe-topk 4 \
   --moe-cache-io-split 4 \
@@ -178,17 +395,114 @@ LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
 
 If you have the memory headroom, `--moe-slot-bank 96` can be slightly better than `90`, but the gain is small compared with the extra reserve.
 
+If you do not have a second drive for prefetch, omit `--moe-prefetch-sidecar` and prefetch will continue to use `--moe-sidecar`.
+
 GLM-5.1 specific notes:
 
 - **`--moe-topk 4`** is a reduction-only override of the model's native K=8. On IQ1_M/IQ2_XXS quants the K=4 vs K=8 quality gap is within noise for general use, while halving per-token expert I/O for ~2× decode. Drop the flag to use native K=8 if you need maximum fidelity.
 - **`--moe-slot-bank 64`** is the starting point. With native K=8 the bank has only 8× headroom; if you have RAM, try `128` or `256` for higher reuse on warm caches.
-- **`--moe-prefetch-temporal`** is the single biggest knob — it overlaps next-layer expert `pread`s with current-layer GPU compute. Always on for SSD-bound MoE.
-- **`--perf`** is recommended for tuning. It prints `load time` for dense-vs-full-GGUF comparisons, and on `slot-bank` runs it also prints the Flash-MoE routed breakdown (`Expert I/O source`, `Expert upload`), cached expert hit rate, and Metal replay cache hit rate.
+- **`--moe-prefetch-temporal`** is the single biggest knob — it overlaps next-layer expert `pread`s with current-layer GPU compute.
+- **`--moe-prefetch-sidecar PATH`** is optional. When set, prefetch reads use that alternate sidecar directory or manifest path while demand misses continue to use `--moe-sidecar`. This is useful when you keep a second sidecar copy on another SSD.
+- **`--perf`** is recommended for tuning. In this CLI it prints the Flash-MoE routed breakdown (`Expert I/O source`, `Expert upload`), cached expert hit rate, and Metal replay cache hit rate, plus the prompt/generation throughput summary. It does not currently print `load time` on exit.
 - **The best-known fast path on this branch is higher than the older baseline.** With dense-only export, Metal replay, CPU-visible slot writes, predictor off, and a `90` to `96` slot bank, GLM-5.1 IQ1_M is currently landing around `6.5` to `6.7 tok/s` on M5 Max 128 GB steady-state runs. Older full-GGUF or smaller-bank recipes remain useful as simpler baselines.
 - If you hit hangs or memory pressure (the DSV2/Kimi GPU-bank path is shared with GLM), fall back with:
   ```bash
   LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1 ./build/bin/llama-cli ...
   ```
+
+## Benchmark weighted 3-drive stripe splits
+
+If you keep identical GLM sidecar copies on three drives and want to test weighted striping before changing the runtime format, use:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_stripe_bench.py \
+  --sidecar-a ~/Models/GLM/test \
+  --sidecar-b /Volumes/SN1/test \
+  --sidecar-c /Volumes/SN2/test \
+  --mode expert \
+  --layers 3-13 \
+  --families ffn_gate_exps,ffn_up_exps,ffn_down_exps \
+  --max-layers 8 \
+  --max-experts 16 \
+  --repeats 3 \
+  --no-cache \
+  --drop-cache-between-runs
+```
+
+What it does:
+
+- samples routed GLM families from the manifest on drive `A`
+- reads the same expert byte ranges from the three sidecar copies by path
+- benchmarks candidate weighted splits such as `A-only`, `3:1:0`, `3:1:1`, `4:1:1`, and `5:1:1`
+- reports `P50`, `P90`, `P99`, `CV%`, effective `GiB/s`, and the exact page split per drive
+
+Useful overrides:
+
+- `--strategy NAME=A:B:C` to try a custom split, for example `--strategy tuned=4:1:1`
+- `--experts 0-31` to lock the benchmark to a specific expert subset
+- `--mode family` to benchmark one family at a time instead of full expert payloads
+- `--page-bytes 16384` to match the current Flash-MoE page granularity
+
+This benchmark is the quickest way to answer whether your `12 GB/s + 4 GB/s + 4 GB/s` drive mix wants a simple `3:1:1` split, a more latency-biased `4:1:1` or `5:1:1`, or no striping at all.
+
+## Estimate a 3-bin expert-placement oracle
+
+If you want to estimate a per-`(layer, expert)` hot/warm/cold placement across three drives before repacking the sidecar, use:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_bin_oracle.py \
+  --sidecar ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash/sidecar \
+  --trace /tmp/minimax.trace.jsonl \
+  --mode lru-misses \
+  --bank-size 60 \
+  --bin apple=2.05 \
+  --bin t710a=1.95 \
+  --bin t710b=1.95
+```
+
+What it does:
+
+- replays a `--moe-trace` JSONL trace
+- either uses the raw routed requests or approximates slot-bank miss traffic with an LRU model
+- assigns each `(layer, expert)` to a storage bin
+- estimates routed source time assuming reads that land on different bins can overlap
+- compares simple baselines (`single:...`, hot bands, frequency balance) against a local-search oracle
+
+Notes:
+
+- calibrate each `--bin NAME=RATE_GIB_S` from a real single-drive run: `effective GiB/s = bytes / source_time`
+- the `oracle-local` result is a planning ceiling, not a promise for the current runtime
+- `--assignment-out /tmp/oracle-bins.json` writes the oracle per-layer expert assignment for later repacker experiments
+- the prototype is most useful when you want to compare "expert binning" against weighted striping on the same trace
+
+## Plan a cross-machine layer split
+
+If you want to keep a fully resident prefix on one machine and run the remaining layers through Flash-MoE on another, use:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_layer_split.py \
+  --model ~/Models/GLM/GLM-5.1-IQ1-Dense/model-dense.gguf \
+  --sidecar ~/Models/GLM/GLM-5.1-sidecar \
+  --ctx 200000 \
+  --ubatch 1 \
+  --node name=m3u,mode=resident,usable_gib=76 \
+  --node name=m5max,mode=flash,usable_gib=100,slot_bank=96
+```
+
+What it does:
+
+- reads the dense-only GGUF metadata and exact per-layer dense/shared bytes
+- reads the sidecar manifest to recover full-resident expert bytes per routed layer
+- budgets KV cache at the requested context length
+- assigns contiguous layer ranges across the nodes in the order you pass them
+- emits a plan with the layer spans, per-node memory use, and the boundary activation size
+
+Notes:
+
+- `mode=resident` means routed layers on that node are fully resident
+- `mode=flash` means routed layers on that node are budgeted as dense/shared + KV + `slot_bank`
+- `usable_gib` should be the memory budget you are actually willing to give that node after OS/headroom
+- transport is recorded in the plan as a hint; the current recommendation is to start with TCP over a private Thunderbolt IP link and keep RDMA as a later pluggable transport
 
 ## Verify the sidecar
 
