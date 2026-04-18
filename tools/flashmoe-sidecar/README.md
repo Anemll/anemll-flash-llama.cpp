@@ -249,6 +249,30 @@ python3 ./tools/flashmoe-sidecar/make_coding_prompts.py \
 
 Note: counts are plain tokenizer counts for the prompt text itself. If a runtime adds a BOS token or a chat wrapper separately, the evaluated prompt length may differ by a token or two.
 
+The `run_minimax_m2_flash.sh` wrapper now canonicalizes `-f/--file` and
+`-bf/--binary-file` inputs before launching `llama-cli`. That means copy-pasted
+examples like `-f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt` work
+both from the repo root and from other current directories.
+
+If Terminal.app still mangles a multi-line paste, you can skip the `-f` line
+entirely and use:
+
+```bash
+PROMPT_FILE=./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh ...
+```
+
+The wrapper resolves `PROMPT_FILE` the same way it resolves `-f`.
+
+For the built-in coding prompt samples, you can avoid paths entirely:
+
+```bash
+PROMPT_LABEL=4k \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh ...
+```
+
+Supported labels are: `1k`, `4k`, `16k`, and `22k`.
+
 Run the four prompt sizes through the MiniMax wrapper:
 
 ```bash

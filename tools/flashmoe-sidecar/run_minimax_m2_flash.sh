@@ -1,6 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+repo_root=$(cd "$script_dir/../.." && pwd -P)
+default_prompt_dir="$repo_root/tools/flashmoe-sidecar/prompts/coding"
+
+resolve_input_path() {
+    local raw_path=$1
+
+    if [[ "$raw_path" = /* ]]; then
+        printf "%s\n" "$raw_path"
+        return 0
+    fi
+
+    if [[ -e "$raw_path" ]]; then
+        python3 - "$raw_path" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve())
+PY
+        return 0
+    fi
+
+    if [[ -e "$repo_root/$raw_path" ]]; then
+        python3 - "$repo_root" "$raw_path" <<'PY'
+from pathlib import Path
+import sys
+
+print((Path(sys.argv[1]) / sys.argv[2]).resolve())
+PY
+        return 0
+    fi
+
+    printf "%s\n" "$raw_path"
+}
+
+resolve_prompt_label_path() {
+    local label=$1
+    local candidate="$default_prompt_dir/coding_${label}.txt"
+
+    if [[ -f "$candidate" ]]; then
+        printf "%s\n" "$candidate"
+        return 0
+    fi
+
+    echo "unknown PROMPT_LABEL '$label' (expected one of: 1k, 4k, 16k, 22k)" >&2
+    exit 1
+}
+
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 PACKAGE_DIR [llama-cli args...]" >&2
     exit 1
@@ -25,9 +73,14 @@ package_prefetch_temporal=1
 package_reasoning=off
 package_reasoning_budget=0
 package_ubatch=8
+package_expert_count=0
+sidecar_manifest_path=${SIDECAR_MANIFEST_PATH:-}
+if [[ -z "$sidecar_manifest_path" && -d "$sidecar_path" ]]; then
+    sidecar_manifest_path="$sidecar_path/manifest.json"
+fi
 
 if [[ -f "$package_json" ]]; then
-    read -r package_topk package_slot_bank package_cache_io_split package_prefetch_temporal < <(
+    read -r package_topk package_slot_bank package_cache_io_split package_prefetch_temporal package_expert_count < <(
         python3 - "$package_json" <<'PY'
 import json
 import sys
@@ -36,12 +89,28 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
     package = json.load(handle)
 
 hint = package.get("runtime_hint") or {}
+model = package.get("model") or {}
 print(
     hint.get("moe_topk", 4),
     hint.get("moe_slot_bank", 64),
     hint.get("moe_cache_io_split", 4),
     1 if hint.get("moe_prefetch_temporal", True) else 0,
+    model.get("expert_count", 0),
 )
+PY
+    )
+fi
+
+if [[ "$package_expert_count" == "0" && -f "$sidecar_manifest_path" ]]; then
+    package_expert_count=$(python3 - "$sidecar_manifest_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+model = manifest.get("model") or {}
+print(model.get("expert_count", 0))
 PY
     )
 fi
@@ -85,6 +154,9 @@ else
     fi
     if (( required_slots > effective_slot_bank )); then
         effective_slot_bank=$(( ((required_slots + 31) / 32) * 32 ))
+    fi
+    if (( package_expert_count > 0 && effective_slot_bank > package_expert_count )); then
+        effective_slot_bank=$package_expert_count
     fi
 fi
 
@@ -143,14 +215,62 @@ if [[ "${RAW_COMPLETION:-0}" != "0" ]]; then
     cmd+=(--moe-trace-harness)
 fi
 
-if [[ $# -eq 0 ]]; then
+declare -a forwarded_args
+forwarded_args=()
+had_forwarded_args=0
+saw_prompt_file_arg=0
+saw_prompt_binary_file_arg=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--file|-bf|--binary-file)
+            if [[ $# -lt 2 ]]; then
+                echo "missing argument for $1" >&2
+                exit 1
+            fi
+            forwarded_args+=("$1" "$(resolve_input_path "$2")")
+            had_forwarded_args=1
+            if [[ "$1" == "-f" || "$1" == "--file" ]]; then
+                saw_prompt_file_arg=1
+            else
+                saw_prompt_binary_file_arg=1
+            fi
+            shift 2
+            ;;
+        *)
+            forwarded_args+=("$1")
+            had_forwarded_args=1
+            shift
+            ;;
+    esac
+done
+
+if [[ -n "${PROMPT_FILE:-}" && "$saw_prompt_file_arg" == "0" ]]; then
+    forwarded_args+=(-f "$(resolve_input_path "$PROMPT_FILE")")
+    had_forwarded_args=1
+    saw_prompt_file_arg=1
+fi
+
+if [[ -n "${PROMPT_BINARY_FILE:-}" && "$saw_prompt_binary_file_arg" == "0" ]]; then
+    forwarded_args+=(-bf "$(resolve_input_path "$PROMPT_BINARY_FILE")")
+    had_forwarded_args=1
+    saw_prompt_binary_file_arg=1
+fi
+
+if [[ -n "${PROMPT_LABEL:-}" && "$saw_prompt_file_arg" == "0" && "$saw_prompt_binary_file_arg" == "0" ]]; then
+    forwarded_args+=(-f "$(resolve_prompt_label_path "$PROMPT_LABEL")")
+    had_forwarded_args=1
+    saw_prompt_file_arg=1
+fi
+
+if [[ "$had_forwarded_args" == "0" ]]; then
     cmd+=(
         -p "Explain why Flash-MoE helps large routed MiniMax models."
         -n "${N_PREDICT:-128}"
         -st
     )
 else
-    cmd+=("$@")
+    cmd+=("${forwarded_args[@]}")
 fi
 
 printf "running:"

@@ -1086,7 +1086,7 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.moe_prefill_layer_major) {
         if (params.moe_prefill_batch == 0) {
-            params.moe_prefill_batch = params.n_batch;
+            params.moe_prefill_batch = 8192;
         }
         if (params.moe_prefill_micro_batch == 0) {
             params.moe_prefill_micro_batch = params.moe_prefill_batch;

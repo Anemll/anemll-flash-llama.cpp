@@ -1271,7 +1271,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"--moe-prefill-batch"}, "N",
-        "prefill-only logical batch size for --moe-prefill-layer-major (0 = follow -b/--batch-size)",
+        "prefill-only logical batch size for --moe-prefill-layer-major (0 = default 8192)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

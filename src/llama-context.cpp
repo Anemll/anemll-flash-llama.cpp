@@ -304,12 +304,13 @@ public:
     }
 
     bool uses_dedicated_prefill_moe(int layer) const override {
-        if (!transient_shared_scratch || !uses_layer(layer) || model.arch != LLM_ARCH_MINIMAX_M2) {
+        if (!transient_shared_scratch || !uses_layer(layer)) {
             return false;
         }
 
         const auto & model_layer = model.layers[layer];
-        return model_layer.ffn_gate_up_exps == nullptr &&
+        const bool separate_gate_up_down =
+                model_layer.ffn_gate_up_exps == nullptr &&
                 model_layer.ffn_gate_exps    != nullptr &&
                 model_layer.ffn_up_exps      != nullptr &&
                 model_layer.ffn_down_exps    != nullptr &&
@@ -317,8 +318,28 @@ public:
                 model_layer.ffn_up_exps_b    == nullptr &&
                 model_layer.ffn_down_exps_b  == nullptr &&
                 model_layer.ffn_gate_exps_s  == nullptr &&
-                model_layer.ffn_up_exps_s    == nullptr &&
-                model_layer.ffn_down_exps_s  == nullptr;
+                model_layer.ffn_up_exps_s    == nullptr;
+
+        const bool merged_gate_up_down =
+                model_layer.ffn_gate_up_exps != nullptr &&
+                model_layer.ffn_gate_exps    == nullptr &&
+                model_layer.ffn_up_exps      == nullptr &&
+                model_layer.ffn_down_exps    != nullptr &&
+                model_layer.ffn_gate_up_exps_b == nullptr &&
+                model_layer.ffn_down_exps_b    == nullptr &&
+                model_layer.ffn_up_exps_s      == nullptr;
+
+        switch (model.arch) {
+            case LLM_ARCH_MINIMAX_M2:
+            case LLM_ARCH_GLM_DSA:
+            case LLM_ARCH_DEEPSEEK2:
+            case LLM_ARCH_QWEN35MOE:
+                return separate_gate_up_down;
+            case LLM_ARCH_GEMMA4:
+                return merged_gate_up_down;
+            default:
+                return false;
+        }
     }
 
     void bind_slot_ids_input(int layer, ggml_tensor * slot_ids) override {
@@ -1207,6 +1228,41 @@ private:
         }
     }
 
+    void read_tensor_vector_f32(
+            const ggml_tensor * tensor,
+            int64_t count,
+            std::vector<float> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        out.resize(size_t(count));
+
+        auto decode = [&](const uint8_t * src) {
+            switch (tensor->type) {
+                case GGML_TYPE_F32:
+                    std::memcpy(out.data(), src, size_t(count) * sizeof(float));
+                    break;
+                case GGML_TYPE_F16:
+                    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(src), out.data(), count);
+                    break;
+                case GGML_TYPE_BF16:
+                    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(src), out.data(), count);
+                    break;
+                default:
+                    throw std::runtime_error(format(
+                            "Flash-MoE dedicated prefill MoE does not support scale tensor type %s",
+                            ggml_type_name(tensor->type)));
+            }
+        };
+
+        if (const uint8_t * src = tensor_host_data(tensor)) {
+            decode(src);
+            return;
+        }
+
+        std::vector<uint8_t> temp(ggml_row_size(tensor->type, count));
+        ggml_backend_tensor_get(tensor, temp.data(), 0, temp.size());
+        decode(temp.data());
+    }
+
     prefill_selected_plan build_prefill_selected_plan(
             const layer_state & state,
             const std::vector<int32_t> & selected_experts,
@@ -1238,6 +1294,7 @@ private:
 
         const auto * order_entry =
                 state.down_entry != nullptr ? state.down_entry :
+                state.gate_up_entry != nullptr ? state.gate_up_entry :
                 state.up_entry   != nullptr ? state.up_entry :
                 state.gate_entry;
         std::sort(plan.unique_experts.begin(), plan.unique_experts.end(),
@@ -1456,14 +1513,11 @@ private:
         if (!state.pending_prefill_valid ||
             state.pending_prefill_topk != topk ||
             state.pending_prefill_tokens != n_tokens) {
-            throw std::runtime_error(format(
-                    "Flash-MoE dedicated prefill MoE lost routed top-k capture for layer %d (have valid=%d topk=%lld tokens=%lld, expected topk=%lld tokens=%lld)",
-                    layer,
-                    state.pending_prefill_valid ? 1 : 0,
-                    (long long) state.pending_prefill_topk,
-                    (long long) state.pending_prefill_tokens,
-                    (long long) topk,
-                    (long long) n_tokens));
+            read_topk_ids_tensor(selected_experts_tensor, topk, n_tokens);
+            state.pending_prefill_selected_experts = topk_ids;
+            state.pending_prefill_topk = topk;
+            state.pending_prefill_tokens = n_tokens;
+            state.pending_prefill_valid = true;
         }
 
         const auto plan = build_prefill_selected_plan(
@@ -1491,10 +1545,22 @@ private:
             }
         }
 
+        const auto * gate_up_entry = state.gate_up_entry;
         const auto * gate_entry = state.gate_entry;
         const auto * up_entry = state.up_entry;
         const auto * down_entry = state.down_entry;
-        GGML_ASSERT(gate_entry != nullptr && up_entry != nullptr && down_entry != nullptr);
+        const bool use_gate_up_merged =
+                gate_up_entry != nullptr &&
+                gate_entry == nullptr &&
+                up_entry == nullptr &&
+                down_entry != nullptr;
+        std::vector<float> down_expert_scales;
+        if (model.layers[layer].ffn_down_exps_s != nullptr) {
+            read_tensor_vector_f32(model.layers[layer].ffn_down_exps_s, expert_count, down_expert_scales);
+        }
+        GGML_ASSERT(
+                (use_gate_up_merged && gate_up_entry != nullptr && down_entry != nullptr) ||
+                (!use_gate_up_merged && gate_entry != nullptr && up_entry != nullptr && down_entry != nullptr));
 
         ggml_backend_t exec_backend = get_prefill_exec_backend(cur_tensor);
         if (exec_backend == nullptr) {
@@ -1526,18 +1592,37 @@ private:
                             plan.max_refs_per_expert);
 
             ggml_tensor * cur_in = ggml_new_tensor_2d(temp_ctx, GGML_TYPE_F32, n_embd, chunk_tokens);
-            ggml_tensor * gate_w = ggml_new_tensor_2d(temp_ctx, gate_entry->quant_type, state.gate_tensor->ne[0], state.gate_tensor->ne[1]);
-            ggml_tensor * up_w = ggml_new_tensor_2d(temp_ctx, up_entry->quant_type, state.up_tensor->ne[0], state.up_tensor->ne[1]);
+            ggml_tensor * gate_up_w = nullptr;
+            ggml_tensor * gate_w = nullptr;
+            ggml_tensor * up_w = nullptr;
             ggml_tensor * down_w = ggml_new_tensor_2d(temp_ctx, down_entry->quant_type, state.down_tensor->ne[0], state.down_tensor->ne[1]);
+            ggml_tensor * out = nullptr;
 
-            GGML_ASSERT(ggml_nbytes(gate_w) == gate_entry->bytes_per_expert);
-            GGML_ASSERT(ggml_nbytes(up_w) == up_entry->bytes_per_expert);
-            GGML_ASSERT(ggml_nbytes(down_w) == down_entry->bytes_per_expert);
+            if (use_gate_up_merged) {
+                gate_up_w = ggml_new_tensor_2d(temp_ctx, gate_up_entry->quant_type, state.gate_up_tensor->ne[0], state.gate_up_tensor->ne[1]);
 
-            ggml_tensor * gate = ggml_mul_mat(temp_ctx, gate_w, cur_in);
-            ggml_tensor * up = ggml_mul_mat(temp_ctx, up_w, cur_in);
-            ggml_tensor * act = ggml_swiglu_split(temp_ctx, gate, up);
-            ggml_tensor * out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, down_w, act));
+                GGML_ASSERT(ggml_nbytes(gate_up_w) == gate_up_entry->bytes_per_expert);
+                GGML_ASSERT(ggml_nbytes(down_w) == down_entry->bytes_per_expert);
+
+                ggml_tensor * gate_up = ggml_mul_mat(temp_ctx, gate_up_w, cur_in);
+                const int64_t n_ff = gate_up->ne[0] / 2;
+                ggml_tensor * gate = ggml_view_2d(temp_ctx, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], 0);
+                ggml_tensor * up = ggml_view_2d(temp_ctx, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], n_ff * gate_up->nb[0]);
+                ggml_tensor * act = ggml_geglu_split(temp_ctx, gate, up);
+                out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, down_w, act));
+            } else {
+                gate_w = ggml_new_tensor_2d(temp_ctx, gate_entry->quant_type, state.gate_tensor->ne[0], state.gate_tensor->ne[1]);
+                up_w = ggml_new_tensor_2d(temp_ctx, up_entry->quant_type, state.up_tensor->ne[0], state.up_tensor->ne[1]);
+
+                GGML_ASSERT(ggml_nbytes(gate_w) == gate_entry->bytes_per_expert);
+                GGML_ASSERT(ggml_nbytes(up_w) == up_entry->bytes_per_expert);
+                GGML_ASSERT(ggml_nbytes(down_w) == down_entry->bytes_per_expert);
+
+                ggml_tensor * gate = ggml_mul_mat(temp_ctx, gate_w, cur_in);
+                ggml_tensor * up = ggml_mul_mat(temp_ctx, up_w, cur_in);
+                ggml_tensor * act = ggml_swiglu_split(temp_ctx, gate, up);
+                out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, down_w, act));
+            }
 
             ggml_cgraph * temp_graph = ggml_new_graph_custom(temp_ctx, 32, false);
             ggml_build_forward_expand(temp_graph, out);
@@ -1550,8 +1635,9 @@ private:
 
             std::vector<float> gathered_inputs(size_t(n_embd * chunk_tokens), 0.0f);
             std::vector<float> expert_output(size_t(n_embd * chunk_tokens), 0.0f);
-            std::vector<uint8_t> gate_bytes(gate_entry->bytes_per_expert);
-            std::vector<uint8_t> up_bytes(up_entry->bytes_per_expert);
+            std::vector<uint8_t> gate_up_bytes(use_gate_up_merged ? gate_up_entry->bytes_per_expert : 0);
+            std::vector<uint8_t> gate_bytes(!use_gate_up_merged ? gate_entry->bytes_per_expert : 0);
+            std::vector<uint8_t> up_bytes(!use_gate_up_merged ? up_entry->bytes_per_expert : 0);
             std::vector<uint8_t> down_bytes(down_entry->bytes_per_expert);
             auto * dst_f32 = static_cast<float *>(dst->data);
             std::memset(dst_f32, 0, ggml_nbytes(dst));
@@ -1644,7 +1730,10 @@ private:
                 }
             };
 
-            auto family_kind = [](size_t family_index) -> routed_family {
+            auto family_kind = [&](size_t family_index) -> routed_family {
+                if (use_gate_up_merged) {
+                    return family_index == 0 ? routed_family::gate_up : routed_family::down;
+                }
                 switch (family_index) {
                     case 0: return routed_family::gate;
                     case 1: return routed_family::up;
@@ -1653,13 +1742,19 @@ private:
             };
 
             const std::array<const llama_flash_moe_sidecar_entry *, 3> primary_entries = {
-                gate_entry, up_entry, down_entry,
+                use_gate_up_merged ? gate_up_entry : gate_entry,
+                use_gate_up_merged ? down_entry : up_entry,
+                use_gate_up_merged ? nullptr : down_entry,
             };
             const std::array<const llama_flash_moe_sidecar_entry *, 3> secondary_entries = {
-                state.secondary_gate_entry, state.secondary_up_entry, state.secondary_down_entry,
+                use_gate_up_merged ? state.secondary_gate_up_entry : state.secondary_gate_entry,
+                use_gate_up_merged ? state.secondary_down_entry : state.secondary_up_entry,
+                use_gate_up_merged ? nullptr : state.secondary_down_entry,
             };
             const std::array<const llama_flash_moe_sidecar_entry *, 3> tertiary_entries = {
-                state.tertiary_gate_entry, state.tertiary_up_entry, state.tertiary_down_entry,
+                use_gate_up_merged ? state.tertiary_gate_up_entry : state.tertiary_gate_entry,
+                use_gate_up_merged ? state.tertiary_down_entry : state.tertiary_up_entry,
+                use_gate_up_merged ? nullptr : state.tertiary_down_entry,
             };
 
             struct prefill_ready_expert {
@@ -1701,18 +1796,31 @@ private:
                     loaded.lane = expert_lanes[expert_index];
                     loaded.miss = expert_reservations[expert_index].miss;
                     if (loaded.miss) {
-                        loaded.family_bytes[0].resize(gate_entry->bytes_per_expert);
-                        loaded.family_bytes[1].resize(up_entry->bytes_per_expert);
-                        loaded.family_bytes[2].resize(down_entry->bytes_per_expert);
+                        for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
+                            const auto * primary_entry = primary_entries[family_index];
+                            if (primary_entry != nullptr) {
+                                loaded.family_bytes[family_index].resize(primary_entry->bytes_per_expert);
+                            }
+                        }
                     }
                     batch.experts.emplace_back(std::move(loaded));
                 }
 
                 const bool use_combined_tasks =
                         !resident_bank_source &&
-                        gate_entry->source_format == llama_flash_moe_sidecar_format::gguf_bytes &&
-                        up_entry->source_format == llama_flash_moe_sidecar_format::gguf_bytes &&
-                        down_entry->source_format == llama_flash_moe_sidecar_format::gguf_bytes;
+                        primary_entries[0] != nullptr &&
+                        primary_entries[1] != nullptr &&
+                        primary_entries[0]->source_format == llama_flash_moe_sidecar_format::gguf_bytes &&
+                        primary_entries[1]->source_format == llama_flash_moe_sidecar_format::gguf_bytes &&
+                        (primary_entries[2] == nullptr ||
+                         primary_entries[2]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (secondary_entries[0] == nullptr || secondary_entries[0]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (secondary_entries[1] == nullptr || secondary_entries[1]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (secondary_entries[2] == nullptr || secondary_entries[2]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (tertiary_entries[0] == nullptr || tertiary_entries[0]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (tertiary_entries[1] == nullptr || tertiary_entries[1]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        (tertiary_entries[2] == nullptr || tertiary_entries[2]->source_format == llama_flash_moe_sidecar_format::gguf_bytes) &&
+                        true;
 
                 if (!use_combined_tasks) {
                     for (auto & loaded : batch.experts) {
@@ -1722,6 +1830,9 @@ private:
 
                         for (size_t family_index = 0; family_index < 3; ++family_index) {
                             const auto * primary_entry = primary_entries[family_index];
+                            if (primary_entry == nullptr) {
+                                continue;
+                            }
                             const auto * secondary_entry = secondary_entries[family_index];
                             const auto * tertiary_entry = tertiary_entries[family_index];
                             const bool use_striped_read = prefill_stripe_enabled;
@@ -1802,6 +1913,9 @@ private:
 
                     for (size_t family_index = 0; family_index < 3; ++family_index) {
                         const auto * primary_entry = primary_entries[family_index];
+                        if (primary_entry == nullptr) {
+                            continue;
+                        }
                         const auto * secondary_entry = secondary_entries[family_index];
                         const auto * tertiary_entry = tertiary_entries[family_index];
                         const bool use_striped_read = prefill_stripe_enabled;
@@ -1943,6 +2057,9 @@ private:
                     }
 
                     for (size_t family_index = 0; family_index < 3; ++family_index) {
+                        if (loaded.selected_entries[family_index] == nullptr) {
+                            continue;
+                        }
                         auto & metrics = loaded.family_metrics[family_index];
                         metrics.install_us = metrics.source_us;
 
@@ -2014,31 +2131,48 @@ private:
                     GGML_ASSERT(reserved.slot >= 0);
                     if (loaded.miss) {
                         const int64_t t_stage_start_us = ggml_time_us();
-                        ggml_backend_tensor_set(gate_w, loaded.family_bytes[0].data(), 0, loaded.family_bytes[0].size());
-                        ggml_backend_tensor_set(up_w,   loaded.family_bytes[1].data(), 0, loaded.family_bytes[1].size());
-                        ggml_backend_tensor_set(down_w, loaded.family_bytes[2].data(), 0, loaded.family_bytes[2].size());
+                        if (use_gate_up_merged) {
+                            ggml_backend_tensor_set(gate_up_w, loaded.family_bytes[0].data(), 0, loaded.family_bytes[0].size());
+                            ggml_backend_tensor_set(down_w,    loaded.family_bytes[1].data(), 0, loaded.family_bytes[1].size());
+                            local_stats.prefill_stage_bytes +=
+                                    loaded.family_bytes[0].size() +
+                                    loaded.family_bytes[1].size();
+                        } else {
+                            ggml_backend_tensor_set(gate_w, loaded.family_bytes[0].data(), 0, loaded.family_bytes[0].size());
+                            ggml_backend_tensor_set(up_w,   loaded.family_bytes[1].data(), 0, loaded.family_bytes[1].size());
+                            ggml_backend_tensor_set(down_w, loaded.family_bytes[2].data(), 0, loaded.family_bytes[2].size());
+                            local_stats.prefill_stage_bytes +=
+                                    loaded.family_bytes[0].size() +
+                                    loaded.family_bytes[1].size() +
+                                    loaded.family_bytes[2].size();
+                        }
                         local_stats.prefill_stage_us += ggml_time_us() - t_stage_start_us;
-                        local_stats.prefill_stage_bytes +=
-                                loaded.family_bytes[0].size() +
-                                loaded.family_bytes[1].size() +
-                                loaded.family_bytes[2].size();
                         commit_reserved_slot(state, loaded.expert, reserved);
                     } else {
                         const int64_t t_replay_start_us = ggml_time_us();
-                        read_tensor_slot_bytes(state.gate_tensor, gate_entry, reserved.slot, gate_bytes);
-                        read_tensor_slot_bytes(state.up_tensor,   up_entry,   reserved.slot, up_bytes);
-                        read_tensor_slot_bytes(state.down_tensor, down_entry, reserved.slot, down_bytes);
-                        ggml_backend_tensor_set(gate_w, gate_bytes.data(), 0, gate_bytes.size());
-                        ggml_backend_tensor_set(up_w,   up_bytes.data(),   0, up_bytes.size());
-                        ggml_backend_tensor_set(down_w, down_bytes.data(), 0, down_bytes.size());
+                        if (use_gate_up_merged) {
+                            read_tensor_slot_bytes(state.gate_up_tensor, gate_up_entry, reserved.slot, gate_up_bytes);
+                            read_tensor_slot_bytes(state.down_tensor,    down_entry,    reserved.slot, down_bytes);
+                            ggml_backend_tensor_set(gate_up_w, gate_up_bytes.data(), 0, gate_up_bytes.size());
+                            ggml_backend_tensor_set(down_w,    down_bytes.data(),    0, down_bytes.size());
+                            local_stats.prefill_replay_bytes += gate_up_bytes.size() + down_bytes.size();
+                        } else {
+                            read_tensor_slot_bytes(state.gate_tensor, gate_entry, reserved.slot, gate_bytes);
+                            read_tensor_slot_bytes(state.up_tensor,   up_entry,   reserved.slot, up_bytes);
+                            read_tensor_slot_bytes(state.down_tensor, down_entry, reserved.slot, down_bytes);
+                            ggml_backend_tensor_set(gate_w, gate_bytes.data(), 0, gate_bytes.size());
+                            ggml_backend_tensor_set(up_w,   up_bytes.data(),   0, up_bytes.size());
+                            ggml_backend_tensor_set(down_w, down_bytes.data(), 0, down_bytes.size());
+                            local_stats.prefill_replay_bytes += gate_bytes.size() + up_bytes.size() + down_bytes.size();
+                        }
                         local_stats.prefill_replay_us += ggml_time_us() - t_replay_start_us;
-                        local_stats.prefill_replay_bytes += gate_bytes.size() + up_bytes.size() + down_bytes.size();
                     }
                     state.slot_age[reserved.slot] = ++age;
 
                     for (int32_t ref_offset = 0; ref_offset < ref_count; ref_offset += int32_t(chunk_tokens)) {
                         const int32_t ref_chunk = std::min<int32_t>(ref_count - ref_offset, int32_t(chunk_tokens));
                         const int64_t t_compute_start_us = ggml_time_us();
+                        const float expert_output_scale = down_expert_scales.empty() ? 1.0f : down_expert_scales[size_t(loaded.expert)];
                         std::fill(gathered_inputs.begin(), gathered_inputs.end(), 0.0f);
 
                         for (int32_t j = 0; j < ref_chunk; ++j) {
@@ -2064,7 +2198,7 @@ private:
                             float * dst_row = dst_f32 + size_t(token) * size_t(n_embd);
                             const float * src_row = expert_output.data() + size_t(j) * size_t(n_embd);
                             for (int64_t col = 0; col < n_embd; ++col) {
-                                dst_row[col] += weight * src_row[col];
+                                dst_row[col] += weight * expert_output_scale * src_row[col];
                             }
                         }
                         local_stats.prefill_compute_us += ggml_time_us() - t_compute_start_us;
@@ -4786,7 +4920,7 @@ llama_context::llama_context(
         cparams.moe_prefill_micro_batch = 0;
     } else {
         if (cparams.moe_prefill_batch == 0) {
-            cparams.moe_prefill_batch = params.n_batch;
+            cparams.moe_prefill_batch = 8192;
         }
         if (cparams.moe_prefill_micro_batch == 0) {
             cparams.moe_prefill_micro_batch = cparams.moe_prefill_batch;

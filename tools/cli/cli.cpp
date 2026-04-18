@@ -893,11 +893,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  slot-bank        = %d\n", params.moe_slot_bank);
         fprintf(stderr, "  prefill-banks    = %d\n", params.moe_prefill_banks);
         fprintf(stderr, "  prefill-batch    = %d%s\n",
-                params.moe_prefill_batch > 0 ? params.moe_prefill_batch : params.n_batch,
-                params.moe_prefill_batch > 0 ? "" : " (follows -b)");
+                params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192,
+                params.moe_prefill_batch > 0 ? "" : " (default)");
         fprintf(stderr, "  prefill-micro-batch = %d%s\n",
                 params.moe_prefill_micro_batch > 0 ? params.moe_prefill_micro_batch :
-                        (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : params.n_batch),
+                        (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192),
                 params.moe_prefill_micro_batch > 0 ? "" : " (follows prefill-batch)");
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);

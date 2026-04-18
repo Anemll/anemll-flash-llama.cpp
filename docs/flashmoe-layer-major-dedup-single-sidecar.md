@@ -1,13 +1,8 @@
-# Flash-MoE Layer-Major Dedup (Single Sidecar)
+# Flash-MoE Layer-Major Dedup
 
-This note describes the current `--moe-prefill-layer-major` path in this fork, simplified to the single-sidecar case:
+This note describes the current `--moe-prefill-layer-major` path in this fork.
 
-- one routed sidecar passed with `--moe-sidecar`
-- no secondary or tertiary sidecars
-- no prefill striping
-- no prefill distribution
-
-It focuses on the dedicated prompt-prefill MoE path used by MiniMax-style routed layers in:
+It focuses on the dedicated prompt-prefill MoE path used by routed MoE layers (MiniMax-M2, GLM-5.1, Kimi K2.5, Qwen 3.5, Gemma4) in:
 
 - `src/llama-context.cpp`
 - `common/arg.cpp`
@@ -18,22 +13,47 @@ Layer-major dedup runs prefill one layer at a time. For each layer, it groups re
 
 The bigger the prefill chunk, the more expert reuse we usually get, so prefill becomes cheaper. That should help both GPU and ANE prefill at large batch sizes.
 
+## Confirmed Models
+
+Tested with `--moe-prefill-layer-major` on M5 Max:
+
+- MiniMax-M2.7 — `minimax-m2`
+- Gemma4 26B-A4B — `gemma4`
+- GLM-5.1 — `glm-dsa`
+- Qwen 3.5 35B-A3B — `qwen3moe`
+- Kimi K2.5 — `deepseek2`
+
 ## Example Results
 
-Single-sidecar results on:
+Hardware: `M5 Max`, runtime: `Flash-MoE`, storage: `SSD`.
 
-- hardware: `M5 Max`
-- runtime: `Flash-MoE`
-- storage: `SSD`
-- model: `MiniMax 2.7`
-- quant: `Unsloth UD-Q4_K_XL (4-bit)`
+### 4K prefill across models
 
-| Prefill tokens | Prompt | Decode |
-|---|---:|---:|
-| `1K` | `78.1 t/s` | `16.7 t/s` |
-| `4K` | `227.3 t/s` | `16.6 t/s` |
-| `16K` | `240.0 t/s` | `15.6 t/s` |
-| `22K` | `187.1 t/s` | `13.3 t/s` |
+| Model             | Quant                | Prefill tokens | Prompt      | Decode     |
+| ----------------- | -------------------- | -------------: | ----------: | ---------: |
+| Gemma4 26B-A4B    | `UD-Q3_K_XL`         |         `5009` | `718.3 t/s` | `21.4 t/s` |
+| Qwen 3.5 35B-A3B  | `IQ2`                |         `4661` | `535.5 t/s` | `52.2 t/s` |
+| MiniMax-M2.7      | `UD-Q4_K_XL`         |           `4K` | `227.3 t/s` | `16.6 t/s` |
+| Kimi K2.5         | `UD-TQ1`             |         `4053` | `109.4 t/s` |  `4.4 t/s` |
+| GLM-5.1           | `IQ1`                |         `4070` |  `94.5 t/s` |  `4.4 t/s` |
+
+### 1K prefill (selected)
+
+| Model             | Quant                | Prefill tokens | Prompt      | Decode     |
+| ----------------- | -------------------- | -------------: | ----------: | ---------: |
+| Gemma4 26B-A4B    | `UD-Q3_K_XL`         |         `1260` | `630.6 t/s` | `36.8 t/s` |
+| MiniMax-M2.7      | `UD-Q4_K_XL`         |           `1K` |  `78.1 t/s` | `16.7 t/s` |
+| Kimi K2.5         | `UD-TQ1`             |         `1008` |  `53.0 t/s` |  `6.3 t/s` |
+
+### MiniMax-M2.7 prefill sweep (`UD-Q4_K_XL`)
+
+| Prefill tokens | Prompt      | Decode     |
+| -------------- | ----------- | ---------- |
+| `1K`           | `78.1 t/s`  | `16.7 t/s` |
+| `4K`           | `227.3 t/s` | `16.6 t/s` |
+| `16K`          | `240.0 t/s` | `15.6 t/s` |
+| `22K`          | `187.1 t/s` | `13.3 t/s` |
+
 
 ## Why This Path Exists
 
@@ -62,7 +82,7 @@ For one prompt slab of `N = min(remaining_tokens, --moe-prefill-batch)`:
 2. Build a per-layer prefill plan over the whole slab.
 3. Dedup expert ids across all `N * topk` routed refs.
 4. Sort unique experts by sidecar order for better read locality.
-5. Load unique experts from the single sidecar in host-side read batches of `--moe-prefill-banks`.
+5. Load unique experts from the sidecar in host-side read batches of `--moe-prefill-banks`.
 6. While computing the current staged batch, asynchronously read the next staged batch.
 7. For each unique expert, gather only the token rows that reference it.
 8. Run `gate`, `up`, `swiglu`, `down`.
@@ -142,27 +162,21 @@ The plan does three useful things:
 2. Produces one deduped expert list for the whole layer slab.
 3. Packs all token refs for each expert into a contiguous range.
 
-It also sorts `unique_experts` by sidecar offset, so single-sidecar reads walk the sidecar more sequentially instead of bouncing around by expert id.
+It also sorts `unique_experts` by sidecar offset, so reads walk the sidecar more sequentially instead of bouncing around by expert id.
 
-## Single-Sidecar Read Path
+## Read Path
 
 The dedicated executor is `compute_prefill_moe_tensor()` in `src/llama-context.cpp`.
 
-For the single-sidecar case, the read policy is:
-
-- `prefill_stripe_enabled == false`
-- `prefill_distribute_enabled == false`
-- every miss comes from the primary sidecar only
-
-Each expert still has three routed families:
+Each expert has three routed families:
 
 - `gate`
 - `up`
 - `down`
 
-So one unique expert miss loads three payloads from the same sidecar.
+So one unique expert miss loads three payloads from the sidecar.
 
-If `--moe-prefill-io-split N` is greater than `1`, each family payload is split into `N` page-aligned `pread` tasks. That improves queue depth on one SSD, but it is still one sidecar path, not multi-drive striping.
+If `--moe-prefill-io-split N` is greater than `1`, each family payload is split into `N` page-aligned `pread` tasks. That improves queue depth on the SSD.
 
 ## What `--moe-prefill-banks` Means Now
 
@@ -188,7 +202,7 @@ It is **not** used as:
 
 Those temp tensors are still loaded one expert at a time inside the compute loop.
 
-So for the single-sidecar path:
+In practice:
 
 - `--moe-prefill-banks 1` means no read-ahead batching
 - `--moe-prefill-banks 4` means stage 4 experts, then read the next 4 while computing the current 4
@@ -304,10 +318,10 @@ For each unique expert:
 2. Gather only the input token rows that reference that expert.
 3. Process that expert's ref range in chunks of `--moe-prefill-micro-batch`.
 4. Run the temporary MoE graph:
-   - `gate = ggml_mul_mat(gate_w, cur_in)`
-   - `up = ggml_mul_mat(up_w, cur_in)`
-   - `act = ggml_swiglu_split(gate, up)`
-   - `out = ggml_mul_mat(down_w, act)`
+  - `gate = ggml_mul_mat(gate_w, cur_in)`
+  - `up = ggml_mul_mat(up_w, cur_in)`
+  - `act = ggml_swiglu_split(gate, up)`
+  - `out = ggml_mul_mat(down_w, act)`
 5. Scatter weighted expert output back into the destination rows.
 
 This is why `--moe-prefill-micro-batch` is a per-expert ref-chunk compute knob, not the dedup window.
@@ -316,7 +330,7 @@ The dedup window is the full `--moe-prefill-batch`.
 
 ## Reuse Model
 
-For the current single-sidecar implementation, the real win is dedup reuse, not persistent bank replay.
+In the current implementation, the real win is dedup reuse, not persistent bank replay.
 
 That means:
 
@@ -333,14 +347,14 @@ So it is normal for `Bank replay` to stay near zero in current prefill profiles.
 
 ## Perf Counters To Watch
 
-The most useful counters for single-sidecar tuning are:
+The most useful counters for tuning are:
 
 - `prefill dedup saved`
   - how many routed refs were eliminated by deduping unique experts
 - `prefill reuse factor`
   - average refs served per unique expert load
 - `prefill read bandwidth`
-  - effective single-sidecar read throughput
+  - effective sidecar read throughput
 - `prefill source overlap`
   - summed task time divided by wall time
 - `prefill pacing`
@@ -352,9 +366,9 @@ Interpretation:
 - if `bottleneck=data`, the SSD/read path is limiting prefill
 - if `bottleneck=compute`, increasing I/O parallelism will help less than changing compute chunking
 
-## Single-Sidecar Tuning Rules
+## Tuning Rules
 
-For a single sidecar, the practical knobs are:
+The practical knobs are:
 
 - `--moe-prefill-batch`
   - larger gives a wider dedup window
@@ -385,9 +399,9 @@ If the run becomes compute-bound:
 - keep the I/O knobs
 - adjust `--moe-prefill-micro-batch`
 
-## Example Single-Sidecar Benchmark Command
+## Example Benchmark Command
 
-This is one concrete single-sidecar command for the `16K` coding prompt:
+This is one concrete command for the `16K` coding prompt:
 
 ```bash
 DISPLAY_PROMPT=0 \
@@ -414,22 +428,12 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
 
 For the result table above, the decode length was `1024` tokens.
 
-Single-sidecar means:
-
-- keep `--moe-sidecar`
-- do not pass `--moe-secondary-sidecar`
-- do not pass `--moe-tertiary-sidecar`
-- do not use `--moe-demand-stripe`
-- do not use `--moe-prefetch-stripe`
-- do not use `--moe-prefill-stripe`
-
 ## Summary
 
-The current single-sidecar layer-major path is:
+The current layer-major path is:
 
 - layer-major at the prompt-prefill MoE stage
 - deduped across the full prefill slab
-- single-sidecar on the miss path
 - read-ahead batched by `--moe-prefill-banks`
 - per-expert compute chunked by `--moe-prefill-micro-batch`
 
@@ -439,4 +443,174 @@ The main speedup comes from:
 - grouping all token refs for that expert together
 - overlapping staged reads for the next expert batch with compute on the current batch
 
-That is the simplified algorithm behind the single-sidecar benchmark numbers.
+That is the simplified algorithm behind the benchmark numbers.
+
+## GLM-5.1 Default Test
+
+This is a simple GLM-5.1 prefill smoke test using the current default
+`--moe-prefill-batch = 8192`.
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+SIDECAR_PATH=~/Models/GLM/GLM-5.1-sidecar \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=96 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=6000 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/GLM/GLM-5.1-IQ1-Dense \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1024 -st
+```
+
+Expected startup line:
+
+```text
+prefill-batch    = 8192 (default)
+```
+
+This is a good default M5 Max starting point for GLM-5.1:
+
+- `--moe-topk 4`
+- `--moe-slot-bank 96`
+- layer-major prefill enabled
+- explicit micro-batch / I/O-split / prefill-banks tuning
+
+## Additional Model Smoke Tests
+
+These are the tested layer-major prefill smoke tests for the other
+architectures currently enabled on this branch.
+
+### Kimi K2.5
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+SIDECAR_PATH=~/Models/Kimi/Kimi-K2.5-UD-TQ1/sidecar \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=8192 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/Kimi/Kimi-K2.5-UD-TQ1/dense \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1024 -st
+```
+
+### Qwen 3.5
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+SIDECAR_PATH=~/Models/Q35A3_IQ2_GUFF/sidecar \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=8192 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/Q35A3_IQ2_GUFF/dense \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1024 -st
+```
+
+### Gemma4
+
+Build the Flash package once (dense GGUF + routed sidecar under one directory):
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model ~/Models/gemma4/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf \
+  --out-dir ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense/sidecar \
+  --force
+
+python3 ./tools/flashmoe-sidecar/export_dense_gguf.py \
+  --model ~/Models/gemma4/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf \
+  --sidecar ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense/sidecar \
+  --out-dir ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense \
+  --force
+```
+
+Resulting layout (Q3_K_XL): `model-dense.gguf` 2.4 GB, `sidecar/` 9.6 GB,
+`flashmoe-package.json`.
+
+#### 1K prefill
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=4096 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_1k.txt \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1024 -st
+```
+
+#### 4K prefill
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=8192 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 1024 -st
+```
+
