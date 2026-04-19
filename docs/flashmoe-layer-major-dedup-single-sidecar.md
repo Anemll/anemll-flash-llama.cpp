@@ -946,6 +946,7 @@ To register additional local servers (for example a second machine on the
 LAN), copy the object, bump `index`, give it a new unique `id` like
 `custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
 
+<a name="testing-flash-moe-with-mariozechner-pi-agent-badlogic"></a>
 ## Testing Flash-MoE with `@badlogicgames` pi-agent (badlogic)
 
 [`pi` / `pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
