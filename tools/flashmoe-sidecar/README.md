@@ -880,6 +880,49 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }' | jq
 ```
 
+### Pi coding-agent integration
+
+The local server can also be added to
+[`pi` / `@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+as a custom OpenAI-compatible provider via `~/.pi/agent/models.json`.
+
+```json
+{
+  "providers": {
+    "flashmoe-local": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "minimax-m2",
+          "name": "MiniMax-M2.7 Flash (Local)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 96000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}
+```
+
+Notes:
+
+- `id` must match `MODEL_ALIAS` on the server.
+- Keep `baseUrl` on `127.0.0.1` when `pi` runs on the same machine, even if the
+  server binds to `HOST=0.0.0.0`.
+- The `compat` block keeps `pi` on the plain OpenAI-compatible path that works
+  with the current Flash-MoE server.
+
 Gemma4 benchmark example:
 
 ```bash

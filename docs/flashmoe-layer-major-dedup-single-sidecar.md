@@ -35,6 +35,7 @@ Flash-MoE sidecar instead of staying resident:
 - [Server Mode](#server-mode)
 - [Largest Verified Safe Q8 Server Context](#largest-verified-safe-q8-server-context)
 - [Testing the Server with MiniMax-M2.7 and DroidAI (M5 Max 128)](#testing-the-server-with-minimax-m27-and-droidai-m5-max-128)
+- [Testing Flash-MoE with `@mariozechner` pi-agent (badlogic)](#testing-flash-moe-with-mariozechner-pi-agent-badlogic)
 
 ## Short Description
 
@@ -945,9 +946,62 @@ To register additional local servers (for example a second machine on the
 LAN), copy the object, bump `index`, give it a new unique `id` like
 `custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
 
+## Testing Flash-MoE with `@mariozechner` pi-agent (badlogic)
+
+[`pi` / `@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+can use the local Flash-MoE server as a custom OpenAI-compatible provider. The
+provider entry lives in `~/.pi/agent/models.json`.
+
+```json
+{
+  "providers": {
+    "flashmoe-local": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "minimax-m2",
+          "name": "MiniMax-M2.7 Flash (Local)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 96000,
+          "maxTokens": 32000,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Notes:
+
+- `id` must equal `MODEL_ALIAS` on the server. If the server advertises
+  `minimax-m2`, the `pi` model id must also be `minimax-m2`.
+- Keep `baseUrl` on `127.0.0.1` when `pi` runs on the same machine, even if
+  the server binds to `HOST=0.0.0.0` for LAN access.
+- `supportsDeveloperRole=false` and `supportsReasoningEffort=false` keep `pi`
+  on the simplest OpenAI-compatible path for the current server behavior.
+- `supportsUsageInStreaming=false` avoids relying on usage chunks in streamed
+  responses.
+- After editing `~/.pi/agent/models.json`, open `/model` inside `pi` to reload
+  the file and select `MiniMax-M2.7 Flash (Local)`.
+
 ### Quick sanity check
 
-Before opening DroidAI, confirm the alias and endpoint are reachable:
+Before opening DroidAI or `pi`, confirm the alias and endpoint are reachable:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/models | jq
