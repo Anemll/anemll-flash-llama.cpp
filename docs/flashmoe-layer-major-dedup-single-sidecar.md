@@ -855,6 +855,35 @@ Notes on the server flags:
   single-bank layer-major prefill path for MiniMax on M5 Max 128. Raise
   `--moe-prefill-banks` only if you have extra memory headroom.
 
+High memory use to improve decoding cache hit rate:
+
+```bash
+HOST=0.0.0.0 \
+PORT=8080 \
+MODEL_ALIAS=minimax-m2 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=128 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=4096 \
+UBATCH=16 \
+CTX=96000 \
+SEED=123 \
+TEMP=0.0 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --ctx-checkpoints 0 \
+  --checkpoint-every-n-tokens -1 \
+  --no-warmup \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 16192 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 1
+```
+
 ### Adding the server to `~/.factory/settings.json`
 
 Factory AI / DroidAI reads custom OpenAI-compatible models from
