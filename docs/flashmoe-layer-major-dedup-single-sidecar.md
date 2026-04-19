@@ -1,4 +1,4 @@
-# Flash-MoE Layer-Major Dedup
+# Flash-MoE Layer-Major Dedup (SSD-streamed)
 
 This note describes the current `--moe-prefill-layer-major` path in this fork.
 
