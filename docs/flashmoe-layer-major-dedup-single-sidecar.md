@@ -35,7 +35,7 @@ Flash-MoE sidecar instead of staying resident:
 - [Server Mode](#server-mode)
 - [Largest Verified Safe Q8 Server Context](#largest-verified-safe-q8-server-context)
 - [Testing the Server with MiniMax-M2.7 and DroidAI (M5 Max 128)](#testing-the-server-with-minimax-m27-and-droidai-m5-max-128)
-- [Testing Flash-MoE with `@mariozechner` pi-agent (badlogic)](#testing-flash-moe-with-mariozechner-pi-agent-badlogic)
+- [Testing Flash-MoE with `@badlogicgames` pi-agent (badlogic)](#testing-flash-moe-with-badlogicgames-pi-agent-badlogic)
 
 ## Short Description
 
@@ -946,9 +946,9 @@ To register additional local servers (for example a second machine on the
 LAN), copy the object, bump `index`, give it a new unique `id` like
 `custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
 
-## Testing Flash-MoE with `@mariozechner` pi-agent (badlogic)
+## Testing Flash-MoE with `@badlogicgames` pi-agent (badlogic)
 
-[`pi` / `@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+[`pi` / `pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
 can use the local Flash-MoE server as a custom OpenAI-compatible provider. The
 provider entry lives in `~/.pi/agent/models.json`.
 

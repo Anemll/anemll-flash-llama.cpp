@@ -883,7 +883,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ### Pi coding-agent integration
 
 The local server can also be added to
-[`pi` / `@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+[`pi` / `pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
 as a custom OpenAI-compatible provider via `~/.pi/agent/models.json`.
 
 ```json
