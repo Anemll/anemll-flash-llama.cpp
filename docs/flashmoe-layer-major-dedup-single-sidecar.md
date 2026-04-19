@@ -963,7 +963,7 @@ provider entry lives in `~/.pi/agent/models.json`.
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "supportsUsageInStreaming": false,
+        "supportsUsageInStreaming": true,
         "maxTokensField": "max_tokens"
       },
       "models": [
@@ -995,8 +995,12 @@ Notes:
   the server binds to `HOST=0.0.0.0` for LAN access.
 - `supportsDeveloperRole=false` and `supportsReasoningEffort=false` keep `pi`
   on the simplest OpenAI-compatible path for the current server behavior.
-- `supportsUsageInStreaming=false` avoids relying on usage chunks in streamed
-  responses.
+- `supportsUsageInStreaming=true` is required for the `pi` footer to show
+  correct context / cache usage. With it set to `false`, `pi` does not send
+  `stream_options.include_usage`, the server omits the trailing usage chunk,
+  and `pi` reports `cacheRead`/`cacheWrite`/totals as `0`. The llama.cpp
+  server emits `prompt_tokens_details.cached_tokens` in the final stream
+  chunk when this option is enabled.
 - After editing `~/.pi/agent/models.json`, open `/model` inside `pi` to reload
   the file and select `MiniMax-M2.7 Flash (Local)`.
 

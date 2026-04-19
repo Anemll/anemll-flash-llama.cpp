@@ -1500,19 +1500,49 @@ static void func_args_not_string(json & messages) {
     for (auto & message : messages) {
         if (message.contains("tool_calls")) {
             for (auto & tool_call : message["tool_calls"]) {
-                if (tool_call.contains("function") && tool_call["function"].contains("arguments")) {
-                    auto & args = tool_call["function"]["arguments"];
-                    if (args.is_string()) {
-                        try {
-                            args = json::parse(args.get<std::string>());
-                        } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
-                        }
+                if (!tool_call.contains("function")) {
+                    continue;
+                }
+
+                auto & function = tool_call["function"];
+                if (!function.contains("arguments") || function["arguments"].is_null()) {
+                    function["arguments"] = json::object();
+                    continue;
+                }
+
+                auto & args = function["arguments"];
+                if (args.is_string()) {
+                    try {
+                        args = json::parse(args.get<std::string>());
+                    } catch (const std::exception & e) {
+                        throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
                     }
                 }
             }
         }
     }
+}
+
+static bool template_needs_object_arguments(const std::string & src) {
+    const bool iterates_tool_call_arguments =
+        src.find("tool_call.arguments|items") != std::string::npos ||
+        src.find("tool_call.arguments | items") != std::string::npos ||
+        src.find("tool_call['function']['arguments']|items") != std::string::npos ||
+        src.find("tool_call['function']['arguments'] | items") != std::string::npos;
+
+    const bool iterates_stashed_arguments =
+        src.find("_args.items()") != std::string::npos && (
+            src.find("tool_call.arguments") != std::string::npos ||
+            src.find("tc.arguments") != std::string::npos
+        );
+
+    const bool iterates_local_arguments =
+        src.find("arguments|items") != std::string::npos && (
+            src.find("set arguments = tool_call.arguments") != std::string::npos ||
+            src.find("set arguments = tool_call['function']['arguments']") != std::string::npos
+        );
+
+    return iterates_tool_call_arguments || iterates_stashed_arguments || iterates_local_arguments;
 }
 
 }
@@ -1612,7 +1642,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::requires_non_null_content(params.messages);
     }
 
-    if (tmpl.original_caps().supports_object_arguments) {
+    if (tmpl.original_caps().supports_object_arguments || workaround::template_needs_object_arguments(src)) {
         workaround::func_args_not_string(params.messages);
     }
 

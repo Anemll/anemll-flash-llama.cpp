@@ -108,7 +108,7 @@
                     {%- set tool_call = tool_call.function %}
                 {%- endif %}
                 {{- '<invoke name="' + tool_call.name + '">' }}
-                {% set _args = tool_call.arguments %}
+                {% set _args = tool_call.arguments if tool_call.arguments is defined and tool_call.arguments is mapping else {} %}
                 {%- for k, v in _args.items() %}
                 {{- '<parameter name="' + k + '">' }}
                 {{- v | tojson(ensure_ascii=False) if v is not string else v }}

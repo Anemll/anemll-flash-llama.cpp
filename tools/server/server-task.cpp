@@ -52,14 +52,14 @@ static std::string server_extract_xml_attr(const std::string & tag_header, const
         if (end == std::string::npos) {
             return "";
         }
-        return tag_header.substr(value_pos + 1, end - value_pos - 1);
+        return server_trim_copy(tag_header.substr(value_pos + 1, end - value_pos - 1));
     }
 
     size_t end = value_pos;
     while (end < tag_header.size() && !std::isspace(static_cast<unsigned char>(tag_header[end])) && tag_header[end] != '>') {
         ++end;
     }
-    return tag_header.substr(value_pos, end - value_pos);
+    return server_trim_copy(tag_header.substr(value_pos, end - value_pos));
 }
 
 static json server_parse_minimax_param_value(const std::string & raw_value) {
@@ -837,6 +837,10 @@ json result_timings::to_json() const {
         {"prompt_ms",              prompt_ms},
         {"prompt_per_token_ms",    prompt_per_token_ms},
         {"prompt_per_second",      prompt_per_second},
+        {"prompt_prep_ms",         prompt_prep_ms},
+        {"prompt_eval_ms",         prompt_eval_ms},
+        {"prompt_eval_per_token_ms", prompt_eval_per_token_ms},
+        {"prompt_eval_per_second", prompt_eval_per_second},
 
         {"predicted_n",            predicted_n},
         {"predicted_ms",           predicted_ms},
@@ -861,6 +865,8 @@ json result_prompt_progress::to_json() const {
         {"cache",     cache},
         {"processed", processed},
         {"time_ms",   time_ms},
+        {"prep_ms",   prep_ms},
+        {"eval_ms",   eval_ms},
     };
 }
 

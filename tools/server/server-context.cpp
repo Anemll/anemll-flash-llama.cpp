@@ -130,6 +130,7 @@ struct server_slot {
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
     int32_t n_prompt_tokens_logged    = 0;
+    bool prompt_prefill_started_logged = false;
 
     size_t last_nl_pos = 0;
 
@@ -213,6 +214,7 @@ struct server_slot {
     int64_t t_last_generation_progress = 0;
 
     double t_prompt_processing = 0;        // ms
+    double t_prompt_eval = 0;              // ms spent inside llama_decode() while prefilling
     double t_token_generation = 0;         // total generation ms, including first-token latency
     double t_token_generation_steady = 0;  // steady-state generation ms, excluding the first decode iteration
     int32_t n_generation_warmup_tokens = 0;
@@ -227,12 +229,22 @@ struct server_slot {
         return std::max(0, n_decoded - n_generation_warmup_tokens);
     }
 
+    double t_prompt_prep() const {
+        return std::max(0.0, t_prompt_processing - t_prompt_eval);
+    }
+
+    double prompt_eval_tps() const {
+        return n_prompt_tokens_processed > 0 && t_prompt_eval > 0 ?
+                1e3 / t_prompt_eval * n_prompt_tokens_processed : 0.0;
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
         n_decoded = 0;
         n_prompt_tokens_cache  = 0;
         n_prompt_tokens_logged = 0;
+        prompt_prefill_started_logged = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -246,6 +258,7 @@ struct server_slot {
         t_start_generation_steady = 0;
         t_last_generation_progress = 0;
         t_prompt_processing = 0;
+        t_prompt_eval = 0;
         t_token_generation = 0;
         t_token_generation_steady = 0;
         n_generation_warmup_tokens = 0;
@@ -406,6 +419,10 @@ struct server_slot {
         timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0;
         timings.prompt_per_second   = n_prompt_tokens_processed > 0 && t_prompt_processing > 0 ?
                 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0;
+        timings.prompt_prep_ms      = t_prompt_prep();
+        timings.prompt_eval_ms      = t_prompt_eval;
+        timings.prompt_eval_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_eval / n_prompt_tokens_processed : 0;
+        timings.prompt_eval_per_second   = prompt_eval_tps();
 
         const int32_t predicted_n_steady = n_decoded_steady();
         timings.predicted_n            = predicted_n_steady;
@@ -458,6 +475,8 @@ struct server_slot {
         const double t_prompt = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0;
         const double n_prompt_second = n_prompt_tokens_processed > 0 && t_prompt_processing > 0 ?
                 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0;
+        const double t_prompt_eval_per_token = n_prompt_tokens_processed > 0 ? t_prompt_eval / n_prompt_tokens_processed : 0;
+        const double n_prompt_eval_second = prompt_eval_tps();
 
         const int32_t n_gen_steady = n_decoded_steady();
         const double t_gen_steady = n_gen_steady > 0 ? t_token_generation_steady / n_gen_steady : 0;
@@ -466,9 +485,13 @@ struct server_slot {
 
         SLT_INF(*this,
                 "\n"
+                "prompt prep time = %10.2f ms\n"
                 "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
+                "prompt total time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
                 "steady eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
                 "      total time = %10.2f ms / %5d tokens\n",
+                t_prompt_prep(),
+                t_prompt_eval, n_prompt_tokens_processed, t_prompt_eval_per_token, n_prompt_eval_second,
                 t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second,
                 t_token_generation_steady, n_gen_steady, t_gen_steady, n_gen_second_steady,
                 t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
@@ -569,6 +592,7 @@ struct server_slot {
 
         other.t_start_process_prompt    = t_start_process_prompt;
         other.t_prompt_processing       = t_prompt_processing;
+        other.t_prompt_eval             = t_prompt_eval;
         other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
@@ -1554,6 +1578,8 @@ private:
             res->progress.cache     = slot.n_prompt_tokens_cache;
             res->progress.processed = slot.prompt.tokens.size();
             res->progress.time_ms   = (ggml_time_us() - slot.t_start_process_prompt) / 1000;
+            res->progress.prep_ms   = slot.t_prompt_prep();
+            res->progress.eval_ms   = slot.t_prompt_eval;
         } else {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
@@ -2308,6 +2334,7 @@ private:
                         slot.t_start_generation = 0;
                         slot.t_start_generation_steady = 0;
                         slot.t_prompt_processing = 0;
+                        slot.t_prompt_eval = 0;
                         slot.n_generation_warmup_tokens = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -2579,6 +2606,7 @@ private:
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
+                        slot.prompt_prefill_started_logged = false;
 
                         slot.prompt.tokens.keep_first(n_past);
                         slot.n_prompt_tokens_logged = slot.prompt.n_tokens();
@@ -2716,6 +2744,16 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
+                    if (!slot.prompt_prefill_started_logged && n_tokens_cur > 0) {
+                        const int32_t n_total = slot.task->n_tokens();
+                        const int32_t n_pending = std::max<int32_t>(0, slot.task->n_tokens() - slot.n_prompt_tokens_cache);
+                        SLT_INF(slot,
+                                "starting prompt prefill, total = %d, cache = %d, pending = %d, batch = %d, queued = %d%s\n",
+                                n_total, slot.n_prompt_tokens_cache, n_pending, n_tokens_cur, batch.n_tokens,
+                                flash_moe_progress_brief(slot.ctx, true).c_str());
+                        slot.prompt_prefill_started_logged = true;
+                    }
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -2850,6 +2888,7 @@ private:
                 batch.logits   + i,
             };
 
+            const int64_t t_before_decode = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
@@ -2910,6 +2949,7 @@ private:
             n_batch = llama_n_batch(ctx);
 
             const int64_t t_after_decode = ggml_time_us();
+            const double decode_ms = std::max<int64_t>(1, t_after_decode - t_before_decode) / 1e3;
             for (auto & slot : slots) {
                 if (!(slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT)) {
                     continue;
@@ -2918,18 +2958,24 @@ private:
                     continue;
                 }
 
-                const double prompt_tps = slot.n_prompt_tokens_processed > 0 ?
-                        slot.n_prompt_tokens_processed * 1e6 /
-                        std::max<int64_t>(1, t_after_decode - slot.t_start_process_prompt) : 0;
+                slot.t_prompt_eval += decode_ms;
+                const double prompt_ms = std::max<int64_t>(1, t_after_decode - slot.t_start_process_prompt) / 1e3;
+                slot.t_prompt_processing = prompt_ms;
+                const double prompt_prep_ms = slot.t_prompt_prep();
+                const double prompt_eval_ms = slot.t_prompt_eval;
+                const double prompt_tps = slot.prompt_eval_tps();
 
                 if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                    SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d%s\n",
-                            slot.prompt.n_tokens(), batch.n_tokens,
+                    SLT_INF(slot,
+                            "prompt processing done, n_tokens = %d, batch.n_tokens = %d, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
+                            slot.prompt.n_tokens(), batch.n_tokens, prompt_prep_ms, prompt_eval_ms, prompt_ms,
                             flash_moe_progress_brief(slot.ctx, true, prompt_tps).c_str());
                 } else {
-                    SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f%s\n",
+                    SLT_INF(slot,
+                            "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
                             slot.prompt.n_tokens(), batch.n_tokens,
                             (float) slot.prompt.n_tokens() / slot.task->n_tokens(),
+                            prompt_prep_ms, prompt_eval_ms, prompt_ms,
                             flash_moe_progress_brief(slot.ctx, true, prompt_tps).c_str());
                 }
 
@@ -3241,6 +3287,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     try {
         std::vector<server_task> tasks;
+        const int64_t t_start_prepare = ggml_time_us();
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -3248,6 +3295,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // process prompt
         std::vector<server_tokens> inputs;
+        const int64_t t_start_tokenize = ggml_time_us();
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -3256,8 +3304,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
         }
+        const int64_t t_after_tokenize = ggml_time_us();
+        int64_t total_prompt_tokens = 0;
+        for (const auto & input : inputs) {
+            total_prompt_tokens += input.size();
+        }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+        double params_parse_ms = 0.0;
 
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
@@ -3265,11 +3319,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
+            const int64_t t_start_params = ggml_time_us();
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
                     params,
                     meta->slot_n_ctx,
                     data);
+            params_parse_ms += (ggml_time_us() - t_start_params) / 1000.0;
             task.id_slot = json_value(data, "id_slot", -1);
 
             // OAI-compat
@@ -3287,6 +3343,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             tasks.push_back(std::move(task));
         }
+
+        SRV_INF("Request prepared: prompts = %zu, tasks = %zu, prompt_tokens = %" PRId64 ", tokenize = %.2f ms, params = %.2f ms, total = %.2f ms, queueing for slot scheduling\n",
+                inputs.size(),
+                tasks.size(),
+                total_prompt_tokens,
+                (t_after_tokenize - t_start_tokenize) / 1000.0,
+                params_parse_ms,
+                (ggml_time_us() - t_start_prepare) / 1000.0);
 
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {

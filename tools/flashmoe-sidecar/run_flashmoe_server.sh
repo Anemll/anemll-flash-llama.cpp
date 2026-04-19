@@ -35,6 +35,7 @@ secondary_sidecar_path=${SECONDARY_SIDECAR_PATH:-}
 tertiary_sidecar_path=${TERTIARY_SIDECAR_PATH:-}
 prefetch_sidecar=${PREFETCH_SIDECAR:-}
 model_alias=${MODEL_ALIAS:-}
+chat_template_file=${CHAT_TEMPLATE_FILE:-}
 package_json=${PACKAGE_JSON:-}
 if [[ -z "$package_json" && -n "$package_dir" ]]; then
     package_json="$package_dir/flashmoe-package.json"
@@ -200,6 +201,34 @@ fi
 
 if [[ -n "${TEMP:-}" ]]; then
     cmd+=(--temp "$TEMP")
+fi
+
+if [[ $# -gt 0 ]]; then
+    has_explicit_template_args=0
+    for arg in "$@"; do
+        case "$arg" in
+            --chat-template|--chat-template-file)
+                has_explicit_template_args=1
+                break
+                ;;
+        esac
+    done
+else
+    has_explicit_template_args=0
+fi
+
+if [[ -z "$chat_template_file" && "$has_explicit_template_args" == "0" ]]; then
+    local_minimax_template="$script_dir/../../models/templates/MiniMax-M2.jinja"
+    if [[ -f "$local_minimax_template" ]]; then
+        minimax_hint="${model_alias} ${model_path} ${package_dir:-} ${target}"
+        if [[ "$minimax_hint" == *MiniMax-M2* || "$minimax_hint" == *minimax-m2* ]]; then
+            chat_template_file="$local_minimax_template"
+        fi
+    fi
+fi
+
+if [[ -n "$chat_template_file" && "$has_explicit_template_args" == "0" ]]; then
+    cmd+=(--jinja --chat-template-file "$chat_template_file")
 fi
 
 if [[ $# -gt 0 ]]; then

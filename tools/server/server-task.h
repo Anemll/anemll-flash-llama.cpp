@@ -261,14 +261,18 @@ struct result_timings {
     int32_t cache_n = -1;
 
     int32_t prompt_n = -1;
-    double prompt_ms;
-    double prompt_per_token_ms;
-    double prompt_per_second;
+    double prompt_ms = 0;
+    double prompt_per_token_ms = 0;
+    double prompt_per_second = 0;
+    double prompt_prep_ms = 0;
+    double prompt_eval_ms = 0;
+    double prompt_eval_per_token_ms = 0;
+    double prompt_eval_per_second = 0;
 
     int32_t predicted_n = -1;
-    double predicted_ms;
-    double predicted_per_token_ms;
-    double predicted_per_second;
+    double predicted_ms = 0;
+    double predicted_per_token_ms = 0;
+    double predicted_per_second = 0;
 
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
@@ -282,6 +286,8 @@ struct result_prompt_progress {
     int32_t cache = 0;
     int32_t processed = 0;
     int64_t time_ms = 0;
+    double prep_ms = 0;
+    double eval_ms = 0;
 
     json to_json() const;
 };
