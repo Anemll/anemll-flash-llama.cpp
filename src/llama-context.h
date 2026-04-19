@@ -172,6 +172,7 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    bool flash_moe_progress_get(bool prefill, llama_flash_moe_progress_stats & out) const;
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 

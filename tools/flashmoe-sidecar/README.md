@@ -713,6 +713,269 @@ You do not need to know how many layers are routed MoE versus dense/shared; rout
 
 If you want a shared-expert-only control run with the same dense/shared placement, add `--moe-shared-only`. That bypasses routed experts at graph build time while leaving shared experts active, which is useful for MLX-style prefill and dense/shared diagnostic comparisons.
 
+## Server workflow for layer-major prefill
+
+Three helper scripts cover the server path:
+
+- `tools/flashmoe-sidecar/run_flashmoe_server.sh`
+  Launches `llama-server` with Flash-MoE defaults, slot-bank sizing, and any
+  layer-major prefill flags you pass through.
+- `tools/flashmoe-sidecar/flashmoe_server_synth_test.py`
+  Sends one synthetic long-prompt request to a running server and prints prompt
+  and decode throughput without involving tools or a follow-up turn.
+- `tools/flashmoe-sidecar/flashmoe_server_turn_test.py`
+  Sends a big first-turn `/completion` request, then a same-slot follow-up turn.
+- `tools/flashmoe-sidecar/flashmoe_server_smoke.sh`
+  Starts the server, waits for readiness, runs the turn test, shuts the server
+  down, and prints the key prompt / dedup / decode summaries.
+
+If you want a stable OpenAI-style model id for `/v1/models` and
+`/v1/chat/completions`, set:
+
+- `MODEL_ALIAS=minimax-m2`
+- `MODEL_ALIAS=gemma4`
+- `MODEL_ALIAS=glm-dsa`
+- `MODEL_ALIAS=qwen3moe`
+- `MODEL_ALIAS=deepseek2`
+
+`run_flashmoe_server.sh` forwards that as `--alias`, and the alias becomes the
+model id returned by `/v1/models`.
+
+`run_flashmoe_server.sh` also accepts an optional server profile:
+
+- `FLASHMOE_SERVER_PROFILE=default`
+  Uses the package/default slot-bank sizing path.
+- `FLASHMOE_SERVER_PROFILE=highmem-decode`
+  Raises the auto-sized slot-bank floor to `128` so the server can spend more
+  host memory to improve decode-side cache hit rate on larger-memory systems.
+  `MOE_SLOT_BANK` still overrides the profile if you want an exact value.
+
+Example MiniMax high-memory server profile:
+
+```bash
+HOST=0.0.0.0 \
+PORT=8080 \
+MODEL_ALIAS=minimax-m2 \
+FLASHMOE_SERVER_PROFILE=highmem-decode \
+MOE_TOPK=4 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=4096 \
+UBATCH=16 \
+CTX=96000 \
+SEED=123 \
+TEMP=0.0 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --ctx-checkpoints 0 \
+  --checkpoint-every-n-tokens -1 \
+  --no-warmup \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 16192 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 1
+```
+
+### MiniMax tool-calling note
+
+MiniMax tool calling in this fork now uses a server-side fallback for the
+documented MiniMax XML tool format:
+
+- the sampler grammar is disabled for MiniMax tool requests
+- the raw assistant reply is still captured
+- if the generic PEG parser rejects mixed prose / `</think>` / XML output, the
+  server extracts `<minimax:tool_call> ... <invoke ...> ... </invoke> ...`
+  blocks manually and converts them into normal OpenAI-style `tool_calls`
+
+That means a direct `/v1/chat/completions` request can now succeed even when the
+raw MiniMax reply looks like:
+
+```xml
+<minimax:tool_call>
+<invoke name="Read">
+<parameter name="file_path">/tmp/demo.py</parameter>
+<parameter name="offset">1</parameter>
+<parameter name="limit">20</parameter>
+</invoke>
+</minimax:tool_call>
+```
+
+Recommended workflow for debugging tool use:
+
+1. Start the server with `run_flashmoe_server.sh`.
+2. Send a direct curl request to `/v1/chat/completions` before trying a UI like
+   Factory AI or DroidAI.
+3. Check the server log for:
+   - `Tool-call request: ...`
+   - `Tool-parse state: ...`
+   - `MiniMax tool-call parse fallback recovered ...`
+
+Example MiniMax tool-call probe:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "minimax-m2",
+    "temperature": 0,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read lines 1 to 20 from /tmp/demo.py using the Read tool."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "Read",
+          "description": "Read part of a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_path": { "type": "string" },
+              "offset": { "type": "integer" },
+              "limit": { "type": "integer" }
+            },
+            "required": ["file_path", "offset", "limit"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "required",
+    "parallel_tool_calls": false,
+    "max_tokens": 128
+  }' | jq
+```
+
+Gemma4 benchmark example:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8091 \
+PROMPT_LABEL=16k \
+N_PREDICT=64 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=25000 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
+  ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4
+```
+
+This server flow is tested on:
+
+- MiniMax-M2.7
+- Gemma4 26B-A4B
+- GLM-5.1
+- Qwen 3.5 35B-A3B
+- Kimi K2.5
+
+Qwen 3.5 currently has one important server caveat: the second turn may force a
+full prompt re-processing pass because the server reports a lack of cache data
+for its SWA / hybrid-memory path. The dedicated layer-major prefill path still
+works there; the limitation is turn-prefix reuse.
+
+Single-request synthetic 16K probe against a running server:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_server_synth_test.py \
+  --url http://127.0.0.1:8080/completion \
+  --prompt-label 16k \
+  --n-predict 128
+```
+
+### Safe large-context workflow
+
+For very large prompt tests on Apple Silicon, do not jump straight to the
+largest context. Use the server smoke wrapper with:
+
+- persistent logs under `tools/flashmoe-sidecar/logs/...`
+- a live memory guard
+- quantized KV cache
+- disabled server prompt checkpoints
+
+Important env vars:
+
+- `FREE_MEM_ABORT_PERCENT=20`
+  Interrupt the run if system-wide free memory falls to `20%` or less.
+- `MEMORY_CHECK_SEC=2`
+  Poll system free memory every 2 seconds.
+- `REQUEST_TIMEOUT_SEC=...`
+  Increase the client HTTP timeout for long-prefill runs.
+
+Important server flags for safer large-context runs:
+
+- `-ctk q8_0 -ctv q8_0`
+  Halve KV cache memory versus the default f16 cache.
+- `--ctx-checkpoints 0 --checkpoint-every-n-tokens -1`
+  Disable server prompt checkpoints, which otherwise add large memory overhead
+  during long prompt processing.
+- `--no-warmup`
+  Skip the empty warmup run when you are only testing memory / throughput.
+
+Conservative MiniMax starting point:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8096 \
+PROMPT_LABEL=1k \
+N_PREDICT=16 \
+FREE_MEM_ABORT_PERCENT=20 \
+MEMORY_CHECK_SEC=2 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=1024 \
+UBATCH=16 \
+CTX=4096 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -ctk q8_0 -ctv q8_0 \
+  --ctx-checkpoints 0 \
+  --checkpoint-every-n-tokens -1 \
+  --no-warmup \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 1
+```
+
+Observed on M5 Max:
+
+- the 1k smoke test above completed safely
+- a conservative 64k MiniMax server run with the same safety flags and
+  `CTX=72000` dropped system free memory from about `63%` idle to about `22%`
+  during startup / prefill preparation
+
+Largest verified guarded Q8 server contexts on this M5 Max:
+
+- MiniMax-M2.7: `196608`
+- Qwen 3.5 35B-A3B: `262144`
+- Kimi K2.5: `262144`
+- GLM-5.1: `188160`
+- Gemma4 26B-A4B: full Q8 KV is not currently supported in this server reserve path
+
+That means `64k` is already close enough to the machine limit that `128k` and
+`250k` should not be attempted without another reduction in memory pressure or a
+higher-abort safety policy.
+
 ## Notes
 
 - The extractor writes one raw bank file per sparse layer: `layer_XXX.bin`.

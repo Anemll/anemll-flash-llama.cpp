@@ -12,6 +12,112 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <cstdlib>
+#include <cstring>
+
+static std::string server_debug_preview(const std::string & text, size_t max_chars = 512) {
+    if (text.size() <= max_chars) {
+        return text;
+    }
+    return text.substr(0, max_chars) + "...<truncated>";
+}
+
+static std::string server_escape_log_text(const std::string & text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+
+    for (char ch : text) {
+        switch (ch) {
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+        }
+    }
+
+    return escaped;
+}
+
+static std::string server_chat_msg_text(const common_chat_msg & msg) {
+    if (!msg.content.empty()) {
+        return msg.content;
+    }
+
+    if (msg.content_parts.empty()) {
+        return "";
+    }
+
+    std::string text;
+    for (const auto & part : msg.content_parts) {
+        if (!text.empty()) {
+            text.push_back('\n');
+        }
+        text += part.text;
+    }
+
+    return text;
+}
+
+static bool server_log_tool_results_enabled() {
+    const char * value = std::getenv("LLAMA_SERVER_LOG_TOOL_RESULTS");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "on") == 0) {
+        return true;
+    }
+
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "off") == 0) {
+        return false;
+    }
+
+    return false;
+}
+
+static std::string normalize_generation_prompt_for_parser(const common_chat_params & chat_params) {
+    std::string generation_prompt = chat_params.generation_prompt;
+
+    // The PEG parser is built against the generation prompt prefix before the
+    // reasoning marker. Keep parser/sampler prefill aligned with that prefix so
+    // tool-call requests do not walk the grammar into an unexpected EOG state
+    // during sampler initialization.
+    size_t cut_pos = std::string::npos;
+
+    auto consider_cut = [&](const std::string & marker) {
+        if (marker.empty()) {
+            return;
+        }
+        const size_t pos = generation_prompt.find(marker);
+        if (pos != std::string::npos && (cut_pos == std::string::npos || pos < cut_pos)) {
+            cut_pos = pos;
+        }
+    };
+
+    consider_cut(chat_params.thinking_start_tag);
+
+    // Some templates enable thinking but do not propagate a reasoning start tag
+    // back through common_chat_params. Keep a small fallback list for the
+    // server-side tool-call path so these templates do not abort during grammar
+    // prefill.
+    consider_cut("<think>");
+    consider_cut("[THINK]");
+    consider_cut("<|channel|>analysis<|message|>");
+
+    if (cut_pos != std::string::npos) {
+        generation_prompt.erase(cut_pos);
+    }
+
+    return generation_prompt;
+}
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1007,6 +1113,22 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
+    if (server_log_tool_results_enabled()) {
+        for (size_t i = 0; i < inputs.messages.size(); ++i) {
+            const auto & msg = inputs.messages[i];
+            if (msg.role != "tool") {
+                continue;
+            }
+
+            const std::string tool_text = server_chat_msg_text(msg);
+            SRV_INF("Tool result input[%zu]: tool_call_id=%s name=%s content_len=%zu preview='%s'\n",
+                    i,
+                    msg.tool_call_id.c_str(),
+                    msg.tool_name.c_str(),
+                    tool_text.size(),
+                    server_escape_log_text(server_debug_preview(tool_text, 384)).c_str());
+        }
+    }
     inputs.tools                 = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice           = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema           = json_schema.is_null() ? "" : json_schema.dump();
@@ -1019,7 +1141,8 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking       = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+    const bool tool_request = !inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    if (tool_request) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
@@ -1041,6 +1164,13 @@ json oaicompat_chat_params_parse(
         inputs.enable_thinking = false;
     } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
+    }
+
+    if (tool_request && inputs.enable_thinking) {
+        LOG_WRN("Disabling thinking for tool-call request to avoid chat-template grammar prefill conflicts.\n");
+        inputs.enable_thinking = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+        inputs.chat_template_kwargs["enable_thinking"] = "false";
     }
 
     // if the assistant message appears at the end of list, we do not add end-of-turn token
@@ -1081,26 +1211,42 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    const std::string normalized_generation_prompt = normalize_generation_prompt_for_parser(chat_params);
+
+    const bool minimax_manual_tool_parse = !chat_params.grammar.empty() &&
+        chat_params.grammar.find("<minimax:tool_call>") != std::string::npos;
+
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
-    if (!chat_params.grammar.empty()) {
+    if (!chat_params.grammar.empty() && !minimax_manual_tool_parse) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");
     }
-    llama_params["grammar_lazy"] = chat_params.grammar_lazy;
-    auto grammar_triggers        = json::array();
-    for (const auto & trigger : chat_params.grammar_triggers) {
-        server_grammar_trigger ct(trigger);
-        grammar_triggers.push_back(ct.to_json());
+    if (!minimax_manual_tool_parse) {
+        llama_params["grammar_lazy"] = chat_params.grammar_lazy;
+        auto grammar_triggers        = json::array();
+        for (const auto & trigger : chat_params.grammar_triggers) {
+            server_grammar_trigger ct(trigger);
+            grammar_triggers.push_back(ct.to_json());
+        }
+        llama_params["grammar_triggers"] = grammar_triggers;
+        llama_params["preserved_tokens"] = chat_params.preserved_tokens;
     }
-    llama_params["grammar_triggers"]  = grammar_triggers;
-    llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
-    llama_params["generation_prompt"] = chat_params.generation_prompt;
+    llama_params["generation_prompt"] = normalized_generation_prompt;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }
     if (!chat_params.parser.empty()) {
         llama_params["chat_parser"] = chat_params.parser;
+    }
+
+    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        if (minimax_manual_tool_parse) {
+            SRV_WRN("%s", "Using manual MiniMax tool-call parsing path: sampler grammar disabled, chat parser kept enabled.\n");
+        }
+        SRV_INF("Tool-call request: format=%s parse_tool_calls=%d thinking=%d grammar_len=%zu generation_prompt='%s' normalized_generation_prompt='%s'\n",
+            common_chat_format_name(chat_params.format), 1, inputs.enable_thinking, chat_params.grammar.size(),
+            chat_params.generation_prompt.c_str(), normalized_generation_prompt.c_str());
     }
 
     // Reasoning budget: pass parameters through to sampling layer

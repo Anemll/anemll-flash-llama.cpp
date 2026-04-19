@@ -10,6 +10,204 @@
 
 using json = nlohmann::ordered_json;
 
+static std::string server_debug_preview(const std::string & text, size_t max_chars = 512) {
+    if (text.size() <= max_chars) {
+        return text;
+    }
+    return text.substr(0, max_chars) + "...<truncated>";
+}
+
+static std::string server_trim_copy(const std::string & text) {
+    size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+static std::string server_extract_xml_attr(const std::string & tag_header, const std::string & attr_name) {
+    const std::string needle = attr_name + "=";
+    const size_t pos = tag_header.find(needle);
+    if (pos == std::string::npos) {
+        return "";
+    }
+
+    size_t value_pos = pos + needle.size();
+    while (value_pos < tag_header.size() && std::isspace(static_cast<unsigned char>(tag_header[value_pos]))) {
+        ++value_pos;
+    }
+    if (value_pos >= tag_header.size()) {
+        return "";
+    }
+
+    const char quote = tag_header[value_pos];
+    if (quote == '"' || quote == '\'') {
+        const size_t end = tag_header.find(quote, value_pos + 1);
+        if (end == std::string::npos) {
+            return "";
+        }
+        return tag_header.substr(value_pos + 1, end - value_pos - 1);
+    }
+
+    size_t end = value_pos;
+    while (end < tag_header.size() && !std::isspace(static_cast<unsigned char>(tag_header[end])) && tag_header[end] != '>') {
+        ++end;
+    }
+    return tag_header.substr(value_pos, end - value_pos);
+}
+
+static json server_parse_minimax_param_value(const std::string & raw_value) {
+    const std::string value = server_trim_copy(raw_value);
+    if (value.empty()) {
+        return "";
+    }
+
+    try {
+        return json::parse(value);
+    } catch (...) {
+        return value;
+    }
+}
+
+static void server_split_minimax_prefix(const std::string & raw_prefix, std::string & reasoning, std::string & content) {
+    std::string prefix = raw_prefix;
+
+    size_t think_open;
+    while ((think_open = prefix.find("<think>")) != std::string::npos) {
+        prefix.erase(think_open, std::string("<think>").size());
+    }
+
+    const size_t think_close = prefix.find("</think>");
+    if (think_close != std::string::npos) {
+        reasoning = server_trim_copy(prefix.substr(0, think_close));
+        content = server_trim_copy(prefix.substr(think_close + std::string("</think>").size()));
+    } else {
+        reasoning.clear();
+        content = server_trim_copy(prefix);
+    }
+}
+
+static bool server_try_parse_minimax_tool_call_text(const std::string & raw_text, bool is_partial, common_chat_msg & out_msg) {
+    const std::string tool_block_start = "<minimax:tool_call>";
+    const std::string tool_block_end   = "</minimax:tool_call>";
+    const std::string invoke_start     = "<invoke";
+    const std::string invoke_end_tag   = "</invoke>";
+    const std::string param_start      = "<parameter";
+    const std::string param_end_tag    = "</parameter>";
+
+    const size_t first_tool_pos = raw_text.find(tool_block_start);
+    if (first_tool_pos == std::string::npos) {
+        return false;
+    }
+
+    out_msg = {};
+    out_msg.role = "assistant";
+
+    server_split_minimax_prefix(raw_text.substr(0, first_tool_pos), out_msg.reasoning_content, out_msg.content);
+
+    size_t search_pos = first_tool_pos;
+    while (search_pos < raw_text.size()) {
+        const size_t block_pos = raw_text.find(tool_block_start, search_pos);
+        if (block_pos == std::string::npos) {
+            break;
+        }
+
+        const size_t block_body_pos = block_pos + tool_block_start.size();
+        const size_t block_end_pos  = raw_text.find(tool_block_end, block_body_pos);
+        if (block_end_pos == std::string::npos) {
+            if (!is_partial) {
+                SRV_WRN("%s\n", "MiniMax tool-call parse fallback found unterminated tool block");
+            }
+            break;
+        }
+
+        const std::string block_body = raw_text.substr(block_body_pos, block_end_pos - block_body_pos);
+        size_t invoke_search = 0;
+        while (invoke_search < block_body.size()) {
+            const size_t invoke_pos = block_body.find(invoke_start, invoke_search);
+            if (invoke_pos == std::string::npos) {
+                break;
+            }
+
+            const size_t invoke_header_end = block_body.find('>', invoke_pos);
+            if (invoke_header_end == std::string::npos) {
+                break;
+            }
+
+            const std::string invoke_header = block_body.substr(invoke_pos, invoke_header_end - invoke_pos + 1);
+            const std::string invoke_name   = server_extract_xml_attr(invoke_header, "name");
+
+            const size_t invoke_body_pos = invoke_header_end + 1;
+            const size_t invoke_end_pos  = block_body.find(invoke_end_tag, invoke_body_pos);
+            if (invoke_end_pos == std::string::npos) {
+                break;
+            }
+
+            json args = json::object();
+            const std::string invoke_body = block_body.substr(invoke_body_pos, invoke_end_pos - invoke_body_pos);
+
+            size_t param_search = 0;
+            while (param_search < invoke_body.size()) {
+                const size_t param_pos = invoke_body.find(param_start, param_search);
+                if (param_pos == std::string::npos) {
+                    break;
+                }
+
+                const size_t param_header_end = invoke_body.find('>', param_pos);
+                if (param_header_end == std::string::npos) {
+                    break;
+                }
+
+                const std::string param_header = invoke_body.substr(param_pos, param_header_end - param_pos + 1);
+                const std::string param_name   = server_extract_xml_attr(param_header, "name");
+
+                const size_t param_body_pos = param_header_end + 1;
+                const size_t param_end_pos  = invoke_body.find(param_end_tag, param_body_pos);
+                if (param_end_pos == std::string::npos) {
+                    break;
+                }
+
+                const std::string param_value = invoke_body.substr(param_body_pos, param_end_pos - param_body_pos);
+                if (!param_name.empty()) {
+                    args[param_name] = server_parse_minimax_param_value(param_value);
+                }
+
+                param_search = param_end_pos + param_end_tag.size();
+            }
+
+            if (!invoke_name.empty()) {
+                common_chat_tool_call tool_call;
+                tool_call.name      = invoke_name;
+                tool_call.arguments = args.dump();
+                out_msg.tool_calls.push_back(std::move(tool_call));
+            }
+
+            invoke_search = invoke_end_pos + invoke_end_tag.size();
+        }
+
+        search_pos = block_end_pos + tool_block_end.size();
+    }
+
+    const size_t last_block_end = raw_text.rfind(tool_block_end);
+    if (last_block_end != std::string::npos) {
+        const std::string trailing = server_trim_copy(raw_text.substr(last_block_end + tool_block_end.size()));
+        if (!trailing.empty()) {
+            if (!out_msg.content.empty()) {
+                out_msg.content += "\n\n";
+            }
+            out_msg.content += trailing;
+        }
+    }
+
+    return !out_msg.empty();
+}
+
 //
 // task_params
 //
@@ -162,10 +360,33 @@ common_chat_msg task_result_state::update_chat_msg(
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
-    auto new_msg = common_chat_parse(
-        generated_text,
-        is_partial,
-        chat_parser_params);
+    common_chat_msg new_msg;
+    bool used_minimax_tool_fallback = false;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params);
+    } catch (const std::exception & e) {
+        if (chat_parser_params.parse_tool_calls && server_try_parse_minimax_tool_call_text(generated_text, is_partial, new_msg)) {
+            used_minimax_tool_fallback = true;
+            SRV_WRN("MiniMax tool-call parse fallback recovered from parser error: %s\n", e.what());
+        } else {
+            throw;
+        }
+    }
+
+    if (chat_parser_params.parse_tool_calls) {
+        SRV_DBG("Tool-parse state: partial=%d generated_len=%zu content_len=%zu reasoning_len=%zu tool_calls=%zu fallback=%d raw='%s'\n",
+            is_partial, generated_text.size(), new_msg.content.size(), new_msg.reasoning_content.size(),
+            new_msg.tool_calls.size(), used_minimax_tool_fallback, server_debug_preview(generated_text).c_str());
+        for (size_t i = 0; i < new_msg.tool_calls.size(); ++i) {
+            const auto & tc = new_msg.tool_calls[i];
+            SRV_DBG("Tool-parse call[%zu]: id='%s' name='%s' args='%s'\n",
+                i, tc.id.c_str(), tc.name.c_str(), server_debug_preview(tc.arguments, 256).c_str());
+        }
+    }
+
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;

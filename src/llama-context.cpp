@@ -2582,6 +2582,54 @@ private:
 #endif
     }
 
+public:
+    bool progress_get_data(llama_flash_moe_progress_stats & out) const {
+        routed_metrics total;
+        for (const auto & layer : layers) {
+            if (layer.stats.calls == 0) {
+                continue;
+            }
+            accumulate_metrics(total, layer.stats);
+        }
+
+        if (total.calls == 0) {
+            return false;
+        }
+
+        std::memset(&out, 0, sizeof(out));
+        out.available = true;
+        out.prefill_profile = transient_shared_scratch;
+        out.unique_experts = total.unique_experts;
+        out.miss_experts = total.miss_experts;
+        out.token_refs = total.token_refs;
+        out.bytes_loaded = total.bytes_loaded;
+        out.cache_hit_pct = total.unique_experts > 0 ? 100.0 * double(total.hit_experts) / double(total.unique_experts) : 0.0;
+
+        const int64_t source_wall_us = total.source_wall_us > 0 ? total.source_wall_us : total.source_us;
+        out.reload_bw_gbps = source_wall_us > 0 ?
+                (double(total.bytes_loaded) / 1e9) / (double(source_wall_us) / 1e6) : 0.0;
+
+        if (transient_shared_scratch) {
+            const uint64_t dedup_saved = total.token_refs > total.unique_experts ? total.token_refs - total.unique_experts : 0;
+            out.dedup_saved_pct = total.token_refs > 0 ? 100.0 * double(dedup_saved) / double(total.token_refs) : 0.0;
+            out.reuse_factor = total.unique_experts > 0 ? double(total.token_refs) / double(total.unique_experts) : 0.0;
+        }
+
+#ifdef GGML_USE_METAL
+        struct ggml_metal_mul_mat_id_stats metal_stats = {};
+        ggml_metal_op_mul_mat_id_get_stats(&metal_stats);
+        const uint64_t replay_total = metal_stats.replay_hit + metal_stats.replay_miss;
+        if (replay_total > 0) {
+            out.replay_available = true;
+            out.replay_hit_pct = 100.0 * double(metal_stats.replay_hit) / double(replay_total);
+        }
+#endif
+
+        return true;
+    }
+
+private:
+
     static bool mixed_slot_buffer_enabled() {
         const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_MIXED_SLOT_BUFFER");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -7662,6 +7710,17 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+bool llama_context::flash_moe_progress_get(bool prefill, llama_flash_moe_progress_stats & out) const {
+    std::memset(&out, 0, sizeof(out));
+
+    const auto * runtime = prefill ? flash_moe_prefill_runtime.get() : flash_moe_slot_runtime.get();
+    if (runtime == nullptr) {
+        return false;
+    }
+
+    return runtime->progress_get_data(out);
+}
+
 std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -8497,9 +8556,9 @@ void llama_perf_context_print(const llama_context * ctx) {
     const double t_end_ms = 1e-3 * ggml_time_us();
 
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
-    LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+    LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n",
             __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
-    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tps)\n",
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
@@ -8507,6 +8566,19 @@ void llama_perf_context_print(const llama_context * ctx) {
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+bool llama_flash_moe_progress_get(const llama_context * ctx, bool prefill, llama_flash_moe_progress_stats * out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    std::memset(out, 0, sizeof(*out));
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    return ctx->flash_moe_progress_get(prefill, *out);
 }
 
 void llama_memory_breakdown_print(const struct llama_context * ctx) {

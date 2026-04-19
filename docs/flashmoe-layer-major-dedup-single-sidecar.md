@@ -7,6 +7,32 @@ It focuses on the dedicated prompt-prefill MoE path used by routed MoE layers (M
 - `src/llama-context.cpp`
 - `common/arg.cpp`
 
+## Index
+
+- [Short Description](#short-description)
+- [Confirmed Models](#confirmed-models)
+- [Example Results](#example-results)
+- [Why This Path Exists](#why-this-path-exists)
+- [High-Level Shape](#high-level-shape)
+- [Dedup Diagram](#dedup-diagram)
+- [Core Planner](#core-planner)
+- [Read Path](#read-path)
+- [What `--moe-prefill-banks` Means Now](#what---moe-prefill-banks-means-now)
+- [How Micro-Batch Reuse Actually Works](#how-micro-batch-reuse-actually-works)
+- [Micro-Batch Reuse Diagram](#micro-batch-reuse-diagram)
+- [Reuse Timeline](#reuse-timeline)
+- [Compute Step](#compute-step)
+- [Reuse Model](#reuse-model)
+- [Perf Counters To Watch](#perf-counters-to-watch)
+- [Tuning Rules](#tuning-rules)
+- [Example Benchmark Command](#example-benchmark-command)
+- [Summary](#summary)
+- [GLM-5.1 Default Test](#glm-51-default-test)
+- [Additional Model Smoke Tests](#additional-model-smoke-tests) (Kimi K2.5, Qwen 3.5, Gemma4)
+- [Server Mode](#server-mode)
+- [Largest Verified Safe Q8 Server Context](#largest-verified-safe-q8-server-context)
+- [Testing the Server with MiniMax-M2.7 and DroidAI (M5 Max 128)](#testing-the-server-with-minimax-m27-and-droidai-m5-max-128)
+
 ## Short Description
 
 Layer-major dedup runs prefill one layer at a time. For each layer, it groups repeated expert selections across the current prefill chunk, loads each expert once, and reuses it for all tokens that need it instead of reloading it repeatedly.
@@ -614,3 +640,281 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -n 1024 -st
 ```
 
+## Server Mode
+
+`llama-server` on this branch can use the same dedicated
+`--moe-prefill-layer-major` path as `llama-cli`. The server helper workflow is:
+
+- `tools/flashmoe-sidecar/run_flashmoe_server.sh`
+  Starts `llama-server` with Flash-MoE sidecar defaults, slot-bank sizing,
+  Metal replay env vars, and the layer-major prefill flags you pass through.
+- `tools/flashmoe-sidecar/flashmoe_server_turn_test.py`
+  Sends a large first-turn `/completion` request with `cache_prompt=true`, then
+  sends a follow-up turn on the same `id_slot`.
+- `tools/flashmoe-sidecar/flashmoe_server_smoke.sh`
+  Convenience wrapper that launches the server, waits for readiness, runs the
+  turn test, shuts the server down, and prints the key prefill/decode summaries.
+
+### Gemma4 Server Benchmark
+
+This is the benchmark workflow we used for a big-prefill Gemma4 server test:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8091 \
+PROMPT_LABEL=16k \
+N_PREDICT=64 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=32 \
+CTX=25000 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
+  ~/Models/gemma4/gemma-4-UD-Q3_K_XL-dense \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4
+```
+
+Observed Gemma4 server result:
+
+- turn 1: `20008` prompt tokens at `638.8 t/s`, decode `64` tokens at `13.5 t/s`
+- turn 2: `74` new prompt tokens with `cache_n=20008`, decode `64` tokens at `14.1 t/s`
+- shutdown summary: `src=prefill-layer-major`, dedup `saved=2320548 (99.6%)`,
+  reuse `246.72x`
+
+### Server Smoke Matrix
+
+The following models were tested end-to-end in server mode with
+`--moe-prefill-layer-major` enabled:
+
+| Model | Prompt | Slot Bank | Turn 1 | Turn 2 | Prefill Dedup | Notes |
+|-------|-------:|----------:|-------:|-------:|--------------:|-------|
+| Gemma4 26B-A4B | `16k` (`20008` tok) | `64` | prompt `638.8 t/s`, decode `13.5 t/s` | `74` new tokens, `cache_n=20008`, prompt `115.3 t/s` | `99.6%`, `246.72x` | big-prefill benchmark |
+| MiniMax-M2.7 | `4k` (`4097` tok) | `128` | prompt `211.9 t/s`, decode `6.2 t/s` | `73` new tokens, `cache_n=4097`, prompt `12.9 t/s` | `97.8%`, `46.11x` | server prompt reuse works |
+| GLM-5.1 | `4k` (`4070` tok) | `96` | prompt `83.1 t/s`, decode `3.6 t/s` | `72` new tokens, `cache_n=4070`, prompt `8.9 t/s` | `97.7%`, `44.01x` | server prompt reuse works |
+| Qwen 3.5 35B-A3B | `4k` (`4661` tok) | `64` | prompt `539.8 t/s`, decode `46.8 t/s` | full reprocess, `cache_n=0`, prompt `534.8 t/s` | `98.7%`, `77.07x` | server log reports forced full prompt re-processing due to SWA / hybrid memory cache limits |
+| Kimi K2.5 | `1k` (`1008` tok) | `64` | prompt `52.7 t/s`, decode `5.5 t/s` | `73` new tokens, `cache_n=1007`, prompt `10.1 t/s` | `90.0%`, `10.01x` | keep `UBATCH=1` for stable output |
+
+### Notes for Server Turn Tests
+
+- The turn test uses `/completion`, not `/v1/chat/completions`, so the prompts
+  are raw completion prompts on purpose.
+- The second request reuses the same `id_slot` and sends `cache_prompt=true`.
+- For models without SWA / hybrid-memory cache restrictions, the second turn
+  should show a small `prompt_n` and a large `cache_n`.
+- Qwen 3.5 is the current exception in this tested set. The server logs:
+  `forcing full prompt re-processing due to lack of cache data`, so the second
+  turn is still valid server inference but not a cache-reuse benchmark.
+
+## Largest Verified Safe Q8 Server Context
+
+After a naive long-context server test froze the machine, we switched to a
+guarded workflow:
+
+- quantized KV cache: `-ctk q8_0 -ctv q8_0`
+- no warmup: `--no-warmup`
+- no context checkpoints: `--ctx-checkpoints 0 --checkpoint-every-n-tokens -1`
+- small starting MoE settings: low `MOE_SLOT_BANK`, low `UBATCH`,
+  `--moe-prefill-banks 1`
+- hard free-memory abort: stop the probe if system free memory reaches `20%`
+
+These numbers are the largest **startup-safe** server contexts we verified on
+this M5 Max using that guard. They are not all full prompt-prefill runs; they
+are the largest guarded server contexts that reached `server ready` without
+crossing the abort threshold.
+
+| Model | Q8 server context | Result | Memory guard notes |
+|-------|-------------------:|--------|--------------------|
+| MiniMax-M2.7 | `196608` | safe | stayed around `38-39%` free after ready |
+| Qwen 3.5 35B-A3B | `262144` | safe | remained very comfortable, around `85%` free at ready |
+| Kimi K2.5 | `262144` | safe | reached ready around `49%` free, use `UBATCH=1` |
+| GLM-5.1 | `188160` | safe | reached ready at `21%` free; `202752` tripped the guard |
+| Gemma4 26B-A4B | n/a in full Q8 KV | unsupported in this config | quantized `V` cache requires Flash Attention, and this server reserve path disables it |
+
+Notes:
+
+- MiniMax cannot reach `250k` because its training context is `196608`.
+- Qwen and Kimi can load at `262144`, so `250k` is below the verified
+  startup-safe ceiling on this machine.
+- GLM is the tightest of the supported Q8 runs in this set. `188160` is the
+  largest verified safe value so far; `202752` was not safe.
+- Gemma4 still works well for normal layer-major server inference, but not with
+  full quantized Q8 KV in the current server reserve configuration.
+
+Example guarded startup-only probe:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8101 \
+STARTUP_ONLY=1 \
+READY_STABILIZE_SEC=3 \
+FREE_MEM_ABORT_PERCENT=20 \
+MEMORY_CHECK_SEC=2 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=1024 \
+UBATCH=16 \
+CTX=196608 \
+SEED=123 \
+TEMP=0.1 \
+bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --ctx-checkpoints 0 \
+  --checkpoint-every-n-tokens -1 \
+  --no-warmup \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 2048 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 1
+```
+
+## Testing the Server with MiniMax-M2.7 and DroidAI (M5 Max 128)
+
+End-to-end recipe for wiring a local Flash-MoE server into the Factory AI /
+DroidAI desktop client. The critical piece is `MODEL_ALIAS=minimax-m2`: it
+becomes the model id returned by `/v1/models`, and the client's `model` field
+must match it byte-for-byte.
+
+### Build `llama-server`
+
+The server binary is not built by default. From the repo root, configure and
+compile the `llama-server` target with Metal enabled on Apple Silicon:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_METAL=ON \
+  -DLLAMA_CURL=OFF \
+  -DLLAMA_FLASH_MOE_GPU_BANK=ON
+
+cmake --build build --target llama-server -j
+```
+
+The resulting binary is `./build/bin/llama-server`. If you build the server
+for the first time, also build `llama-cli` once so smoke scripts that expect
+both binaries keep working:
+
+```bash
+cmake --build build --target llama-cli llama-server -j
+```
+
+The `run_flashmoe_server.sh` wrapper picks up the binary automatically at
+`./build/bin/llama-server`. Override the path with `LLAMA_SERVER_BIN=...`
+if you built into a different directory.
+
+### Launch the server
+
+```bash
+HOST=0.0.0.0 \
+PORT=8080 \
+MODEL_ALIAS=minimax-m2 \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=64 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=4096 \
+UBATCH=16 \
+CTX=96000 \
+SEED=123 \
+TEMP=0.0 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --ctx-checkpoints 0 \
+  --checkpoint-every-n-tokens -1 \
+  --no-warmup \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 16192 \
+  --moe-prefill-micro-batch 32 \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 1
+```
+
+Notes on the server flags:
+
+- `HOST=0.0.0.0` lets the client reach the server on `127.0.0.1` and from other
+  machines on the LAN. Use `HOST=127.0.0.1` if you want loopback only.
+- `MODEL_ALIAS=minimax-m2` makes the server advertise `minimax-m2` as the
+  model id; the DroidAI `model` field below must be the same string.
+- `CTX=96000` with `-ctk q8_0 -ctv q8_0` keeps KV cache memory in check for
+  long coding / tool-use sessions.
+- `--moe-prefill-layer-major` plus `--moe-prefill-banks 1` is the verified
+  single-bank layer-major prefill path for MiniMax on M5 Max 128. Raise
+  `--moe-prefill-banks` only if you have extra memory headroom.
+
+### Adding the server to `~/.factory/settings.json`
+
+Factory AI / DroidAI reads custom OpenAI-compatible models from
+`~/.factory/settings.json`. Add one `customModels` entry that points at the
+local server. The server and client must agree on two things: the `model`
+field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
+
+```json
+{
+  "enabledPlugins": {
+    "core@factory-plugins": true
+  },
+  "logoAnimation": "off",
+  "customModels": [
+    {
+      "model": "minimax-m2",
+      "id": "custom:MiniMax-M2.7-(m5m-local)-0",
+      "index": 1,
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "apiKey": "not-needed",
+      "displayName": "MiniMax-M2.7 (m5m local)",
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    }
+  ]
+}
+```
+
+Field-by-field:
+
+- `"model": "minimax-m2"` must equal `MODEL_ALIAS` on the server. If the
+  alias changes, this string must change with it.
+- `"id": "custom:MiniMax-M2.7-(m5m-local)-0"` is the internal DroidAI handle.
+  The `custom:` prefix plus a unique suffix per entry are the hard
+  requirements. The `(m5m-local)` tag is a naming convention we use to mark
+  this as the local M5 Max server and to distinguish it from a separate
+  `(m3u-local)` entry on another host or from a hosted MiniMax endpoint.
+- `"index"` controls display order in the DroidAI model picker; pick any
+  free integer.
+- `"baseUrl": "http://127.0.0.1:8080/v1"` points at the loopback server
+  started above. For LAN access or a different port, match `HOST` and
+  `PORT` exactly. Keep the trailing `/v1`.
+- `"apiKey": "not-needed"` — the local server does not validate the key,
+  but the field must be present for the provider plugin.
+- `"provider": "generic-chat-completion-api"` selects the OpenAI-compatible
+  transport, which our `/v1/chat/completions` endpoint implements.
+- `"noImageSupport": true` is required: MiniMax-M2.7 is text-only.
+
+To register additional local servers (for example a second machine on the
+LAN), copy the object, bump `index`, give it a new unique `id` like
+`custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
+
+### Quick sanity check
+
+Before opening DroidAI, confirm the alias and endpoint are reachable:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models | jq
+```
+
+The response must include `"id": "minimax-m2"`. If it does not, the server
+`MODEL_ALIAS` and the DroidAI `model` field are out of sync and the client
+will fail to route requests.

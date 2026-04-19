@@ -1593,9 +1593,25 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
+    struct llama_flash_moe_progress_stats {
+        bool     available;
+        bool     prefill_profile;
+        bool     replay_available;
+        double   cache_hit_pct;
+        double   replay_hit_pct;
+        double   reload_bw_gbps;
+        double   dedup_saved_pct;
+        double   reuse_factor;
+        uint64_t unique_experts;
+        uint64_t miss_experts;
+        uint64_t token_refs;
+        uint64_t bytes_loaded;
+    };
+
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+    LLAMA_API bool                           llama_flash_moe_progress_get(const struct llama_context * ctx, bool prefill, struct llama_flash_moe_progress_stats * out);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
