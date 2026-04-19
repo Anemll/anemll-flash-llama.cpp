@@ -2,7 +2,10 @@
 
 This note describes the current `--moe-prefill-layer-major` path in this fork.
 
-It focuses on the dedicated prompt-prefill MoE path used by routed MoE layers (MiniMax-M2, GLM-5.1, Kimi K2.5, Qwen 3.5, Gemma4) in:
+It focuses on the SSD-streamed prompt-prefill MoE path used by routed MoE
+layers (MiniMax-M2, GLM-5.1, Kimi K2.5, Qwen 3.5, Gemma4) when the full routed
+expert weights do not fit in memory and have to be loaded on demand from the
+Flash-MoE sidecar instead of staying resident:
 
 - `src/llama-context.cpp`
 - `common/arg.cpp`
@@ -35,9 +38,15 @@ It focuses on the dedicated prompt-prefill MoE path used by routed MoE layers (M
 
 ## Short Description
 
-Layer-major dedup runs prefill one layer at a time. For each layer, it groups repeated expert selections across the current prefill chunk, loads each expert once, and reuses it for all tokens that need it instead of reloading it repeatedly.
+Layer-major dedup runs prefill one layer at a time. For each layer, it groups
+repeated expert selections across the current prefill chunk, streams each
+needed expert from the sidecar once, and reuses it for all tokens that need it
+instead of reloading it repeatedly.
 
-The bigger the prefill chunk, the more expert reuse we usually get, so prefill becomes cheaper. That should help both GPU and ANE prefill at large batch sizes.
+The bigger the prefill chunk, the more expert reuse we usually get, so SSD
+traffic and prefill cost both drop. That is the main reason this path exists
+for large routed MoE models that cannot keep all expert weights resident on the
+target system.
 
 ## Confirmed Models
 
