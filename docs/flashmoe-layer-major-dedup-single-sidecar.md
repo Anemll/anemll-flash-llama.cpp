@@ -30,6 +30,7 @@ Flash-MoE sidecar instead of staying resident:
 - [Tuning Rules](#tuning-rules)
 - [Example Benchmark Command](#example-benchmark-command)
 - [Summary](#summary)
+- [Decode Read Locality (`--moe-sort-decode-expert-ids`)](#decode-read-locality---moe-sort-decode-expert-ids)
 - [GLM-5.1 Default Test](#glm-51-default-test)
 - [Additional Model Smoke Tests](#additional-model-smoke-tests) (Kimi K2.5, Qwen 3.5, Gemma4)
 - [Server Mode](#server-mode)
@@ -485,6 +486,35 @@ The main speedup comes from:
 - overlapping staged reads for the next expert batch with compute on the current batch
 
 That is the simplified algorithm behind the benchmark numbers.
+
+## Decode Read Locality (`--moe-sort-decode-expert-ids`)
+
+Prefill already reads experts in near-sequential sidecar order — the
+planner sorts `unique_experts[]` by sidecar offset before staging reads
+(see [Core Planner](#core-planner)). Decode does not get that for free:
+at `n_tokens == 1` there is no dedup, no planner, and the routed top-K
+selected by the router arrives in arbitrary id order.
+
+`--moe-sort-decode-expert-ids` (default disabled) fixes the decode side by
+reordering the routed top-K expert ids in ascending order before the routed
+MLP runs. Because expert payloads are laid out on disk by ascending expert
+id per layer, iterating the top-K in sorted id order turns the per-token
+sidecar `pread()` fan-out into a near-sequential SSD access pattern, which
+improves read locality and throughput.
+
+Implementation:
+
+- gated by `n_tokens == 1 && n_expert_used > 1` and only on layers backed
+  by the Flash-MoE slot-bank (sidecar) path
+  (`src/llama-graph.cpp`, around the `ffn_moe_topk_id_sorted` node)
+- inserted as a `ggml_map_custom1` sort on the selected top-K id tensor
+  just before the weight gather, so both the gather and the routed matmuls
+  iterate experts in the reordered order
+- disabled by default; opt in per-run with `--moe-sort-decode-expert-ids`,
+  the env `LLAMA_ARG_MOE_SORT_DECODE_EXPERT_IDS=1`, or negate explicitly
+  with `--no-moe-sort-decode-expert-ids`
+- prefill is unaffected — the layer-major prefill path already walks the
+  sidecar in offset order
 
 ## GLM-5.1 Default Test
 
