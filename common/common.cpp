@@ -1080,8 +1080,9 @@ common_init_result::common_init_result(common_params & params) :
         }
     }
 
-    if (params.moe_prefill_batch < 0 || params.moe_prefill_micro_batch < 0) {
-        throw std::invalid_argument("Flash-MoE prefill batch settings must be >= 0");
+    if (params.moe_prefill_batch < 0 ||
+        (params.moe_prefill_micro_batch < 0 && params.moe_prefill_micro_batch != COMMON_MOE_PREFILL_MICRO_BATCH_AUTO)) {
+        throw std::invalid_argument("Flash-MoE prefill batch settings must be >= 0 (or 'auto' for --moe-prefill-micro-batch)");
     }
 
     if (params.moe_prefill_layer_major) {
@@ -1091,13 +1092,13 @@ common_init_result::common_init_result(common_params & params) :
         if (params.moe_prefill_micro_batch == 0) {
             params.moe_prefill_micro_batch = params.moe_prefill_batch;
         }
-        if (params.moe_prefill_micro_batch > params.moe_prefill_batch) {
+        if (params.moe_prefill_micro_batch > 0 && params.moe_prefill_micro_batch > params.moe_prefill_batch) {
             LOG_WRN("%s: clamping --moe-prefill-micro-batch %d to --moe-prefill-batch %d\n",
                     __func__, params.moe_prefill_micro_batch, params.moe_prefill_batch);
             params.moe_prefill_micro_batch = params.moe_prefill_batch;
         }
     } else {
-        if (params.moe_prefill_batch > 0 || params.moe_prefill_micro_batch > 0) {
+        if (params.moe_prefill_batch > 0 || params.moe_prefill_micro_batch != 0) {
             LOG_INF("%s: ignoring prefill-only batching settings because --moe-prefill-layer-major is not enabled\n", __func__);
             params.moe_prefill_batch = 0;
             params.moe_prefill_micro_batch = 0;
@@ -1457,6 +1458,24 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+int32_t common_moe_prefill_micro_batch_auto_for_tokens(int32_t prompt_tokens) {
+    // Derived from the exact Flash-MoE layer-major prefill sweep:
+    // 512/1k -> 80, 2k -> 96, 4k/8k -> 128, 16k/32k -> 160.
+    if (prompt_tokens <= 0) {
+        return 128;
+    }
+    if (prompt_tokens <= 1574) {
+        return 80;
+    }
+    if (prompt_tokens <= 3110) {
+        return 96;
+    }
+    if (prompt_tokens <= 12326) {
+        return 128;
+    }
+    return 160;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1465,7 +1484,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.moe_prefill_batch = params.moe_prefill_batch;
-    cparams.moe_prefill_micro_batch = params.moe_prefill_micro_batch;
+    cparams.moe_prefill_micro_batch = params.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO ?
+            uint32_t(-1) :
+            uint32_t(params.moe_prefill_micro_batch);
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
@@ -1491,6 +1512,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_force_expert  = params.moe_force_expert;
     cparams.moe_shared_only   = params.moe_shared_only;
     cparams.moe_router_only   = params.moe_router_only;
+    cparams.moe_sort_decode_expert_ids = params.moe_sort_decode_expert_ids;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -112,10 +112,13 @@ export LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY="${LLAMA_FLASH_MOE_EXPER
 export LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY_CACHE_LIMIT="${LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY_CACHE_LIMIT:-65536}"
 export LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB="${LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB:-0}"
 export LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES="${LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES:-1}"
+export LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS="${LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS:-1}"
+export LLAMA_FLASH_MOE_PERF_PREFILL_LAYER_STATS="${LLAMA_FLASH_MOE_PERF_PREFILL_LAYER_STATS:-0}"
 
 requested_topk=${MOE_TOPK:-$package_topk}
 requested_ubatch=${UBATCH:-32}
 server_profile=${FLASHMOE_SERVER_PROFILE:-default}
+server_perf=${FLASHMOE_SERVER_PERF:-0}
 profile_slot_bank_floor=0
 
 case "$server_profile" in
@@ -152,9 +155,21 @@ else
 fi
 
 declare -a cmd
+
+has_explicit_perf_args=0
+if [[ $# -gt 0 ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            --perf|--no-perf)
+                has_explicit_perf_args=1
+                break
+                ;;
+        esac
+    done
+fi
+
 cmd=(
     "$llama_server_bin"
-    --perf
     --host "${HOST:-127.0.0.1}"
     --port "${PORT:-8080}"
     --model "$model_path"
@@ -170,6 +185,14 @@ cmd=(
     -c "${CTX:-8192}"
     --parallel "${N_PARALLEL:-1}"
 )
+
+if [[ "$has_explicit_perf_args" == "0" ]]; then
+    if [[ "$server_perf" != "0" ]]; then
+        cmd=( "${cmd[0]}" --perf "${cmd[@]:1}" )
+    else
+        cmd=( "${cmd[0]}" --no-perf "${cmd[@]:1}" )
+    fi
+fi
 
 if [[ -n "$model_alias" ]]; then
     cmd+=(--alias "$model_alias")

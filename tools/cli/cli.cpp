@@ -462,6 +462,15 @@ private:
                     task.params.sampling.reasoning_budget_forced =
                         common_tokenize(vocab, reasoning_budget_message + chat_params.thinking_end_tag, false, true);
                 }
+            } else {
+                // Raw completions should stream plain content deltas without invoking the
+                // chat parser or tool-call recovery machinery.
+                task.params.chat_parser_params = common_chat_parser_params();
+                task.params.chat_parser_params.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+                task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+                task.params.chat_parser_params.reasoning_in_content = false;
+                task.params.chat_parser_params.generation_prompt.clear();
+                task.params.chat_parser_params.parse_tool_calls = false;
             }
 
             rd.post_task({std::move(task)});
@@ -895,10 +904,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  prefill-batch    = %d%s\n",
                 params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192,
                 params.moe_prefill_batch > 0 ? "" : " (default)");
-        fprintf(stderr, "  prefill-micro-batch = %d%s\n",
-                params.moe_prefill_micro_batch > 0 ? params.moe_prefill_micro_batch :
-                        (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192),
-                params.moe_prefill_micro_batch > 0 ? "" : " (follows prefill-batch)");
+        if (params.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO) {
+            fprintf(stderr, "  prefill-micro-batch = auto (adaptive by prompt length)\n");
+        } else {
+            fprintf(stderr, "  prefill-micro-batch = %d%s\n",
+                    params.moe_prefill_micro_batch > 0 ? params.moe_prefill_micro_batch :
+                            (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192),
+                    params.moe_prefill_micro_batch > 0 ? "" : " (follows prefill-batch)");
+        }
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
         fprintf(stderr, "  prefetch-cache-io-split = %d%s\n",
@@ -916,6 +929,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  predict-prev-token = %s\n", params.moe_predict_prev_token ? "on" : "off");
         fprintf(stderr, "  predict-top1-prev = %s\n", params.moe_predict_top1_prev ? "on" : "off");
         fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");
+        fprintf(stderr, "  sort-decode-ids  = %s\n", params.moe_sort_decode_expert_ids ? "on" : "off");
         fprintf(stderr, "  trace-harness    = %s\n", params.moe_trace_harness ? "on" : "off");
         fprintf(stderr, "  n_gpu_layers     = %d\n", params.n_gpu_layers);
         {

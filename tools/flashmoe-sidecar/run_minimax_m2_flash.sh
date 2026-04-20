@@ -5,6 +5,14 @@ script_dir=$(cd "$(dirname "$0")" && pwd -P)
 repo_root=$(cd "$script_dir/../.." && pwd -P)
 default_prompt_dir="$repo_root/tools/flashmoe-sidecar/prompts/coding"
 
+note() {
+    printf "note: %s\n" "$1" >&2
+}
+
+warn() {
+    printf "warning: %s\n" "$1" >&2
+}
+
 resolve_input_path() {
     local raw_path=$1
 
@@ -49,6 +57,11 @@ resolve_prompt_label_path() {
     exit 1
 }
 
+is_builtin_coding_prompt_path() {
+    local candidate=$1
+    [[ "$candidate" == "$default_prompt_dir"/coding_*.txt ]]
+}
+
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 PACKAGE_DIR [llama-cli args...]" >&2
     exit 1
@@ -58,6 +71,7 @@ package_dir=$1
 shift
 
 llama_bin=${LLAMA_BIN:-./build/bin/llama-cli}
+llama_bin_name=$(basename "$llama_bin")
 model_path=${MODEL_PATH:-"$package_dir/model-dense.gguf"}
 sidecar_path=${SIDECAR_PATH:-"$package_dir/sidecar"}
 secondary_sidecar_path=${SECONDARY_SIDECAR_PATH:-}
@@ -220,6 +234,26 @@ forwarded_args=()
 had_forwarded_args=0
 saw_prompt_file_arg=0
 saw_prompt_binary_file_arg=0
+saw_prompt_text_arg=0
+saw_conversation_mode_arg=0
+saw_raw_completion_arg=0
+effective_reasoning_mode=${REASONING_MODE:-$package_reasoning}
+saw_reasoning_format_arg=0
+selected_builtin_coding_prompt=0
+
+if [[ -n "${PROMPT_LABEL:-}" && -n "${BENCHMARK_PROMPT_LABEL:-}" && "${PROMPT_LABEL}" != "${BENCHMARK_PROMPT_LABEL}" ]]; then
+    echo "PROMPT_LABEL and BENCHMARK_PROMPT_LABEL disagree; set only one of them" >&2
+    exit 1
+fi
+
+benchmark_prompt_label=${BENCHMARK_PROMPT_LABEL:-${PROMPT_LABEL:-}}
+benchmark_prompt_label_source=
+if [[ -n "${BENCHMARK_PROMPT_LABEL:-}" ]]; then
+    benchmark_prompt_label_source="BENCHMARK_PROMPT_LABEL"
+elif [[ -n "${PROMPT_LABEL:-}" ]]; then
+    benchmark_prompt_label_source="PROMPT_LABEL"
+    warn "PROMPT_LABEL is a legacy alias here; it injects a built-in synthetic coding benchmark prompt file, not a generic prompt-length knob. Prefer BENCHMARK_PROMPT_LABEL for clarity."
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -228,13 +262,64 @@ while [[ $# -gt 0 ]]; do
                 echo "missing argument for $1" >&2
                 exit 1
             fi
-            forwarded_args+=("$1" "$(resolve_input_path "$2")")
+            resolved_input=$(resolve_input_path "$2")
+            forwarded_args+=("$1" "$resolved_input")
             had_forwarded_args=1
             if [[ "$1" == "-f" || "$1" == "--file" ]]; then
                 saw_prompt_file_arg=1
+                if is_builtin_coding_prompt_path "$resolved_input"; then
+                    selected_builtin_coding_prompt=1
+                fi
             else
                 saw_prompt_binary_file_arg=1
             fi
+            shift 2
+            ;;
+        -p|--prompt)
+            if [[ $# -lt 2 ]]; then
+                echo "missing argument for $1" >&2
+                exit 1
+            fi
+            forwarded_args+=("$1" "$2")
+            had_forwarded_args=1
+            saw_prompt_text_arg=1
+            shift 2
+            ;;
+        -n|--predict|--n-predict)
+            if [[ $# -lt 2 ]]; then
+                echo "missing argument for $1" >&2
+                exit 1
+            fi
+            value=$2
+            if [[ "$value" =~ ^(-?[0-9]+)-st$ ]]; then
+                forwarded_args+=("$1" "${BASH_REMATCH[1]}" "-st")
+                note "normalized merged '$value' into '${BASH_REMATCH[1]}' and '-st' after $1"
+            else
+                forwarded_args+=("$1" "$value")
+            fi
+            had_forwarded_args=1
+            shift 2
+            ;;
+        -cnv|--conversation|-no-cnv|--no-conversation)
+            forwarded_args+=("$1")
+            had_forwarded_args=1
+            saw_conversation_mode_arg=1
+            shift
+            ;;
+        --moe-trace-harness)
+            forwarded_args+=("$1")
+            had_forwarded_args=1
+            saw_raw_completion_arg=1
+            shift
+            ;;
+        --reasoning-format)
+            if [[ $# -lt 2 ]]; then
+                echo "missing argument for $1" >&2
+                exit 1
+            fi
+            forwarded_args+=("$1" "$2")
+            had_forwarded_args=1
+            saw_reasoning_format_arg=1
             shift 2
             ;;
         *)
@@ -245,22 +330,54 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "${PROMPT_FILE:-}" && "$saw_prompt_file_arg" == "0" ]]; then
-    forwarded_args+=(-f "$(resolve_input_path "$PROMPT_FILE")")
+if [[ -n "${PROMPT_FILE:-}" && "$saw_prompt_file_arg" == "0" && "$saw_prompt_binary_file_arg" == "0" && "$saw_prompt_text_arg" == "0" ]]; then
+    resolved_prompt_file=$(resolve_input_path "$PROMPT_FILE")
+    forwarded_args+=(-f "$resolved_prompt_file")
     had_forwarded_args=1
     saw_prompt_file_arg=1
+    if is_builtin_coding_prompt_path "$resolved_prompt_file"; then
+        selected_builtin_coding_prompt=1
+    fi
+elif [[ -n "${PROMPT_FILE:-}" ]]; then
+    note "ignoring PROMPT_FILE because an explicit prompt source was already provided"
 fi
 
-if [[ -n "${PROMPT_BINARY_FILE:-}" && "$saw_prompt_binary_file_arg" == "0" ]]; then
+if [[ -n "${PROMPT_BINARY_FILE:-}" && "$saw_prompt_file_arg" == "0" && "$saw_prompt_binary_file_arg" == "0" && "$saw_prompt_text_arg" == "0" ]]; then
     forwarded_args+=(-bf "$(resolve_input_path "$PROMPT_BINARY_FILE")")
     had_forwarded_args=1
     saw_prompt_binary_file_arg=1
+elif [[ -n "${PROMPT_BINARY_FILE:-}" ]]; then
+    note "ignoring PROMPT_BINARY_FILE because an explicit prompt source was already provided"
 fi
 
-if [[ -n "${PROMPT_LABEL:-}" && "$saw_prompt_file_arg" == "0" && "$saw_prompt_binary_file_arg" == "0" ]]; then
-    forwarded_args+=(-f "$(resolve_prompt_label_path "$PROMPT_LABEL")")
+if [[ -n "$benchmark_prompt_label" && "$saw_prompt_file_arg" == "0" && "$saw_prompt_binary_file_arg" == "0" && "$saw_prompt_text_arg" == "0" ]]; then
+    resolved_benchmark_prompt=$(resolve_prompt_label_path "$benchmark_prompt_label")
+    note "${benchmark_prompt_label_source}=$benchmark_prompt_label selects the built-in synthetic coding benchmark prompt file: $resolved_benchmark_prompt"
+    note "remove ${benchmark_prompt_label_source} or pass -p/--prompt to run a normal ad-hoc generation instead"
+    forwarded_args+=(-f "$resolved_benchmark_prompt")
     had_forwarded_args=1
     saw_prompt_file_arg=1
+    selected_builtin_coding_prompt=1
+elif [[ -n "$benchmark_prompt_label" ]]; then
+    note "ignoring ${benchmark_prompt_label_source} because an explicit prompt source was already provided"
+fi
+
+if [[ "$selected_builtin_coding_prompt" == "1" && "$saw_conversation_mode_arg" == "0" && "$saw_raw_completion_arg" == "0" && -z "${RAW_COMPLETION:-}" ]]; then
+    if [[ "$llama_bin_name" == "llama-cli" ]]; then
+        note "auto-enabling --moe-trace-harness for built-in coding benchmark prompts so llama-cli runs a single raw completion instead of wrapping the prompt in the model chat template"
+        note "pass -cnv to keep chat-template mode for this benchmark prompt"
+        forwarded_args+=(--moe-trace-harness)
+    else
+        note "built-in coding benchmark prompt detected, but auto raw-completion mode is only enabled for llama-cli; pass the appropriate raw-completion flag manually for '$llama_bin_name' if needed"
+    fi
+fi
+
+if [[ "$effective_reasoning_mode" == "off" && "$saw_reasoning_format_arg" == "0" ]]; then
+    # With reasoning disabled, leaving the parser in its default DeepSeek-style
+    # extraction mode can hide the entire answer if the model still emits a
+    # reasoning-shaped stream. Force plain content parsing unless the caller
+    # explicitly asked for a different reasoning format.
+    forwarded_args+=(--reasoning-format none)
 fi
 
 if [[ "$had_forwarded_args" == "0" ]]; then

@@ -4,7 +4,10 @@
 
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -16,6 +19,54 @@ struct ggml_metal_device_deleter {
 };
 
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
+
+static int16_t ggml_metal_mul_mm_env_nk() {
+    static int16_t nk = -1;
+    if (nk != -1) {
+        return nk;
+    }
+
+    nk = 32;
+    const char * value = std::getenv("GGML_METAL_MUL_MM_NK");
+    if (value == nullptr || value[0] == '\0') {
+        return nk;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return nk;
+    }
+
+    if (parsed >= 32 && parsed <= 128 && parsed % 16 == 0) {
+        nk = int16_t(parsed);
+    }
+
+    return nk;
+}
+
+static int16_t ggml_metal_mul_mm_env_walk_mode() {
+    static int16_t walk = -1;
+    if (walk != -1) {
+        return walk;
+    }
+
+    walk = GGML_METAL_MUL_MM_WALK_LEGACY;
+    const char * value = std::getenv("GGML_METAL_MUL_MM_WALK");
+    if (value == nullptr || value[0] == '\0') {
+        return walk;
+    }
+
+    if (strcmp(value, "legacy") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_LEGACY;
+    } else if (strcmp(value, "regular") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_REGULAR;
+    } else if (strcmp(value, "morton") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_MORTON;
+    }
+
+    return walk;
+}
 
 ggml_metal_device_t ggml_metal_device_get(int device) {
     static std::vector<ggml_metal_device_ptr> devs;
@@ -679,18 +730,54 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_types(
+        ggml_metal_library_t lib,
+        ggml_type tsrc0,
+        ggml_type tsrc1,
+        int64_t src0_ne0,
+        int64_t out_ne0,
+        int64_t out_ne1,
+        bool f16_output,
+        bool use_m5_expert) {
     char base[256];
     char name[256];
 
-    const ggml_type tsrc0 = op->src[0]->type;
-    const ggml_type tsrc1 = op->src[1]->type;
+    const bool bc_inp = src0_ne0 % 32 != 0;
+    const bool bc_out = out_ne0 % 64 != 0 || out_ne1 % 32 != 0;
+    const bool use_flashmoe_metal4_kernel =
+            use_m5_expert &&
+            ((f16_output &&
+              tsrc1 == GGML_TYPE_F32 &&
+              (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K)) ||
+             (tsrc0 == GGML_TYPE_F16 && tsrc1 == GGML_TYPE_F16));
+    // Keep the first custom Metal4 expert kernel numerically aligned with the proven
+    // baseline shape; we can retune it later without touching the generic mul_mm path.
+    const char * kernel_prefix = nullptr;
+    if (f16_output) {
+        kernel_prefix = use_flashmoe_metal4_kernel ?
+                "kernel_mul_mm_flashmoe_metal4_out_f16" :
+                "kernel_mul_mm_out_f16";
+    } else {
+        kernel_prefix = use_flashmoe_metal4_kernel ?
+                "kernel_mul_mm_flashmoe_metal4" :
+                "kernel_mul_mm";
+    }
+    const int16_t env_walk = ggml_metal_mul_mm_env_walk_mode();
+    const int16_t env_nk = ggml_metal_mul_mm_env_nk();
+    const bool supports_tuned_nk =
+            !f16_output &&
+            !use_flashmoe_metal4_kernel &&
+            tsrc1 == GGML_TYPE_F32 &&
+            (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K);
+    const int16_t nk = supports_tuned_nk ? env_nk : int16_t(32);
+    const size_t tile_smem = size_t(96) * nk * size_t(2);
 
-    const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
-    const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
-
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+    if (nk == 32) {
+        snprintf(base, sizeof(base), "%s_%s_%s", kernel_prefix, ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else {
+        snprintf(base, sizeof(base), "%s_nk%d_%s_%s", kernel_prefix, int(nk), ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
+    snprintf(name, sizeof(name), "%s_bci=%d_bco=%d_walk=%d", base, bc_inp, bc_out, int(env_walk));
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -698,6 +785,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_int16(cv, env_walk, FC_MUL_MM + 2);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -705,7 +793,79 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }
 
     // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes
-    res.smem = bc_out ? 8192 : 4096 + 2048;
+    res.smem = std::max(tile_smem, (bc_out || f16_output) ? size_t(8192) : size_t(0));
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool use_m5_expert) {
+    return ggml_metal_library_get_pipeline_mul_mm_types(
+            lib,
+            op->src[0]->type,
+            op->src[1]->type,
+            op->src[0]->ne[0],
+            op->ne[0],
+            op->ne[1],
+            op->op == GGML_OP_MUL_MAT_F16,
+            use_m5_expert);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_split_glu(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SPLIT_GLU);
+    GGML_ASSERT(op->src[0] != nullptr);
+    GGML_ASSERT(op->src[1] != nullptr);
+    GGML_ASSERT(op->src[2] != nullptr);
+    GGML_ASSERT(op->src[3] != nullptr);
+
+    char base[256];
+    char name[256];
+
+    const int32_t glu_op = ggml_get_op_params_i32(op, 0);
+    const char * glu_str = nullptr;
+
+    switch (glu_op) {
+        case GGML_GLU_OP_SWIGLU:
+            glu_str = "swiglu";
+            break;
+        case GGML_GLU_OP_GEGLU:
+            glu_str = "geglu";
+            break;
+        default:
+            GGML_ABORT("unsupported FLASHMOE_SPLIT_GLU op");
+    }
+
+    snprintf(base, sizeof(base), "kernel_flashmoe_split_%s_%s_%s_%s",
+            glu_str,
+            ggml_type_name(op->src[0]->type),
+            ggml_type_name(op->src[2]->type),
+            ggml_type_name(op->src[3]->type));
+    snprintf(name, sizeof(name), "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // The fused split-MLP kernel reuses the same threadgroup storage for:
+    // 1. gate/up staged weights + input activations + gate/up accumulators
+    // 2. down staged weights + fused GLU activations + output partials
+    constexpr size_t flashmoe_split_ff_tile  = 32;
+    constexpr size_t flashmoe_split_tok_tile = 32;
+    constexpr size_t flashmoe_split_out_tile = 64;
+    constexpr size_t flashmoe_split_nk       = 32;
+
+    const size_t stage1_smem =
+            2 * flashmoe_split_ff_tile * flashmoe_split_nk * sizeof(uint16_t) +
+            flashmoe_split_tok_tile * flashmoe_split_nk * sizeof(uint16_t) +
+            2 * flashmoe_split_ff_tile * flashmoe_split_tok_tile * sizeof(float);
+
+    const size_t stage2_smem =
+            flashmoe_split_out_tile * flashmoe_split_nk * sizeof(uint16_t) +
+            flashmoe_split_tok_tile * flashmoe_split_nk * sizeof(uint16_t) +
+            flashmoe_split_out_tile * flashmoe_split_tok_tile * sizeof(float);
+
+    res.nsg = 1;
+    res.smem = std::max(stage1_smem, stage2_smem);
 
     return res;
 }

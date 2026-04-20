@@ -208,6 +208,15 @@ static bool server_try_parse_minimax_tool_call_text(const std::string & raw_text
     return !out_msg.empty();
 }
 
+static bool server_should_passthrough_content_only(const common_chat_parser_params & params) {
+    return params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY &&
+           params.parser.empty() &&
+           !params.parse_tool_calls &&
+           params.reasoning_format == COMMON_REASONING_FORMAT_NONE &&
+           !params.reasoning_in_content &&
+           params.generation_prompt.empty();
+}
+
 //
 // task_params
 //
@@ -359,9 +368,20 @@ common_chat_msg task_result_state::update_chat_msg(
         bool filter_tool_calls) {
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
+
+    if (server_should_passthrough_content_only(chat_parser_params)) {
+        common_chat_msg new_msg;
+        new_msg.role = "assistant";
+        new_msg.content = generated_text;
+        chat_msg = std::move(new_msg);
+        diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        return chat_msg;
+    }
+
     SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     common_chat_msg new_msg;
     bool used_minimax_tool_fallback = false;
+    bool used_content_parse_fallback = false;
     try {
         new_msg = common_chat_parse(
             generated_text,
@@ -371,6 +391,16 @@ common_chat_msg task_result_state::update_chat_msg(
         if (chat_parser_params.parse_tool_calls && server_try_parse_minimax_tool_call_text(generated_text, is_partial, new_msg)) {
             used_minimax_tool_fallback = true;
             SRV_WRN("MiniMax tool-call parse fallback recovered from parser error: %s\n", e.what());
+        } else if (chat_parser_params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY && chat_parser_params.parser.empty()) {
+            used_content_parse_fallback = true;
+            new_msg = {};
+            new_msg.role = "assistant";
+            new_msg.content = generated_text;
+            if (!content_parse_fallback_warned) {
+                content_parse_fallback_warned = true;
+                SRV_WRN("Content-only parse fallback recovered from parser error%s: %s\n",
+                        is_partial ? " (partial)" : "", e.what());
+            }
         } else {
             throw;
         }
@@ -379,7 +409,7 @@ common_chat_msg task_result_state::update_chat_msg(
     if (chat_parser_params.parse_tool_calls) {
         SRV_DBG("Tool-parse state: partial=%d generated_len=%zu content_len=%zu reasoning_len=%zu tool_calls=%zu fallback=%d raw='%s'\n",
             is_partial, generated_text.size(), new_msg.content.size(), new_msg.reasoning_content.size(),
-            new_msg.tool_calls.size(), used_minimax_tool_fallback, server_debug_preview(generated_text).c_str());
+            new_msg.tool_calls.size(), used_minimax_tool_fallback || used_content_parse_fallback, server_debug_preview(generated_text).c_str());
         for (size_t i = 0; i < new_msg.tool_calls.size(); ++i) {
             const auto & tc = new_msg.tool_calls[i];
             SRV_DBG("Tool-parse call[%zu]: id='%s' name='%s' args='%s'\n",

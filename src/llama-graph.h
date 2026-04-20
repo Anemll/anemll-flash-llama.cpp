@@ -652,6 +652,7 @@ struct llm_graph_params {
             cparams.moe_force_expert == other.cparams.moe_force_expert &&
             cparams.moe_shared_only == other.cparams.moe_shared_only &&
             cparams.moe_router_only == other.cparams.moe_router_only &&
+            cparams.moe_sort_decode_expert_ids == other.cparams.moe_sort_decode_expert_ids &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

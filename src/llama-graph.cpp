@@ -10,6 +10,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cmath>
@@ -25,6 +26,41 @@ static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
         enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
     }
     return enabled == 1;
+}
+
+static void llama_moe_sort_decode_expert_ids_custom_op(
+        ggml_tensor * dst,
+        const ggml_tensor * src0,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+
+    if (ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0->ne[1] == 1);
+    GGML_ASSERT(dst->ne[0] == src0->ne[0]);
+    GGML_ASSERT(dst->ne[1] == src0->ne[1]);
+
+    const int64_t n = src0->ne[0];
+    std::vector<int32_t> ids;
+    ids.resize(size_t(n));
+    for (int64_t i = 0; i < n; ++i) {
+        std::memcpy(&ids[size_t(i)], (const char *) src0->data + i*src0->nb[0], sizeof(int32_t));
+    }
+
+    std::sort(ids.begin(), ids.end());
+
+    for (int64_t i = 0; i < n; ++i) {
+        std::memcpy((char *) dst->data + i*dst->nb[0], &ids[size_t(i)], sizeof(int32_t));
+    }
 }
 
 // dedup helpers
@@ -1345,7 +1381,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    cb(selected_experts, "ffn_moe_topk", il);
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -1356,9 +1391,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
+    if (force_single_expert) {
+        ggml_tensor * forced_experts_f32 = ggml_fill(
+                ctx0,
+                ggml_cast(ctx0, selected_experts, GGML_TYPE_F32),
+                (float) cparams.moe_force_expert);
+        selected_experts = ggml_cast(ctx0, forced_experts_f32, GGML_TYPE_I32);
+        cb(selected_experts, "ffn_moe_forced_top1", il);
+    }
+
+    const bool sort_decode_expert_ids =
+            cparams.moe_sort_decode_expert_ids &&
+            n_tokens == 1 &&
+            n_expert_used > 1 &&
+            flash_moe_slot_runtime != nullptr &&
+            flash_moe_slot_runtime->uses_layer(il);
+    if (sort_decode_expert_ids) {
+        selected_experts = ggml_map_custom1(
+                ctx0,
+                selected_experts,
+                llama_moe_sort_decode_expert_ids_custom_op,
+                1,
+                nullptr);
+        cb(selected_experts, "ffn_moe_topk_id_sorted", il);
+        if (sched != nullptr && backend_cpu != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+        }
+    }
+
+    cb(selected_experts, "ffn_moe_topk", il);
+
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
-
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
@@ -1388,13 +1452,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (force_single_expert) {
-        ggml_tensor * forced_experts_f32 = ggml_fill(
-                ctx0,
-                ggml_cast(ctx0, selected_experts, GGML_TYPE_F32),
-                (float) cparams.moe_force_expert);
-        selected_experts = ggml_cast(ctx0, forced_experts_f32, GGML_TYPE_I32);
-        cb(selected_experts, "ffn_moe_forced_top1", il);
-
         weights = ggml_fill(ctx0, weights, 1.0f);
         cb(weights, "ffn_moe_forced_weights", il);
     }

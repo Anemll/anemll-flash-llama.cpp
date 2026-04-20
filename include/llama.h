@@ -446,6 +446,7 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool moe_shared_only; // bypass routed experts during graph build and keep shared experts only
         bool moe_router_only; // keep routed gating/top-k active but bypass routed expert matmuls
+        bool moe_sort_decode_expert_ids; // sort single-token Flash-MoE routed decode experts by ascending expert id before routed MLP
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -617,6 +618,9 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    // Returns a pointer to the most recent backend/context error for this context, or NULL if none.
+    // The returned pointer remains valid until the next call that mutates the context.
+    LLAMA_API const char *               llama_get_last_error(const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);

@@ -10,6 +10,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -67,6 +68,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    const char * get_last_error() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -237,6 +239,9 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void clear_last_error();
+    void set_last_error(const std::string & err);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -270,6 +275,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+    std::string last_error;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

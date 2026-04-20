@@ -201,6 +201,9 @@ All wrapper environment variables for `run_minimax_m2_flash.sh`:
 | `SEED` | (unset) | RNG seed for reproducibility |
 | `TEMP` | (unset) | Sampling temperature |
 | `LLAMA_BIN` | `./build/bin/llama-cli` | Path to the llama-cli binary |
+| `BENCHMARK_PROMPT_LABEL` | (unset) | Synthetic coding benchmark prompt label for this wrapper only (`1k`, `4k`, `16k`, `22k`); injects the matching `tools/flashmoe-sidecar/prompts/coding/coding_<label>.txt` when no explicit `-p` / `-f` / `-bf` prompt source is provided |
+
+When the effective reasoning mode is `off`, the wrapper also injects `--reasoning-format none` unless you explicitly set `--reasoning-format` yourself. This avoids a llama-cli display edge case where generated text can be classified as hidden reasoning and nothing appears on stdout even though decode tokens were produced.
 
 Examples:
 
@@ -267,11 +270,13 @@ The wrapper resolves `PROMPT_FILE` the same way it resolves `-f`.
 For the built-in coding prompt samples, you can avoid paths entirely:
 
 ```bash
-PROMPT_LABEL=4k \
+BENCHMARK_PROMPT_LABEL=4k \
 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh ...
 ```
 
 Supported labels are: `1k`, `4k`, `16k`, and `22k`.
+`PROMPT_LABEL` still works as a legacy alias in `run_minimax_m2_flash.sh`, but it is easy to mistake for a generic prompt-length knob, so `BENCHMARK_PROMPT_LABEL` is the safer spelling.
+When one of these built-in coding benchmark prompts is selected through `run_minimax_m2_flash.sh`, the wrapper now auto-enables `--moe-trace-harness` by default so `llama-cli` treats the file as one raw completion request instead of wrapping it in the model chat template. Pass `-cnv` if you explicitly want chat-template mode.
 
 Run the four prompt sizes through the MiniMax wrapper:
 
@@ -281,7 +286,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_coding_prompt_sweep.sh \
   --moe-prefill-layer-major \
   --moe-prefill-stripe 3:2:2 \
   --moe-prefill-batch 2048 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1 -st
@@ -750,6 +755,12 @@ model id returned by `/v1/models`.
   host memory to improve decode-side cache hit rate on larger-memory systems.
   `MOE_SLOT_BANK` still overrides the profile if you want an exact value.
 
+The server wrapper defaults to `--no-perf` so routine serving does not emit the
+full Flash-MoE profile tables on every run. Set `FLASHMOE_SERVER_PERF=1` or
+pass `--perf` explicitly when you want the routed profile summaries for tuning.
+If you also want quieter slot/request logging, set `LLAMA_LOG_VERBOSITY=2` to
+hide `INFO` lines and keep only warnings/errors.
+
 High memory use to improve decoding cache hit rate:
 
 ```bash
@@ -774,9 +785,9 @@ bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 16192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
-  --moe-prefill-banks 1
+  --moe-prefill-banks 4
 ```
 
 Equivalent profile-driven form:
@@ -803,9 +814,9 @@ bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 16192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
-  --moe-prefill-banks 1
+  --moe-prefill-banks 4
 ```
 
 ### MiniMax tool-calling note
@@ -943,7 +954,7 @@ bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 8192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4
 ```
@@ -1024,10 +1035,12 @@ bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
   --no-warmup \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
-  --moe-prefill-banks 1
+  --moe-prefill-banks 4
 ```
+
+Here `PROMPT_LABEL` is selecting a built-in synthetic coding smoke prompt for `flashmoe_server_smoke.sh`; it is not a general runtime context or prompt-length tuning knob.
 
 Observed on M5 Max:
 

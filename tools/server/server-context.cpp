@@ -15,9 +15,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <cstring>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -26,11 +28,80 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_log_colors_enabled() {
+    const char * value = std::getenv("LLAMA_LOG_COLORS");
+    if (value != nullptr && value[0] != '\0') {
+        if (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0) {
+            return false;
+        }
+        if (std::strcmp(value, "on") == 0 || std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0) {
+            return true;
+        }
+    }
+
+    return isatty(fileno(stderr)) != 0;
+}
+
+static std::string server_highlight_tps(double tps, int precision = 2) {
+    const std::string value = string_format("%.*f", precision, tps);
+    if (!server_log_colors_enabled()) {
+        return value;
+    }
+
+    return string_format("%s%s%s", LOG_COL_YELLOW, value.c_str(), LOG_COL_DEFAULT);
+}
+
+struct server_request_log_shape {
+    const char * api_kind = "completion";
+    size_t message_count = 0;
+    size_t tool_count = 0;
+    bool likely_context_compaction = false;
+};
+
+static server_request_log_shape classify_request_log_shape(
+        task_response_type res_type,
+        const json & data,
+        int64_t total_prompt_tokens) {
+    server_request_log_shape out;
+
+    switch (res_type) {
+        case TASK_RESPONSE_TYPE_OAI_CHAT: out.api_kind = "oai-chat"; break;
+        case TASK_RESPONSE_TYPE_OAI_RESP: out.api_kind = "oai-responses"; break;
+        case TASK_RESPONSE_TYPE_ANTHROPIC: out.api_kind = "anthropic"; break;
+        case TASK_RESPONSE_TYPE_OAI_CMPL: out.api_kind = "oai-completion"; break;
+        case TASK_RESPONSE_TYPE_NONE: out.api_kind = "completion"; break;
+        case TASK_RESPONSE_TYPE_OAI_EMBD: out.api_kind = "embedding"; break;
+    }
+
+    if (data.contains("messages") && data.at("messages").is_array()) {
+        out.message_count = data.at("messages").size();
+    }
+    if (data.contains("tools") && data.at("tools").is_array()) {
+        out.tool_count = data.at("tools").size();
+    }
+
+    const bool is_chat_like =
+            res_type == TASK_RESPONSE_TYPE_OAI_CHAT ||
+            res_type == TASK_RESPONSE_TYPE_OAI_RESP ||
+            res_type == TASK_RESPONSE_TYPE_ANTHROPIC;
+    const bool has_large_rendered_history =
+            total_prompt_tokens >= 32768 ||
+            out.message_count >= 48;
+    const bool agentic_shape =
+            out.tool_count > 0 ||
+            out.message_count >= 12;
+
+    out.likely_context_compaction = is_chat_like && has_large_rendered_history && agentic_shape;
+    return out;
+}
 
 static std::string flash_moe_progress_brief(const llama_context * ctx, bool prefill, double token_tps = -1.0) {
     if (ctx == nullptr) {
@@ -42,48 +113,30 @@ static std::string flash_moe_progress_brief(const llama_context * ctx, bool pref
         return "";
     }
 
-    char buffer[256];
+    const std::string tps_suffix = token_tps > 0.0 ?
+            string_format(" tps=%s", server_highlight_tps(token_tps).c_str()) :
+            "";
     if (stats.prefill_profile) {
         if (stats.replay_available) {
-            if (token_tps > 0.0) {
-                std::snprintf(
-                        buffer, sizeof(buffer),
-                        " | moe prefill: dedup=%.1f%% reuse=%.2fx replay=%.1f%% reload=%.2fGB/s tps=%.2f",
-                        stats.dedup_saved_pct, stats.reuse_factor, stats.replay_hit_pct, stats.reload_bw_gbps, token_tps);
-            } else {
-                std::snprintf(
-                        buffer, sizeof(buffer),
-                        " | moe prefill: dedup=%.1f%% reuse=%.2fx replay=%.1f%% reload=%.2fGB/s",
-                        stats.dedup_saved_pct, stats.reuse_factor, stats.replay_hit_pct, stats.reload_bw_gbps);
-            }
+            return string_format(
+                    " | moe prefill: dedup=%.1f%% reuse=%.2fx replay=%.1f%% reload=%.2fGB/s%s",
+                    stats.dedup_saved_pct, stats.reuse_factor, stats.replay_hit_pct, stats.reload_bw_gbps, tps_suffix.c_str());
         } else {
-            if (token_tps > 0.0) {
-                std::snprintf(
-                        buffer, sizeof(buffer),
-                        " | moe prefill: dedup=%.1f%% reuse=%.2fx reload=%.2fGB/s tps=%.2f",
-                        stats.dedup_saved_pct, stats.reuse_factor, stats.reload_bw_gbps, token_tps);
-            } else {
-                std::snprintf(
-                        buffer, sizeof(buffer),
-                        " | moe prefill: dedup=%.1f%% reuse=%.2fx reload=%.2fGB/s",
-                        stats.dedup_saved_pct, stats.reuse_factor, stats.reload_bw_gbps);
-            }
+            return string_format(
+                    " | moe prefill: dedup=%.1f%% reuse=%.2fx reload=%.2fGB/s%s",
+                    stats.dedup_saved_pct, stats.reuse_factor, stats.reload_bw_gbps, tps_suffix.c_str());
         }
     } else {
         if (stats.replay_available) {
-            std::snprintf(
-                    buffer, sizeof(buffer),
+            return string_format(
                     " | moe decode: hit=%.1f%% replay=%.1f%% reload=%.2fGB/s",
                     stats.cache_hit_pct, stats.replay_hit_pct, stats.reload_bw_gbps);
         } else {
-            std::snprintf(
-                    buffer, sizeof(buffer),
+            return string_format(
                     " | moe decode: hit=%.1f%% reload=%.2fGB/s",
                     stats.cache_hit_pct, stats.reload_bw_gbps);
         }
     }
-
-    return buffer;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -477,23 +530,26 @@ struct server_slot {
                 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0;
         const double t_prompt_eval_per_token = n_prompt_tokens_processed > 0 ? t_prompt_eval / n_prompt_tokens_processed : 0;
         const double n_prompt_eval_second = prompt_eval_tps();
+        const std::string n_prompt_eval_second_str = server_highlight_tps(n_prompt_eval_second);
 
         const int32_t n_gen_steady = n_decoded_steady();
         const double t_gen_steady = n_gen_steady > 0 ? t_token_generation_steady / n_gen_steady : 0;
         const double n_gen_second_steady = n_gen_steady > 0 && t_token_generation_steady > 0 ?
                 1e3 / t_token_generation_steady * n_gen_steady : 0;
+        const std::string n_prompt_second_str = server_highlight_tps(n_prompt_second);
+        const std::string n_gen_second_steady_str = server_highlight_tps(n_gen_second_steady);
 
         SLT_INF(*this,
                 "\n"
                 "prompt prep time = %10.2f ms\n"
-                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
-                "prompt total time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
-                "steady eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tps)\n"
+                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %s tps)\n"
+                "prompt total time = %10.2f ms / %5d tokens (%8.2f ms per token, %s tps)\n"
+                "steady eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %s tps)\n"
                 "      total time = %10.2f ms / %5d tokens\n",
                 t_prompt_prep(),
-                t_prompt_eval, n_prompt_tokens_processed, t_prompt_eval_per_token, n_prompt_eval_second,
-                t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second,
-                t_token_generation_steady, n_gen_steady, t_gen_steady, n_gen_second_steady,
+                t_prompt_eval, n_prompt_tokens_processed, t_prompt_eval_per_token, n_prompt_eval_second_str.c_str(),
+                t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second_str.c_str(),
+                t_token_generation_steady, n_gen_steady, t_gen_steady, n_gen_second_steady_str.c_str(),
                 t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
 
         if (n_draft_total > 0) {
@@ -512,8 +568,12 @@ struct server_slot {
             return;
         }
 
-        constexpr int32_t progress_step_tokens = 128;
-        constexpr int64_t progress_step_us = 5 * 1000 * 1000;
+        if (!force && task->params.likely_context_compaction && n_decoded > 1) {
+            return;
+        }
+
+        constexpr int32_t progress_step_tokens = 256;
+        constexpr int64_t progress_step_us = 15 * 1000 * 1000;
 
         const bool step_due = (n_decoded == 1) || (n_decoded % progress_step_tokens == 0);
         const bool time_due = t_last_generation_progress > 0 && (t_current - t_last_generation_progress) >= progress_step_us;
@@ -533,14 +593,16 @@ struct server_slot {
 
         if (n_predict_total > 0) {
             const double progress = (double) n_decoded / n_predict_total;
+            const std::string tps_str = server_highlight_tps(tps);
             SLT_INF(*this,
-                    "generate: ndec = %d / %d, n_rem = %d, prgs = %.4f, tps: %.2f%s\n",
-                    n_decoded, n_predict_total, n_remaining_local, progress, tps,
+                    "generate: ndec = %d / %d, n_rem = %d, prgs = %.4f, tps: %s%s\n",
+                    n_decoded, n_predict_total, n_remaining_local, progress, tps_str.c_str(),
                     flash_moe_progress_brief(ctx, false).c_str());
         } else {
+            const std::string tps_str = server_highlight_tps(tps);
             SLT_INF(*this,
-                    "generate: ndec = %d, n_rem = %d, tps: %.2f%s\n",
-                    n_decoded, n_remaining_local, tps,
+                    "generate: ndec = %d, n_rem = %d, tps: %s%s\n",
+                    n_decoded, n_remaining_local, tps_str.c_str(),
                     flash_moe_progress_brief(ctx, false).c_str());
         }
 
@@ -2291,9 +2353,12 @@ private:
             for (const auto & slot : slots) {
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     n_batch = std::min<int32_t>(n_batch_ctx, params_base.moe_prefill_batch);
-                    const int32_t configured_micro = params_base.moe_prefill_micro_batch > 0 ?
-                            params_base.moe_prefill_micro_batch :
-                            n_batch;
+                    const int32_t configured_micro =
+                            params_base.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO ?
+                                    common_moe_prefill_micro_batch_auto_for_tokens(slot.task ? slot.task->n_tokens() : n_batch) :
+                            params_base.moe_prefill_micro_batch > 0 ?
+                                    params_base.moe_prefill_micro_batch :
+                                    n_batch;
                     n_ubatch = std::min<int32_t>(n_ubatch_ctx, configured_micro);
                     break;
                 }
@@ -2909,7 +2974,8 @@ private:
 
                     if (ret < -1) {
                         // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
-                        err = "Compute error.";
+                        const char * ctx_err = llama_get_last_error(ctx);
+                        err = (ctx_err != nullptr && ctx_err[0] != '\0') ? ctx_err : "Compute error.";
                     }
 
                     // TODO: handle ret == 2 (abort) when we start aborting
@@ -2967,13 +3033,13 @@ private:
 
                 if (slot.state == SLOT_STATE_DONE_PROMPT) {
                     SLT_INF(slot,
-                            "prompt processing done, n_tokens = %d, batch.n_tokens = %d, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
-                            slot.prompt.n_tokens(), batch.n_tokens, prompt_prep_ms, prompt_eval_ms, prompt_ms,
+                            "prompt processing done, total = %d, cache = %d, processed = %d, current = %d, batch.n_tokens = %d, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
+                            slot.task->n_tokens(), slot.n_prompt_tokens_cache, slot.n_prompt_tokens_processed, slot.prompt.n_tokens(), batch.n_tokens, prompt_prep_ms, prompt_eval_ms, prompt_ms,
                             flash_moe_progress_brief(slot.ctx, true, prompt_tps).c_str());
                 } else {
                     SLT_INF(slot,
-                            "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
-                            slot.prompt.n_tokens(), batch.n_tokens,
+                            "prompt processing progress, total = %d, cache = %d, processed = %d, current = %d, batch.n_tokens = %d, progress = %f, prep = %.2f ms, eval = %.2f ms, total = %.2f ms%s\n",
+                            slot.task->n_tokens(), slot.n_prompt_tokens_cache, slot.n_prompt_tokens_processed, slot.prompt.n_tokens(), batch.n_tokens,
                             (float) slot.prompt.n_tokens() / slot.task->n_tokens(),
                             prompt_prep_ms, prompt_eval_ms, prompt_ms,
                             flash_moe_progress_brief(slot.ctx, true, prompt_tps).c_str());
@@ -3309,6 +3375,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         for (const auto & input : inputs) {
             total_prompt_tokens += input.size();
         }
+        const auto request_shape = classify_request_log_shape(res_type, data, total_prompt_tokens);
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
         double params_parse_ms = 0.0;
@@ -3332,6 +3399,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            task.params.likely_context_compaction = request_shape.likely_context_compaction;
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -3344,13 +3412,21 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
-        SRV_INF("Request prepared: prompts = %zu, tasks = %zu, prompt_tokens = %" PRId64 ", tokenize = %.2f ms, params = %.2f ms, total = %.2f ms, queueing for slot scheduling\n",
+        SRV_INF("Request prepared: kind = %s, prompts = %zu, tasks = %zu, prompt_tokens = %" PRId64 ", messages = %zu, tools = %zu, classify = %s, tokenize = %.2f ms, params = %.2f ms, total = %.2f ms, queueing for slot scheduling\n",
+                request_shape.api_kind,
                 inputs.size(),
                 tasks.size(),
                 total_prompt_tokens,
+                request_shape.message_count,
+                request_shape.tool_count,
+                request_shape.likely_context_compaction ? "likely-context-compaction" : "normal",
                 (t_after_tokenize - t_start_tokenize) / 1000.0,
                 params_parse_ms,
                 (ggml_time_us() - t_start_prepare) / 1000.0);
+
+        if (request_shape.likely_context_compaction) {
+            SRV_INF("%s", "Request classified as likely context compaction / long-history recovery: large rendered chat history with agentic shape; prefill TPS here is not directly comparable to a normal user turn.\n");
+        }
 
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {

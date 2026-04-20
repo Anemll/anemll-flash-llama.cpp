@@ -573,6 +573,8 @@ extern "C" {
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
+        GGML_OP_MUL_MAT_F16,
+        GGML_OP_FLASHMOE_SPLIT_GLU,
         GGML_OP_GLU,
 
         GGML_OP_COUNT,

@@ -1054,10 +1054,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
+    "MUL_MAT_F16",
+    "FLASHMOE_SPLIT_GLU",
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1164,10 +1166,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
     "sgd(x)",
 
+    "mul_mat_f16(x,y)",
+    "flashmoe_split_glu(g,u,x)",
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3233,7 +3237,7 @@ struct ggml_tensor * ggml_mul_mat(
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_F16);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -6480,7 +6484,8 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
         } break;
-        case GGML_OP_MUL_MAT: {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_F16: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
             // s0 = np.random.randn(5, 10)
@@ -6802,6 +6807,9 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_FLASHMOE_SPLIT_GLU: {
+            GGML_ABORT("backward pass not implemented for FLASHMOE_SPLIT_GLU");
         } break;
         case GGML_OP_NONE: {
             // noop

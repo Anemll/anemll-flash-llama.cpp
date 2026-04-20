@@ -86,6 +86,10 @@
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
 
+#define GGML_METAL_MUL_MM_WALK_LEGACY  0
+#define GGML_METAL_MUL_MM_WALK_REGULAR 1
+#define GGML_METAL_MUL_MM_WALK_MORTON  2
+
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
@@ -428,6 +432,18 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
+
+typedef struct {
+    int32_t  n_embd_in;
+    int32_t  n_ff;
+    int32_t  n_tokens;
+    int32_t  n_out;
+    uint64_t gate_nb01;
+    uint64_t up_nb01;
+    uint64_t down_nb01;
+    uint64_t in_nb1;
+    uint64_t out_nb1;
+} ggml_metal_kargs_flashmoe_split_mlp;
 
 typedef struct {
     int32_t  ne00;

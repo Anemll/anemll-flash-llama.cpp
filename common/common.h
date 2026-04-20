@@ -410,6 +410,10 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+static constexpr int32_t COMMON_MOE_PREFILL_MICRO_BATCH_AUTO = -1;
+
+int32_t common_moe_prefill_micro_batch_auto_for_tokens(int32_t prompt_tokens);
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -417,7 +421,7 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     bool    n_ubatch_explicit     = false; // true when -ub/--ubatch-size (or env alias) was set by the user
     int32_t moe_prefill_batch     =     0; // prefill-only logical batch override for --moe-prefill-layer-major (0 = follow n_batch)
-    int32_t moe_prefill_micro_batch =   0; // prefill-only expert compute micro-batch (0 = follow prefill batch)
+    int32_t moe_prefill_micro_batch =   0; // prefill-only expert compute micro-batch (0 = follow prefill batch, -1 = auto)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -667,6 +671,7 @@ struct common_params {
     bool        moe_predict_top1_prev = false; // prev-token top-1 same-layer predictor               // NOLINT
     bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT
     bool        moe_router_only = false; // keep routing/topk, bypass routed expert matmuls           // NOLINT
+    bool        moe_sort_decode_expert_ids = false; // sort single-token routed decode experts by id // NOLINT
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
 
     // retrieval params

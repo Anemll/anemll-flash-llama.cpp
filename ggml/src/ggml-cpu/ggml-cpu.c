@@ -1825,6 +1825,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_F16:
+            GGML_ABORT("GGML_OP_MUL_MAT_F16 is only implemented for Metal");
+        case GGML_OP_FLASHMOE_SPLIT_GLU:
+            GGML_ABORT("GGML_OP_FLASHMOE_SPLIT_GLU is only implemented for Metal");
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -2293,6 +2297,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_F16:
+        case GGML_OP_FLASHMOE_SPLIT_GLU:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
@@ -2805,11 +2811,20 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(node->type)*n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT:
+                case GGML_OP_MUL_MAT_F16:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        }
+                    } break;
+                case GGML_OP_FLASHMOE_SPLIT_GLU:
+                    {
+                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+
+                        if (node->src[2]->type != vec_dot_type) {
+                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[2]));
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

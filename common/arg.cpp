@@ -1280,13 +1280,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_BATCH"));
     add_opt(common_arg(
-        {"--moe-prefill-micro-batch"}, "N",
-        "prefill-only expert compute micro-batch for --moe-prefill-layer-major (0 = follow prefill batch)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"--moe-prefill-micro-batch"}, "N|auto",
+        "prefill-only expert compute micro-batch for --moe-prefill-layer-major (0 = follow prefill batch, auto = adapt by prompt length)",
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.moe_prefill_micro_batch = COMMON_MOE_PREFILL_MICRO_BATCH_AUTO;
+                return;
+            }
+            const int parsed = std::stoi(value);
+            if (parsed < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_prefill_micro_batch = value;
+            params.moe_prefill_micro_batch = parsed;
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_MICRO_BATCH"));
     add_opt(common_arg(
@@ -2470,6 +2475,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_router_only = value;
         }
     ).set_env("LLAMA_ARG_MOE_ROUTER_ONLY"));
+    add_opt(common_arg(
+        {"--moe-sort-decode-expert-ids"},
+        {"--no-moe-sort-decode-expert-ids"},
+        string_format("for single-token Flash-MoE decode, sort routed experts by ascending expert id before the routed MLP so weights and matmuls follow the same reordered top-k list (default: %s)", params.moe_sort_decode_expert_ids ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_sort_decode_expert_ids = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SORT_DECODE_EXPERT_IDS"));
     add_opt(common_arg(
         {"--moe-trace-harness"},
         "llama-cli only: bypass the chat loop and run the provided --prompt as a raw non-interactive completion for long Flash-MoE trace collection",

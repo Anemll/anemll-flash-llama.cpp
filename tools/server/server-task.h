@@ -70,6 +70,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool likely_context_compaction = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -99,6 +100,7 @@ struct task_result_state {
     std::string generated_text; // append new chunks of generated text here
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
+    bool content_parse_fallback_warned = false;
 
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks

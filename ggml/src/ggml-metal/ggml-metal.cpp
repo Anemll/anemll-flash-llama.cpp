@@ -213,6 +213,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
             } break;
+        case GGML_OP_FLASHMOE_SPLIT_GLU:
+            {
+                res += ggml_metal_op_flashmoe_split_glu_extra_tmp(tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
@@ -737,6 +741,8 @@ static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_F16:
+        case GGML_OP_FLASHMOE_SPLIT_GLU:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
             return op->ne[2];
@@ -790,7 +796,7 @@ static bool ggml_backend_metal_device_experimental_split_glu_enabled(void) {
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+    if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID && op->op != GGML_OP_FLASHMOE_SPLIT_GLU) {
         return false;
     }
 

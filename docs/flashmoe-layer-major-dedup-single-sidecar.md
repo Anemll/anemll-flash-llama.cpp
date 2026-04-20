@@ -65,23 +65,28 @@ Hardware: `M5 Max`, runtime: `Flash-MoE`, storage: `SSD`.
 
 ### 4K prefill across models
 
-| Model             | Quant                | Prefill tokens | Prompt      | Decode     |
-| ----------------- | -------------------- | -------------: | ----------: | ---------: |
-| Gemma4 26B-A4B    | `UD-Q3_K_XL`         |         `5009` | `718.3 t/s` | `21.4 t/s` |
-| Qwen 3.5 35B-A3B  | `IQ2`                |         `4661` | `535.5 t/s` | `52.2 t/s` |
-| MiniMax-M2.7      | `UD-Q4_K_XL`         |           `4K` | `227.3 t/s` | `16.6 t/s` |
-| Kimi K2.5         | `UD-TQ1`             |         `4053` | `109.4 t/s` |  `4.4 t/s` |
-| GLM-5.1           | `IQ1`                |         `4070` |  `94.5 t/s` |  `4.4 t/s` |
+
+| Model            | Quant        | Prefill tokens | Prompt      | Decode     |
+| ---------------- | ------------ | -------------- | ----------- | ---------- |
+| Gemma4 26B-A4B   | `UD-Q3_K_XL` | `5009`         | `718.3 t/s` | `21.4 t/s` |
+| Qwen 3.5 35B-A3B | `IQ2`        | `4661`         | `535.5 t/s` | `52.2 t/s` |
+| MiniMax-M2.7     | `UD-Q4_K_XL` | `4K`           | `227.3 t/s` | `16.6 t/s` |
+| Kimi K2.5        | `UD-TQ1`     | `4053`         | `109.4 t/s` | `4.4 t/s`  |
+| GLM-5.1          | `IQ1`        | `4070`         | `94.5 t/s`  | `4.4 t/s`  |
+
 
 ### 1K prefill (selected)
 
-| Model             | Quant                | Prefill tokens | Prompt      | Decode     |
-| ----------------- | -------------------- | -------------: | ----------: | ---------: |
-| Gemma4 26B-A4B    | `UD-Q3_K_XL`         |         `1260` | `630.6 t/s` | `36.8 t/s` |
-| MiniMax-M2.7      | `UD-Q4_K_XL`         |           `1K` |  `78.1 t/s` | `16.7 t/s` |
-| Kimi K2.5         | `UD-TQ1`             |         `1008` |  `53.0 t/s` |  `6.3 t/s` |
+
+| Model          | Quant        | Prefill tokens | Prompt      | Decode     |
+| -------------- | ------------ | -------------- | ----------- | ---------- |
+| Gemma4 26B-A4B | `UD-Q3_K_XL` | `1260`         | `630.6 t/s` | `36.8 t/s` |
+| MiniMax-M2.7   | `UD-Q4_K_XL` | `1K`           | `78.1 t/s`  | `16.7 t/s` |
+| Kimi K2.5      | `UD-TQ1`     | `1008`         | `53.0 t/s`  | `6.3 t/s`  |
+
 
 ### MiniMax-M2.7 prefill sweep (`UD-Q4_K_XL`)
+
 
 | Prefill tokens | Prompt      | Decode     |
 | -------------- | ----------- | ---------- |
@@ -420,7 +425,7 @@ A good starting point is:
 ```bash
 --moe-prefill-layer-major \
 --moe-prefill-batch 2048 \
---moe-prefill-micro-batch 32 \
+--moe-prefill-micro-batch auto \
 --moe-prefill-banks 4 \
 --moe-prefill-io-split 8
 ```
@@ -456,7 +461,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 8192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -504,7 +509,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -548,7 +553,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -574,7 +579,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -619,7 +624,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -f ./tools/flashmoe-sidecar/prompts/coding/coding_1k.txt \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -644,7 +649,7 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4 \
   -n 1024 -st
@@ -656,14 +661,14 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
 `--moe-prefill-layer-major` path as `llama-cli`. The server helper workflow is:
 
 - `tools/flashmoe-sidecar/run_flashmoe_server.sh`
-  Starts `llama-server` with Flash-MoE sidecar defaults, slot-bank sizing,
-  Metal replay env vars, and the layer-major prefill flags you pass through.
+Starts `llama-server` with Flash-MoE sidecar defaults, slot-bank sizing,
+Metal replay env vars, and the layer-major prefill flags you pass through.
 - `tools/flashmoe-sidecar/flashmoe_server_turn_test.py`
-  Sends a large first-turn `/completion` request with `cache_prompt=true`, then
-  sends a follow-up turn on the same `id_slot`.
+Sends a large first-turn `/completion` request with `cache_prompt=true`, then
+sends a follow-up turn on the same `id_slot`.
 - `tools/flashmoe-sidecar/flashmoe_server_smoke.sh`
-  Convenience wrapper that launches the server, waits for readiness, runs the
-  turn test, shuts the server down, and prints the key prefill/decode summaries.
+Convenience wrapper that launches the server, waits for readiness, runs the
+turn test, shuts the server down, and prints the key prefill/decode summaries.
 
 ### Gemma4 Server Benchmark
 
@@ -687,7 +692,7 @@ bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 8192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 4
 ```
@@ -697,31 +702,33 @@ Observed Gemma4 server result:
 - turn 1: `20008` prompt tokens at `638.8 t/s`, decode `64` tokens at `13.5 t/s`
 - turn 2: `74` new prompt tokens with `cache_n=20008`, decode `64` tokens at `14.1 t/s`
 - shutdown summary: `src=prefill-layer-major`, dedup `saved=2320548 (99.6%)`,
-  reuse `246.72x`
+reuse `246.72x`
 
 ### Server Smoke Matrix
 
 The following models were tested end-to-end in server mode with
 `--moe-prefill-layer-major` enabled:
 
-| Model | Prompt | Slot Bank | Turn 1 | Turn 2 | Prefill Dedup | Notes |
-|-------|-------:|----------:|-------:|-------:|--------------:|-------|
-| Gemma4 26B-A4B | `16k` (`20008` tok) | `64` | prompt `638.8 t/s`, decode `13.5 t/s` | `74` new tokens, `cache_n=20008`, prompt `115.3 t/s` | `99.6%`, `246.72x` | big-prefill benchmark |
-| MiniMax-M2.7 | `4k` (`4097` tok) | `128` | prompt `211.9 t/s`, decode `6.2 t/s` | `73` new tokens, `cache_n=4097`, prompt `12.9 t/s` | `97.8%`, `46.11x` | server prompt reuse works |
-| GLM-5.1 | `4k` (`4070` tok) | `96` | prompt `83.1 t/s`, decode `3.6 t/s` | `72` new tokens, `cache_n=4070`, prompt `8.9 t/s` | `97.7%`, `44.01x` | server prompt reuse works |
-| Qwen 3.5 35B-A3B | `4k` (`4661` tok) | `64` | prompt `539.8 t/s`, decode `46.8 t/s` | full reprocess, `cache_n=0`, prompt `534.8 t/s` | `98.7%`, `77.07x` | server log reports forced full prompt re-processing due to SWA / hybrid memory cache limits |
-| Kimi K2.5 | `1k` (`1008` tok) | `64` | prompt `52.7 t/s`, decode `5.5 t/s` | `73` new tokens, `cache_n=1007`, prompt `10.1 t/s` | `90.0%`, `10.01x` | keep `UBATCH=1` for stable output |
+
+| Model            | Prompt              | Slot Bank | Turn 1                                | Turn 2                                               | Prefill Dedup      | Notes                                                                                       |
+| ---------------- | ------------------- | --------- | ------------------------------------- | ---------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------- |
+| Gemma4 26B-A4B   | `16k` (`20008` tok) | `64`      | prompt `638.8 t/s`, decode `13.5 t/s` | `74` new tokens, `cache_n=20008`, prompt `115.3 t/s` | `99.6%`, `246.72x` | big-prefill benchmark                                                                       |
+| MiniMax-M2.7     | `4k` (`4097` tok)   | `128`     | prompt `211.9 t/s`, decode `6.2 t/s`  | `73` new tokens, `cache_n=4097`, prompt `12.9 t/s`   | `97.8%`, `46.11x`  | server prompt reuse works                                                                   |
+| GLM-5.1          | `4k` (`4070` tok)   | `96`      | prompt `83.1 t/s`, decode `3.6 t/s`   | `72` new tokens, `cache_n=4070`, prompt `8.9 t/s`    | `97.7%`, `44.01x`  | server prompt reuse works                                                                   |
+| Qwen 3.5 35B-A3B | `4k` (`4661` tok)   | `64`      | prompt `539.8 t/s`, decode `46.8 t/s` | full reprocess, `cache_n=0`, prompt `534.8 t/s`      | `98.7%`, `77.07x`  | server log reports forced full prompt re-processing due to SWA / hybrid memory cache limits |
+| Kimi K2.5        | `1k` (`1008` tok)   | `64`      | prompt `52.7 t/s`, decode `5.5 t/s`   | `73` new tokens, `cache_n=1007`, prompt `10.1 t/s`   | `90.0%`, `10.01x`  | keep `UBATCH=1` for stable output                                                           |
+
 
 ### Notes for Server Turn Tests
 
 - The turn test uses `/completion`, not `/v1/chat/completions`, so the prompts
-  are raw completion prompts on purpose.
+are raw completion prompts on purpose.
 - The second request reuses the same `id_slot` and sends `cache_prompt=true`.
 - For models without SWA / hybrid-memory cache restrictions, the second turn
-  should show a small `prompt_n` and a large `cache_n`.
+should show a small `prompt_n` and a large `cache_n`.
 - Qwen 3.5 is the current exception in this tested set. The server logs:
-  `forcing full prompt re-processing due to lack of cache data`, so the second
-  turn is still valid server inference but not a cache-reuse benchmark.
+`forcing full prompt re-processing due to lack of cache data`, so the second
+turn is still valid server inference but not a cache-reuse benchmark.
 
 ## Largest Verified Safe Q8 Server Context
 
@@ -732,7 +739,7 @@ guarded workflow:
 - no warmup: `--no-warmup`
 - no context checkpoints: `--ctx-checkpoints 0 --checkpoint-every-n-tokens -1`
 - small starting MoE settings: low `MOE_SLOT_BANK`, low `UBATCH`,
-  `--moe-prefill-banks 1`
+`--moe-prefill-banks 1`
 - hard free-memory abort: stop the probe if system free memory reaches `20%`
 
 These numbers are the largest **startup-safe** server contexts we verified on
@@ -740,23 +747,25 @@ this M5 Max using that guard. They are not all full prompt-prefill runs; they
 are the largest guarded server contexts that reached `server ready` without
 crossing the abort threshold.
 
-| Model | Q8 server context | Result | Memory guard notes |
-|-------|-------------------:|--------|--------------------|
-| MiniMax-M2.7 | `196608` | safe | stayed around `38-39%` free after ready |
-| Qwen 3.5 35B-A3B | `262144` | safe | remained very comfortable, around `85%` free at ready |
-| Kimi K2.5 | `262144` | safe | reached ready around `49%` free, use `UBATCH=1` |
-| GLM-5.1 | `188160` | safe | reached ready at `21%` free; `202752` tripped the guard |
-| Gemma4 26B-A4B | n/a in full Q8 KV | unsupported in this config | quantized `V` cache requires Flash Attention, and this server reserve path disables it |
+
+| Model            | Q8 server context | Result                     | Memory guard notes                                                                     |
+| ---------------- | ----------------- | -------------------------- | -------------------------------------------------------------------------------------- |
+| MiniMax-M2.7     | `196608`          | safe                       | stayed around `38-39%` free after ready                                                |
+| Qwen 3.5 35B-A3B | `262144`          | safe                       | remained very comfortable, around `85%` free at ready                                  |
+| Kimi K2.5        | `262144`          | safe                       | reached ready around `49%` free, use `UBATCH=1`                                        |
+| GLM-5.1          | `188160`          | safe                       | reached ready at `21%` free; `202752` tripped the guard                                |
+| Gemma4 26B-A4B   | n/a in full Q8 KV | unsupported in this config | quantized `V` cache requires Flash Attention, and this server reserve path disables it |
+
 
 Notes:
 
 - MiniMax cannot reach `250k` because its training context is `196608`.
 - Qwen and Kimi can load at `262144`, so `250k` is below the verified
-  startup-safe ceiling on this machine.
+startup-safe ceiling on this machine.
 - GLM is the tightest of the supported Q8 runs in this set. `188160` is the
-  largest verified safe value so far; `202752` was not safe.
+largest verified safe value so far; `202752` was not safe.
 - Gemma4 still works well for normal layer-major server inference, but not with
-  full quantized Q8 KV in the current server reserve configuration.
+full quantized Q8 KV in the current server reserve configuration.
 
 Example guarded startup-only probe:
 
@@ -785,7 +794,7 @@ bash ./tools/flashmoe-sidecar/flashmoe_server_smoke.sh \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
   --moe-prefill-batch 2048 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
   --moe-prefill-banks 1
 ```
@@ -847,23 +856,24 @@ bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
   --no-warmup \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-batch 16192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-batch 4096 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
-  --moe-prefill-banks 1
+  --moe-prefill-banks 4
 ```
 
 Notes on the server flags:
 
 - `HOST=0.0.0.0` lets the client reach the server on `127.0.0.1` and from other
-  machines on the LAN. Use `HOST=127.0.0.1` if you want loopback only.
+machines on the LAN. Use `HOST=127.0.0.1` if you want loopback only.
 - `MODEL_ALIAS=minimax-m2` makes the server advertise `minimax-m2` as the
-  model id; the DroidAI `model` field below must be the same string.
+model id; the DroidAI `model` field below must be the same string.
 - `CTX=96000` with `-ctk q8_0 -ctv q8_0` keeps KV cache memory in check for
-  long coding / tool-use sessions.
-- `--moe-prefill-layer-major` plus `--moe-prefill-banks 1` is the verified
-  single-bank layer-major prefill path for MiniMax on M5 Max 128. Raise
-  `--moe-prefill-banks` only if you have extra memory headroom.
+long coding / tool-use sessions.
+- `--moe-prefill-layer-major` with `--moe-prefill-micro-batch auto` and
+`--moe-prefill-banks 4` is the current recommended layer-major prefill path
+for MiniMax on M5 Max 128. Drop to `--moe-prefill-banks 1` only for the
+guarded large-context startup probe or on memory-constrained machines.
 
 High memory use to improve decoding cache hit rate:
 
@@ -888,10 +898,10 @@ bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
   --no-warmup \
   --moe-predict-top1-prev \
   --moe-prefill-layer-major \
-  --moe-prefill-batch 16192 \
-  --moe-prefill-micro-batch 32 \
+  --moe-prefill-batch 4096 \
+  --moe-prefill-micro-batch auto \
   --moe-prefill-io-split 8 \
-  --moe-prefill-banks 1
+  --moe-prefill-banks 4
 ```
 
 ### Adding the server to `~/.factory/settings.json`
@@ -925,31 +935,30 @@ field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
 Field-by-field:
 
 - `"model": "minimax-m2"` must equal `MODEL_ALIAS` on the server. If the
-  alias changes, this string must change with it.
+alias changes, this string must change with it.
 - `"id": "custom:MiniMax-M2.7-(m5m-local)-0"` is the internal DroidAI handle.
-  The `custom:` prefix plus a unique suffix per entry are the hard
-  requirements. The `(m5m-local)` tag is a naming convention we use to mark
-  this as the local M5 Max server and to distinguish it from a separate
-  `(m3u-local)` entry on another host or from a hosted MiniMax endpoint.
+The `custom:` prefix plus a unique suffix per entry are the hard
+requirements. The `(m5m-local)` tag is a naming convention we use to mark
+this as the local M5 Max server and to distinguish it from a separate
+`(m3u-local)` entry on another host or from a hosted MiniMax endpoint.
 - `"index"` controls display order in the DroidAI model picker; pick any
-  free integer.
+free integer.
 - `"baseUrl": "http://127.0.0.1:8080/v1"` points at the loopback server
-  started above. For LAN access or a different port, match `HOST` and
-  `PORT` exactly. Keep the trailing `/v1`.
+started above. For LAN access or a different port, match `HOST` and
+`PORT` exactly. Keep the trailing `/v1`.
 - `"apiKey": "not-needed"` — the local server does not validate the key,
-  but the field must be present for the provider plugin.
+but the field must be present for the provider plugin.
 - `"provider": "generic-chat-completion-api"` selects the OpenAI-compatible
-  transport, which our `/v1/chat/completions` endpoint implements.
+transport, which our `/v1/chat/completions` endpoint implements.
 - `"noImageSupport": true` is required: MiniMax-M2.7 is text-only.
 
 To register additional local servers (for example a second machine on the
 LAN), copy the object, bump `index`, give it a new unique `id` like
 `custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
 
-<a name="testing-flash-moe-with-mariozechner-pi-agent-badlogic"></a>
 ## Testing Flash-MoE with `@badlogicgames` pi-agent (badlogic)
 
-[`pi` / `pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+`[pi` / `pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)`
 can use the local Flash-MoE server as a custom OpenAI-compatible provider. The
 provider entry lives in `~/.pi/agent/models.json`.
 
@@ -990,19 +999,19 @@ provider entry lives in `~/.pi/agent/models.json`.
 Notes:
 
 - `id` must equal `MODEL_ALIAS` on the server. If the server advertises
-  `minimax-m2`, the `pi` model id must also be `minimax-m2`.
+`minimax-m2`, the `pi` model id must also be `minimax-m2`.
 - Keep `baseUrl` on `127.0.0.1` when `pi` runs on the same machine, even if
-  the server binds to `HOST=0.0.0.0` for LAN access.
+the server binds to `HOST=0.0.0.0` for LAN access.
 - `supportsDeveloperRole=false` and `supportsReasoningEffort=false` keep `pi`
-  on the simplest OpenAI-compatible path for the current server behavior.
+on the simplest OpenAI-compatible path for the current server behavior.
 - `supportsUsageInStreaming=true` is required for the `pi` footer to show
-  correct context / cache usage. With it set to `false`, `pi` does not send
-  `stream_options.include_usage`, the server omits the trailing usage chunk,
-  and `pi` reports `cacheRead`/`cacheWrite`/totals as `0`. The llama.cpp
-  server emits `prompt_tokens_details.cached_tokens` in the final stream
-  chunk when this option is enabled.
+correct context / cache usage. With it set to `false`, `pi` does not send
+`stream_options.include_usage`, the server omits the trailing usage chunk,
+and `pi` reports `cacheRead`/`cacheWrite`/totals as `0`. The llama.cpp
+server emits `prompt_tokens_details.cached_tokens` in the final stream
+chunk when this option is enabled.
 - After editing `~/.pi/agent/models.json`, open `/model` inside `pi` to reload
-  the file and select `MiniMax-M2.7 Flash (Local)`.
+the file and select `MiniMax-M2.7 Flash (Local)`.
 
 ### Quick sanity check
 

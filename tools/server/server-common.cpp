@@ -1241,11 +1241,12 @@ json oaicompat_chat_params_parse(
     }
 
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        const size_t message_count = inputs.messages.size() + (prefill_assistant_message ? 1 : 0);
         if (minimax_manual_tool_parse) {
             SRV_WRN("%s", "Using manual MiniMax tool-call parsing path: sampler grammar disabled, chat parser kept enabled.\n");
         }
-        SRV_INF("Tool-call request: format=%s parse_tool_calls=%d thinking=%d grammar_len=%zu generation_prompt='%s' normalized_generation_prompt='%s'\n",
-            common_chat_format_name(chat_params.format), 1, inputs.enable_thinking, chat_params.grammar.size(),
+        SRV_INF("Tool-call request: format=%s parse_tool_calls=%d thinking=%d messages=%zu tools=%zu grammar_len=%zu generation_prompt='%s' normalized_generation_prompt='%s'\n",
+            common_chat_format_name(chat_params.format), 1, inputs.enable_thinking, message_count, inputs.tools.size(), chat_params.grammar.size(),
             chat_params.generation_prompt.c_str(), normalized_generation_prompt.c_str());
     }
 
