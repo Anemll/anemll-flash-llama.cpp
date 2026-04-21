@@ -156,6 +156,37 @@ fi
 
 declare -a cmd
 
+cmd_has_flag() {
+    local needle=$1
+    local arg
+    for arg in "${cmd[@]}"; do
+        if [[ "$arg" == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_opt_value() {
+    local needle=$1
+    local arg
+    local take_next=0
+    local value=
+    for arg in "${cmd[@]}"; do
+        if [[ "$take_next" == 1 ]]; then
+            value=$arg
+            take_next=0
+            continue
+        fi
+        if [[ "$arg" == "$needle" ]]; then
+            take_next=1
+        fi
+    done
+    if [[ -n "$value" ]]; then
+        printf "%s" "$value"
+    fi
+}
+
 has_explicit_perf_args=0
 if [[ $# -gt 0 ]]; then
     for arg in "$@"; do
@@ -257,6 +288,40 @@ fi
 if [[ $# -gt 0 ]]; then
     cmd+=("$@")
 fi
+
+resolved_host=$(cmd_opt_value --host)
+resolved_port=$(cmd_opt_value --port)
+resolved_alias=$(cmd_opt_value --alias)
+resolved_ctx=$(cmd_opt_value -c)
+resolved_batch=$(cmd_opt_value -b)
+resolved_ubatch=$(cmd_opt_value -ub)
+resolved_topk=$(cmd_opt_value --moe-topk)
+resolved_slot_bank=$(cmd_opt_value --moe-slot-bank)
+resolved_cache_io_split=$(cmd_opt_value --moe-cache-io-split)
+resolved_temp=$(cmd_opt_value --temp)
+resolved_seed=$(cmd_opt_value --seed)
+resolved_prefill_batch=$(cmd_opt_value --moe-prefill-batch)
+resolved_prefill_micro_batch=$(cmd_opt_value --moe-prefill-micro-batch)
+resolved_prefill_io_split=$(cmd_opt_value --moe-prefill-io-split)
+resolved_prefill_banks=$(cmd_opt_value --moe-prefill-banks)
+resolved_perf=default
+if cmd_has_flag --perf; then
+    resolved_perf=on
+elif cmd_has_flag --no-perf; then
+    resolved_perf=off
+fi
+
+printf "resolved server settings:\n"
+printf "  host=%s port=%s alias=%s perf=%s\n" \
+    "${resolved_host:-<unset>}" "${resolved_port:-<unset>}" "${resolved_alias:-<none>}" "$resolved_perf"
+printf "  ctx=%s batch=%s ubatch=%s topk=%s slot_bank=%s cache_io_split=%s\n" \
+    "${resolved_ctx:-<unset>}" "${resolved_batch:-<unset>}" "${resolved_ubatch:-<unset>}" \
+    "${resolved_topk:-<unset>}" "${resolved_slot_bank:-<unset>}" "${resolved_cache_io_split:-<unset>}"
+printf "  prefill_batch=%s prefill_micro_batch=%s prefill_io_split=%s prefill_banks=%s\n" \
+    "${resolved_prefill_batch:-<unset>}" "${resolved_prefill_micro_batch:-<unset>}" \
+    "${resolved_prefill_io_split:-<unset>}" "${resolved_prefill_banks:-<unset>}"
+printf "  seed=%s temp=%s\n" \
+    "${resolved_seed:-<unset>}" "${resolved_temp:-<model-default>}"
 
 printf "running:"
 printf " %q" "${cmd[@]}"

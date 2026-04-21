@@ -905,34 +905,65 @@ long coding / tool-use sessions.
 for MiniMax on M5 Max 128. Drop to `--moe-prefill-banks 1` only for the
 guarded large-context startup probe or on memory-constrained machines.
 
-High memory use to improve decoding cache hit rate:
+High memory use to improve decoding cache hit rate, with prefill and M5 flash-attn
+optimizations enabled. On M5 Max 128GB this combines a 128-slot expert bank with
+the Metal4 non-vec flash-attention path (`NONVEC_M4_ENABLE=1`) and Morton walk
+order for better threadgroup locality during long-context prefill:
 
 ```bash
-HOST=0.0.0.0 \
-PORT=8080 \
-MODEL_ALIAS=minimax-m2 \
-MOE_TOPK=4 \
-MOE_SLOT_BANK=128 \
-MOE_CACHE_IO_SPLIT=8 \
-BATCH=4096 \
-UBATCH=16 \
-CTX=96000 \
-SEED=123 \
-TEMP=0.0 \
-bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
-  ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
-  -ctk q8_0 \
-  -ctv q8_0 \
-  --ctx-checkpoints 0 \
-  --checkpoint-every-n-tokens -1 \
-  --no-warmup \
-  --moe-predict-top1-prev \
-  --moe-prefill-layer-major \
-  --moe-prefill-batch 4096 \
-  --moe-prefill-micro-batch auto \
-  --moe-prefill-io-split 8 \
-  --moe-prefill-banks 4
+env \
+  HOST=0.0.0.0 \
+  PORT=8080 \
+  MODEL_ALIAS=minimax-m2 \
+  MOE_TOPK=4 \
+  MOE_SLOT_BANK=128 \
+  MOE_CACHE_IO_SPLIT=8 \
+  BATCH=4096 \
+  UBATCH=16 \
+  CTX=96000 \
+  SEED=123 \
+  TEMP=0.1 \
+  GGML_METAL_FLASH_ATTN_NONVEC_M4_ENABLE=1 \
+  GGML_METAL_FLASH_ATTN_NONVEC_NSG=4 \
+  GGML_METAL_FLASH_ATTN_NONVEC_WALK=morton \
+  LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS=1 \
+  LLAMA_FLASH_MOE_PERF_PREFILL_LAYER_STATS=0 \
+  FLASHMOE_SERVER_PERF=1 \
+  ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+    ~/Models/MiniMax-M2.7-GGUF/UD-Q4_K_XL-Flash \
+    --ctx-checkpoints 0 \
+    --checkpoint-every-n-tokens -1 \
+    --no-warmup \
+    --moe-predict-top1-prev \
+    --moe-prefill-layer-major \
+    --moe-prefill-batch 16384 \
+    --moe-prefill-micro-batch auto \
+    --moe-prefill-io-split 8 \
+    --moe-prefill-banks 4
 ```
+
+Flash-attention tunables used above (M5-only; silently ignored on M3/M4):
+
+- `GGML_METAL_FLASH_ATTN_NONVEC_M4_ENABLE=1` — route the non-vec (prefill)
+  flash-attention QK matmul through the Metal 4 tensor-ops path. Requires
+  `dk=dv=128` and matching K/V dtype (f16 or f32).
+- `GGML_METAL_FLASH_ATTN_NONVEC_NSG=4` — simdgroups per threadgroup for the
+  non-vec kernel (valid: 1, 2, 4, 8). 4 is the default for `dk < 512`; pinning
+  it here keeps the shader variant stable across runs.
+- `GGML_METAL_FLASH_ATTN_NONVEC_WALK=morton` — Morton-order threadgroup
+  dispatch (alternatives: `legacy`, `regular`). Morton improves L2 locality for
+  long-context prefill where many Q blocks share KV tiles.
+
+Related knobs not set above but useful to know:
+
+- `GGML_METAL_FLASH_ATTN_NONVEC_2PASS_ENABLE=1` (default on) — enables the
+  split-K 2-pass reduction. Kicks in automatically when `kv ≥ 16384`; override
+  `nwg` with `GGML_METAL_FLASH_ATTN_NONVEC_2PASS_NWG=1|2|4|8`.
+- `GGML_METAL_FLASH_ATTN_VEC_M4_ENABLE=1` — Metal4 path for the vec (decode)
+  kernel. Decode is already fast on M5; enable only when benchmarking.
+- `GGML_METAL_FLASH_ATTN_DEBUG=1` — stderr one-shot log of every unique
+  flash-attn shape/path combination encountered. Use for verifying the Metal4
+  path is actually being taken.
 
 ### Adding the server to `~/.factory/settings.json`
 

@@ -218,9 +218,23 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_bias,
         bool    has_scap,
         bool    has_kvpad,
-        int32_t nsg);
+        bool    use_metal4_qk,
+        int32_t nsg,
+        int32_t walk_mode,
+        int32_t nwg);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        bool    has_mask,
+        bool    has_sinks,
+        bool    has_bias,
+        bool    has_scap,
+        bool    has_kvpad,
+        int32_t nsg,
+        int32_t nwg);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_metal4(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         bool    has_mask,

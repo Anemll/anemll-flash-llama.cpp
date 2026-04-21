@@ -13,12 +13,14 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 constexpr uint32_t GGML_METAL_RESOURCE_USAGE_READ  = 1u;
@@ -57,6 +59,397 @@ static int16_t ggml_metal_mul_mm_env_walk_mode() {
     }
 
     return walk;
+}
+
+static int16_t ggml_metal_flash_attn_nonvec_env_walk_mode() {
+    static int16_t walk = -1;
+    if (walk != -1) {
+        return walk;
+    }
+
+    walk = GGML_METAL_MUL_MM_WALK_LEGACY;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_WALK");
+    if (value == nullptr || value[0] == '\0') {
+        return walk;
+    }
+
+    if (std::strcmp(value, "legacy") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_LEGACY;
+    } else if (std::strcmp(value, "regular") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_REGULAR;
+    } else if (std::strcmp(value, "morton") == 0) {
+        walk = GGML_METAL_MUL_MM_WALK_MORTON;
+    } else {
+        std::fprintf(stderr,
+                "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_WALK=%s (supported: legacy, regular, morton)\n",
+                __func__,
+                value);
+        std::fflush(stderr);
+    }
+
+    return walk;
+}
+
+static bool ggml_metal_flash_attn_vec_metal4_env_enabled() {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_VEC_M4_ENABLE");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = std::strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static bool ggml_metal_flash_attn_nonvec_metal4_env_enabled() {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_M4_ENABLE");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = std::strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static bool ggml_metal_flash_attn_nonvec_2pass_env_enabled() {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 1;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_2PASS_ENABLE");
+    if (value == nullptr || value[0] == '\0') {
+        return true;
+    }
+
+    enabled = std::strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static bool ggml_metal_flash_attn_debug_enabled() {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_DEBUG");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = std::strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static int ggml_metal_flash_attn_nonvec_nsg_env_override() {
+    static int override_nsg = -2;
+    if (override_nsg != -2) {
+        return override_nsg;
+    }
+
+    override_nsg = -1;
+
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_NSG");
+    if (value == nullptr || value[0] == '\0') {
+        return override_nsg;
+    }
+
+    const int parsed = std::atoi(value);
+    switch (parsed) {
+        case 1:
+        case 2:
+        case 4:
+        case 8:
+            override_nsg = parsed;
+            break;
+        default:
+            std::fprintf(stderr,
+                    "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_NSG=%s (supported: 1,2,4,8)\n",
+                    __func__,
+                    value);
+            std::fflush(stderr);
+            break;
+    }
+
+    return override_nsg;
+}
+
+static int ggml_metal_flash_attn_nonvec_nwg_env_override() {
+    static int override_nwg = -2;
+    if (override_nwg != -2) {
+        return override_nwg;
+    }
+
+    override_nwg = -1;
+
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_2PASS_NWG");
+    if (value == nullptr || value[0] == '\0') {
+        return override_nwg;
+    }
+
+    const int parsed = std::atoi(value);
+    switch (parsed) {
+        case 1:
+        case 2:
+        case 4:
+        case 8:
+            override_nwg = parsed;
+            break;
+        default:
+            std::fprintf(stderr,
+                    "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_2PASS_NWG=%s (supported: 1,2,4,8)\n",
+                    __func__,
+                    value);
+            std::fflush(stderr);
+            break;
+    }
+
+    return override_nwg;
+}
+
+static bool ggml_metal_flash_attn_vec_metal4_supported_type(enum ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16;
+}
+
+static bool ggml_metal_flash_attn_nonvec_metal4_supported_type(enum ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32;
+}
+
+static bool ggml_metal_flash_attn_nonvec_2pass_supported_type(enum ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16;
+}
+
+static bool ggml_metal_is_token_char(char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z');
+}
+
+static bool ggml_metal_text_contains_token(const char * text, const char * token) {
+    if (text == nullptr || text[0] == '\0' || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    const size_t token_len = std::strlen(token);
+    const char * pos = text;
+
+    while ((pos = std::strstr(pos, token)) != nullptr) {
+        const char prev = pos == text ? '\0' : pos[-1];
+        const char next = pos[token_len];
+        if (!ggml_metal_is_token_char(prev) && !ggml_metal_is_token_char(next)) {
+            return true;
+        }
+        pos += token_len;
+    }
+
+    return false;
+}
+
+static bool ggml_metal_device_name_contains_token(
+        const ggml_metal_device_props * props_dev,
+        const char * token) {
+    if (props_dev == nullptr) {
+        return false;
+    }
+
+    return ggml_metal_text_contains_token(props_dev->name, token) ||
+           ggml_metal_text_contains_token(props_dev->desc, token);
+}
+
+static int32_t ggml_metal_flash_attn_nonvec_nwg(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr) {
+        return 1;
+    }
+
+    if (!ggml_metal_flash_attn_nonvec_2pass_env_enabled()) {
+        return 1;
+    }
+
+    if ((op->src[0]->ne[1] < 20) && (op->src[0]->ne[0] % 32 == 0)) {
+        return 1;
+    }
+
+    if (op->src[0]->ne[1] <= 1) {
+        return 1;
+    }
+
+    if (op->src[1]->ne[1] < 16384) {
+        return 1;
+    }
+
+    if (op->src[1]->type != op->src[2]->type) {
+        return 1;
+    }
+
+    if (!ggml_metal_flash_attn_nonvec_2pass_supported_type(op->src[1]->type)) {
+        return 1;
+    }
+
+    const int override_nwg = ggml_metal_flash_attn_nonvec_nwg_env_override();
+    if (override_nwg > 0) {
+        return override_nwg;
+    }
+
+    const int64_t kv = op->src[1]->ne[1];
+
+    if (kv > 32768) {
+        return 8;
+    }
+
+    return 4;
+}
+
+static bool ggml_metal_flash_attn_vec_use_metal4(
+        const ggml_metal_device_props * props_dev,
+        const ggml_tensor * op) {
+    if (props_dev == nullptr || op == nullptr || !props_dev->has_tensor) {
+        return false;
+    }
+
+    if (!ggml_metal_flash_attn_vec_metal4_env_enabled()) {
+        return false;
+    }
+
+    if (!ggml_metal_device_name_contains_token(props_dev, "M5")) {
+        return false;
+    }
+
+    if (op->src[1] == nullptr || op->src[2] == nullptr) {
+        return false;
+    }
+
+    if (op->src[1]->type != op->src[2]->type) {
+        return false;
+    }
+
+    if (!ggml_metal_flash_attn_vec_metal4_supported_type(op->src[1]->type)) {
+        return false;
+    }
+
+    return op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
+}
+
+static bool ggml_metal_flash_attn_nonvec_use_metal4(
+        const ggml_metal_device_props * props_dev,
+        const ggml_tensor * op) {
+    if (props_dev == nullptr || op == nullptr || !props_dev->has_tensor) {
+        return false;
+    }
+
+    if (!ggml_metal_flash_attn_nonvec_metal4_env_enabled()) {
+        return false;
+    }
+
+    if (!ggml_metal_device_name_contains_token(props_dev, "M5")) {
+        return false;
+    }
+
+    if (op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr) {
+        return false;
+    }
+
+    if (op->src[1]->type != op->src[2]->type) {
+        return false;
+    }
+
+    if (!ggml_metal_flash_attn_nonvec_metal4_supported_type(op->src[1]->type)) {
+        return false;
+    }
+
+    return op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
+}
+
+static const char * ggml_metal_walk_mode_name(int32_t walk_mode) {
+    switch (walk_mode) {
+        case GGML_METAL_MUL_MM_WALK_REGULAR: return "regular";
+        case GGML_METAL_MUL_MM_WALK_MORTON:  return "morton";
+        case GGML_METAL_MUL_MM_WALK_LEGACY:
+        default: return "legacy";
+    }
+}
+
+static void ggml_metal_flash_attn_log_path_once(
+        const ggml_tensor * op,
+        bool is_vec,
+        bool use_metal4_sdpa,
+        bool has_mask,
+        bool has_bias,
+        bool has_scap,
+        bool has_kvpad,
+        int32_t nsg,
+        int32_t walk_mode,
+        int32_t nwg) {
+    if (!ggml_metal_flash_attn_debug_enabled() || op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr) {
+        return;
+    }
+
+    const int32_t q  = int32_t(op->src[0]->ne[1]);
+    const int32_t kv = int32_t(op->src[1]->ne[1]);
+    const int32_t dk = int32_t(op->src[1]->ne[0]);
+    const int32_t dv = int32_t(op->src[2]->ne[0]);
+    const char * phase = q <= 1 ? "decode-like" : "prefill-like";
+    const char * qt = ggml_type_name(op->src[0]->type);
+    const char * kt = ggml_type_name(op->src[1]->type);
+    const char * vt = ggml_type_name(op->src[2]->type);
+
+    char key[256];
+    std::snprintf(
+            key, sizeof(key),
+            "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+            is_vec ? 1 : 0,
+            use_metal4_sdpa ? 1 : 0,
+            q, kv, dk, dv,
+            has_mask ? 1 : 0,
+            has_bias ? 1 : 0,
+            has_scap ? 1 : 0,
+            nsg,
+            walk_mode,
+            nwg);
+
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> seen;
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!seen.emplace(key, true).second) {
+            return;
+        }
+    }
+
+    std::fprintf(
+            stderr,
+            "%s: path=%s%s%s phase=%s q=%d kv=%d dk=%d dv=%d nsg=%d nwg=%d walk=%s mask=%s bias=%s scap=%s kvpad=%s\n",
+            __func__,
+            is_vec ? "vec" : "non-vec",
+            nwg > 1 ? "+2pass" : "",
+            use_metal4_sdpa ? "+metal4" : "",
+            phase,
+            q,
+            kv,
+            dk,
+            dv,
+            nsg,
+            nwg,
+            ggml_metal_walk_mode_name(walk_mode),
+            has_mask ? "yes" : "no",
+            has_bias ? "yes" : "no",
+            has_scap ? "yes" : "no",
+            has_kvpad ? "yes" : "no");
+    std::fprintf(stderr, "%s: tensor types q=%s k=%s v=%s\n", __func__, qt, kt, vt);
+    std::fflush(stderr);
 }
 
 static int32_t ggml_metal_mul_mm_dispatch_extent_morton(int32_t tiles_x, int32_t tiles_y) {
@@ -1036,8 +1429,7 @@ static bool ggml_metal_mul_mat_use_m5_expert_pipeline(
         return false;
     }
 
-    if (strstr(props_dev->name, "M5") == nullptr &&
-        strstr(props_dev->desc, "M5") == nullptr) {
+    if (!ggml_metal_device_name_contains_token(props_dev, "M5")) {
         return false;
     }
 
@@ -4603,6 +4995,13 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
         res += ggml_type_size(GGML_TYPE_F32)*(ne01_max*ne02*ne03*nwg*(ne20 + 2));
     }
 
+    const int32_t nonvec_nwg = ggml_metal_flash_attn_nonvec_nwg(op);
+    if (nonvec_nwg > 1) {
+        const int64_t nrows = (int64_t) op->ne[1]*op->ne[2]*op->ne[3];
+        const size_t res_nonvec = ggml_type_size(GGML_TYPE_F32)*(nrows*nonvec_nwg*(ne20 + 2));
+        res = std::max(res, res_nonvec);
+    }
+
     return res;
 }
 
@@ -4692,6 +5091,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         bool need_sync = false;
 
         const bool has_kvpad = ne11 % ncpsg != 0;
+        const bool use_metal4_qk = ggml_metal_flash_attn_nonvec_use_metal4(props_dev, op);
 
         if (has_kvpad) {
             assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
@@ -4765,6 +5165,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
 
         const int is_q = ggml_is_quantized(op->src[1]->type) ? 1 : 0;
+        const int needs_k_scratch = (is_q || use_metal4_qk) ? 1 : 0;
+        const int32_t walk_mode = ggml_metal_flash_attn_nonvec_env_walk_mode();
 
         // 2*(2*ncpsg)
         // ncpsg soft_max values + ncpsg mask values
@@ -4773,7 +5175,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // the shared memory needed for the simdgroups to load the KV cache
         // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
         //
-#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
+#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + needs_k_scratch*(16*32*(nsg)))*(sizeof(float)/2), 16))
 
         //int64_t nsgmax = 4;
         //
@@ -4792,8 +5194,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // simdgroups per threadgroup (a.k.a. warps)
         //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
         int32_t nsg = ne00 >= 512 ? 8 : 4;
+        const int env_nsg = ggml_metal_flash_attn_nonvec_nsg_env_override();
+        if (env_nsg > 0) {
+            nsg = env_nsg;
+        }
 
         const size_t smem = FATTN_SMEM(nsg);
+        GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
+        const int32_t nwg = ggml_metal_flash_attn_nonvec_nwg(op);
+
+        ggml_metal_flash_attn_log_path_once(op, false, use_metal4_qk, has_mask, has_bias, has_scap, has_kvpad, nsg, walk_mode, nwg);
 
         ggml_metal_kargs_flash_attn_ext args = {
             /*.ne01          =*/ ne01,
@@ -4830,7 +5241,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_metal4_qk, nsg, walk_mode, nwg);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4841,11 +5252,39 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
-        ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
+        ggml_metal_encoder_set_buffer  (enc, nwg > 1 ? bid_tmp : bid_dst,  8);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+        const int32_t q_blocks = (ne01 + nqptg - 1)/nqptg;
+        if (walk_mode == GGML_METAL_MUL_MM_WALK_REGULAR) {
+            ggml_metal_encoder_dispatch_threadgroups(enc, q_blocks*ne02, 1, ne03*nwg, 32, nsg, 1);
+        } else if (walk_mode == GGML_METAL_MUL_MM_WALK_MORTON) {
+            ggml_metal_encoder_dispatch_threadgroups(enc, ggml_metal_mul_mm_dispatch_extent_morton(q_blocks, ne02), 1, ne03*nwg, 32, nsg, 1);
+        } else {
+            ggml_metal_encoder_dispatch_threadgroups(enc, q_blocks, ne02, ne03*nwg, 32, nsg, 1);
+        }
+
+        if (nwg > 1) {
+            assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const int32_t nrows = ne1*ne2*ne3;
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
+                nrows,
+            };
+
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline0);
+            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+        }
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
@@ -4913,14 +5352,19 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+        const bool use_metal4_sdpa = ggml_metal_flash_attn_vec_use_metal4(props_dev, op);
+#define FATTN_SMEM(nsg)    (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+#define FATTN_SMEM_M4(nsg) (GGML_PAD(( GGML_PAD(ne00, 128) + (nsg)*(ncpsg*ne10 + 4*ncpsg + 2*GGML_PAD(ne20, 128)) )*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 
         // workgroups
         // each workgroup handles nsg*nkpsg cache values
         int32_t nwg = 1;
-        if (false) {
+        if (use_metal4_sdpa) {
+            nwg = 32;
+            nsg = 1;
+        } else if (false) {
             // for small KV caches, we could launch a single workgroup and write the results directly to dst/
             // however, this does not lead to significant improvement, so disabled
             nwg = 1;
@@ -4932,6 +5376,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 nsg *= 2;
             }
         }
+
+        ggml_metal_flash_attn_log_path_once(op, true, use_metal4_sdpa, has_mask, has_bias, has_scap, has_kvpad, 0, GGML_METAL_MUL_MM_WALK_LEGACY, nwg);
 
         ggml_metal_kargs_flash_attn_ext_vec args = {
             /*.ne01          =*/ ne01,
@@ -4968,7 +5414,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = use_metal4_sdpa
+                ? ggml_metal_library_get_pipeline_flash_attn_ext_vec_metal4(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg)
+                : ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4980,7 +5428,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
 
-        const size_t smem = FATTN_SMEM(nsg);
+        const size_t smem = use_metal4_sdpa ? FATTN_SMEM_M4(nsg) : FATTN_SMEM(nsg);
 
         //printf("smem: %zu, max: %zu, nsg = %d, nsgmax = %d\n", smem, props_dev->max_theadgroup_memory_size, (int) nsg, (int) nsgmax);
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -5031,6 +5479,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 #undef FATTN_SMEM
+#undef FATTN_SMEM_M4
     }
 
     return 1;

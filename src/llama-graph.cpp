@@ -12,11 +12,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <unordered_set>
 
 static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
@@ -26,6 +29,61 @@ static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
         enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
     }
     return enabled == 1;
+}
+
+static bool llama_flash_attn_debug_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("GGML_METAL_FLASH_ATTN_DEBUG");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static void llama_flash_attn_graph_log_once(
+        int q_tokens,
+        int kv_tokens,
+        int dk,
+        int dv,
+        bool v_trans,
+        bool has_mask,
+        bool has_sinks) {
+    if (!llama_flash_attn_debug_enabled()) {
+        return;
+    }
+
+    char key[256];
+    std::snprintf(
+            key, sizeof(key),
+            "%d|%d|%d|%d|%d|%d|%d",
+            q_tokens, kv_tokens, dk, dv,
+            v_trans ? 1 : 0,
+            has_mask ? 1 : 0,
+            has_sinks ? 1 : 0);
+
+    static std::mutex mu;
+    static std::unordered_set<std::string> seen;
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!seen.emplace(key).second) {
+            return;
+        }
+    }
+
+    std::fprintf(
+            stderr,
+            "%s: graph uses flash_attn_ext phase=%s q=%d kv=%d dk=%d dv=%d mask=%s sinks=%s v_trans=%s\n",
+            __func__,
+            q_tokens <= 1 ? "decode-like" : "prefill-like",
+            q_tokens,
+            kv_tokens,
+            dk,
+            dv,
+            has_mask ? "yes" : "no",
+            has_sinks ? "yes" : "no",
+            v_trans ? "yes" : "no");
+    std::fflush(stderr);
 }
 
 static void llama_moe_sort_decode_expert_ids_custom_op(
@@ -1997,6 +2055,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+
+        llama_flash_attn_graph_log_once(
+                int(q->ne[2]),
+                int(k->ne[2]),
+                int(k->ne[0]),
+                int(v->ne[0]),
+                v_trans,
+                kq_mask != nullptr,
+                sinks != nullptr);
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
