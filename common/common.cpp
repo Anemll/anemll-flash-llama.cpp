@@ -1429,10 +1429,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_prefetch_temporal = params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse;
     mparams.moe_prefetch_temporal_sparse = params.moe_prefetch_temporal_sparse;
     mparams.moe_prefill_layer_major = params.moe_prefill_layer_major;
+    mparams.moe_prefill_next_hot_exclusive_drives = params.moe_prefill_next_hot_exclusive_drives;
     mparams.moe_predict_prev_token = params.moe_predict_prev_token;
     mparams.moe_predict_top1_prev = params.moe_predict_top1_prev;
     mparams.moe_slot_bank      = params.moe_slot_bank;
     mparams.moe_prefill_banks  = params.moe_prefill_banks;
+    mparams.moe_prefill_next_hot_experts = params.moe_prefill_next_hot_experts;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
     mparams.moe_prefill_cache_io_split = params.moe_prefill_cache_io_split;

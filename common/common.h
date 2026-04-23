@@ -658,6 +658,7 @@ struct common_params {
     std::string oracle_dump           = "";      // llama-cli tensor oracle dump directory                       // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
     int32_t     moe_prefill_banks = 1;   // in-flight prefill expert staging banks / read-batch depth // NOLINT
+    int32_t     moe_prefill_next_hot_experts = 0; // prototype one-lookahead prefill hot-expert host staging // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
     int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
     int32_t     moe_prefill_cache_io_split = 0; // override split count for layer-major prefill reads  // NOLINT
@@ -667,6 +668,7 @@ struct common_params {
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
     bool        moe_prefetch_temporal_sparse = false; // alternate even/odd layer temporal prefetch   // NOLINT
     bool        moe_prefill_layer_major = false; // shared scratch-bank layer-major routed prefill    // NOLINT
+    bool        moe_prefill_next_hot_exclusive_drives = false; // pin prefill next-hot staging to secondary/tertiary sidecars // NOLINT
     bool        moe_predict_prev_token = false; // prev-token same-layer expert predictor              // NOLINT
     bool        moe_predict_top1_prev = false; // prev-token top-1 same-layer predictor               // NOLINT
     bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT

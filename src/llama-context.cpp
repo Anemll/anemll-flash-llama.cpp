@@ -70,6 +70,37 @@ static int32_t llama_moe_prefill_micro_batch_auto_for_tokens(int64_t prompt_toke
     return 160;
 }
 
+static void flash_moe_prepare_trace_output_path(const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    static std::mutex trace_paths_mutex;
+    static std::unordered_map<std::string, bool> prepared_paths;
+
+    std::lock_guard<std::mutex> lock(trace_paths_mutex);
+    if (!prepared_paths.emplace(path, true).second) {
+        return;
+    }
+
+    FILE * fp = std::fopen(path, "w");
+    if (fp == nullptr) {
+        throw std::runtime_error(format("failed to open Flash-MoE trace file '%s'", path));
+    }
+    std::fclose(fp);
+}
+
+static FILE * flash_moe_open_trace_output_file(const char * path) {
+    flash_moe_prepare_trace_output_path(path);
+
+    FILE * fp = std::fopen(path, "a");
+    if (fp == nullptr) {
+        throw std::runtime_error(format("failed to open Flash-MoE trace file '%s'", path));
+    }
+    std::setvbuf(fp, nullptr, _IOLBF, 0);
+    return fp;
+}
+
 static bool flash_moe_log_colors_enabled() {
     const char * value = std::getenv("LLAMA_LOG_COLORS");
     if (value != nullptr && value[0] != '\0') {
@@ -240,7 +271,11 @@ public:
             const llama_model & model,
             bool perf_profile,
             bool transient_shared_scratch = false,
-            int32_t prefill_micro_batch_tokens = 0)
+            int32_t prefill_micro_batch_tokens = 0,
+            const int64_t * overall_prompt_eval_us = nullptr,
+            const int32_t * overall_prompt_eval_tokens = nullptr,
+            const int64_t * overall_decode_eval_us = nullptr,
+            const int32_t * overall_decode_eval_tokens = nullptr)
             : model(model),
               slot_count(transient_shared_scratch ?
                       std::max<int32_t>(1, model.hparams.n_expert) :
@@ -254,10 +289,12 @@ public:
               predict_prev_token(!transient_shared_scratch && model.flash_moe_predict_prev_token_enabled()),
               predict_top1_prev(!transient_shared_scratch && model.flash_moe_predict_top1_prev_enabled()),
               secondary_sidecar_enabled(model.flash_moe_secondary_sidecar_enabled()),
+              tertiary_sidecar_enabled(model.flash_moe_tertiary_sidecar_enabled()),
               demand_stripe_enabled(model.flash_moe_demand_stripe_enabled()),
               demand_distribute_enabled(model.flash_moe_demand_distribute_enabled()),
               prefetch_stripe_enabled(!transient_shared_scratch && model.flash_moe_prefetch_stripe_enabled()),
-              prefetch_distribute_enabled(!transient_shared_scratch && model.flash_moe_prefetch_distribute_enabled()),
+              prefetch_distribute_enabled((!transient_shared_scratch || model.flash_moe_prefill_next_hot_experts() > 0) && model.flash_moe_prefetch_distribute_enabled()),
+              prefill_next_hot_exclusive_drives(transient_shared_scratch && model.flash_moe_prefill_next_hot_exclusive_drives_enabled()),
               perf_profile(perf_profile),
               async_slot_upload(async_slot_upload_enabled()),
               parallel_slot_reads(parallel_slot_reads_enabled()),
@@ -273,7 +310,19 @@ public:
               prefetch_stripe_weights(model.flash_moe_prefetch_stripe_weights()),
               prefetch_distribute_weights(model.flash_moe_prefetch_distribute_weights()),
               transient_shared_scratch(transient_shared_scratch),
-              prefill_micro_batch_tokens(prefill_micro_batch_tokens == -1 ? -1 : std::max<int32_t>(0, prefill_micro_batch_tokens)) {
+              prefill_micro_batch_tokens(prefill_micro_batch_tokens == -1 ? -1 : std::max<int32_t>(0, prefill_micro_batch_tokens)),
+              prefill_next_hot_prefetch_experts(transient_shared_scratch ? model.flash_moe_prefill_next_hot_experts() : 0),
+              overall_prompt_eval_us(overall_prompt_eval_us),
+              overall_prompt_eval_tokens(overall_prompt_eval_tokens),
+              overall_decode_eval_us(overall_decode_eval_us),
+              overall_decode_eval_tokens(overall_decode_eval_tokens) {
+        prefill_prefetch_stage_slots[0].launch_lane = source_lane::primary;
+        prefill_prefetch_stage_slots[0].lookahead = 1;
+        prefill_prefetch_stage_slots[1].launch_lane = source_lane::secondary;
+        prefill_prefetch_stage_slots[1].lookahead = 1;
+        prefill_prefetch_stage_slots[2].launch_lane = source_lane::tertiary;
+        prefill_prefetch_stage_slots[2].lookahead = 2;
+
         if (transient_shared_scratch) {
             if (model.flash_moe_prefill_stripe_enabled()) {
                 prefill_stripe_enabled = true;
@@ -290,19 +339,19 @@ public:
             }
         }
 
+        const bool oracle_replay_mode =
+                model.flash_moe_oracle_all_hit_enabled() ||
+                model.flash_moe_oracle_prefetch_enabled();
+
         if (!transient_shared_scratch && (oracle_all_hit || oracle_prefetch)) {
             const char * path = model.flash_moe_trace_file();
             if (path == nullptr || path[0] == '\0') {
                 throw std::runtime_error("Flash-MoE oracle replay mode requires a replay trace file");
             }
-        } else if (!transient_shared_scratch) {
+        } else if (!oracle_replay_mode) {
             const char * path = model.flash_moe_trace_file();
             if (path != nullptr && path[0] != '\0') {
-            trace_fp = std::fopen(path, "w");
-            if (trace_fp == nullptr) {
-                throw std::runtime_error(format("failed to open Flash-MoE trace file '%s'", path));
-            }
-            std::setvbuf(trace_fp, nullptr, _IOLBF, 0);
+                trace_fp = flash_moe_open_trace_output_file(path);
             }
         }
 
@@ -427,6 +476,12 @@ public:
     }
 
     ~llama_flash_moe_slot_runtime() override {
+        for (auto & slot : prefill_prefetch_stage_slots) {
+            if (slot.future.valid()) {
+                slot.future.wait();
+            }
+        }
+        harvest_ready_prefill_next_prefetch();
         stop_read_pool();
         for (auto & [_, uploader] : async_uploaders) {
             for (auto & buffer : uploader.buffers) {
@@ -684,12 +739,20 @@ private:
 
     struct prefill_selected_plan {
         std::vector<int32_t> unique_experts;
+        std::vector<int32_t> hot_experts;
         std::vector<int32_t> expert_ref_offsets;
         std::vector<int32_t> expert_ref_tokens;
         std::vector<float>   expert_ref_weights;
         int32_t max_refs_per_expert = 0;
         int32_t max_tokens_per_expert = 0;
     };
+
+    struct prefill_host_prefetch_expert {
+        int32_t expert = -1;
+        std::array<std::vector<uint8_t>, 3> family_bytes;
+    };
+
+    struct prefill_host_prefetch_stage;
 
     struct prefill_slot_load {
         int32_t expert = -1;
@@ -1085,6 +1148,13 @@ private:
         uint64_t overlap_experts = 0;
     };
 
+    struct prefill_host_prefetch_stage {
+        int32_t layer = -1;
+        std::vector<int32_t> predicted_experts;
+        std::vector<prefill_host_prefetch_expert> experts;
+        routed_metrics stats;
+    };
+
     struct resident_bank_file {
         std::vector<uint8_t> data;
     };
@@ -1115,6 +1185,14 @@ private:
         primary = 0,
         secondary = 1,
         tertiary = 2,
+    };
+
+    struct prefill_prefetch_stage_slot {
+        source_lane launch_lane = source_lane::primary;
+        int32_t lookahead = 0;
+        int32_t target_layer = -1;
+        std::future<std::shared_ptr<prefill_host_prefetch_stage>> future;
+        std::shared_ptr<prefill_host_prefetch_stage> ready;
     };
 
     struct mixed_slot_field {
@@ -1222,6 +1300,7 @@ private:
         std::vector<int32_t>  predicted_experts;
         std::vector<int32_t>  current_token_experts;
         std::vector<int32_t>  pending_prefill_selected_experts;
+        std::vector<int32_t>  prefill_last_hot_experts;
         int64_t pending_prefill_topk = 0;
         int64_t pending_prefill_tokens = 0;
         bool pending_prefill_valid = false;
@@ -1272,12 +1351,14 @@ private:
     bool predict_prev_token = false;
     bool predict_top1_prev = false;
     bool secondary_sidecar_enabled = false;
+    bool tertiary_sidecar_enabled = false;
     bool demand_stripe_enabled = false;
     bool demand_distribute_enabled = false;
     bool prefill_stripe_enabled = false;
     bool prefill_distribute_enabled = false;
     bool prefetch_stripe_enabled = false;
     bool prefetch_distribute_enabled = false;
+    bool prefill_next_hot_exclusive_drives = false;
     bool perf_profile = false;
     bool async_slot_upload = false;
     bool parallel_slot_reads = false;
@@ -1292,6 +1373,11 @@ private:
     std::array<int32_t, 3> prefetch_distribute_weights = { 1, 0, 0 };
     bool transient_shared_scratch = false;
     int32_t prefill_micro_batch_tokens = 0;
+    int32_t prefill_next_hot_prefetch_experts = 0;
+    const int64_t * overall_prompt_eval_us = nullptr;
+    const int32_t * overall_prompt_eval_tokens = nullptr;
+    const int64_t * overall_decode_eval_us = nullptr;
+    const int32_t * overall_decode_eval_tokens = nullptr;
     bool transient_activation_logged = false;
     bool prefill_inline_progress_active = false;
     int32_t prefill_inline_total_layers = 0;
@@ -1307,8 +1393,10 @@ private:
     routed_metrics resident_prime_stats;
     routed_metrics prefetch_stats;
     routed_metrics predictor_prefetch_stats;
+    routed_metrics prefill_next_prefetch_stats;
     routed_metrics oracle_prime_stats;
     predictor_metrics predictor_stats;
+    predictor_metrics prefill_next_predictor_stats;
     std::vector<native_slot_map_userdata> native_slot_map_ud;
     std::vector<prefill_moe_userdata> prefill_moe_ud;
     std::vector<layer_state> layers;
@@ -1325,6 +1413,7 @@ private:
     std::vector<std::pair<int32_t, int32_t>> loads;
     std::vector<uint8_t> staging;
     std::vector<oracle_record> oracle_records;
+    std::array<prefill_prefetch_stage_slot, 3> prefill_prefetch_stage_slots;
     size_t oracle_cursor = 0;
     FILE * trace_fp = nullptr;
     uint64_t trace_seq = 0;
@@ -1348,8 +1437,55 @@ private:
         return -1;
     }
 
+    int32_t next_dedicated_prefill_layer(int32_t layer) const {
+        for (size_t next = size_t(layer + 1); next < layers.size(); ++next) {
+            if (uses_dedicated_prefill_moe((int) next)) {
+                return (int32_t) next;
+            }
+        }
+        return -1;
+    }
+
+    int32_t nth_dedicated_prefill_layer(int32_t layer, int32_t lookahead) const {
+        int32_t current = layer;
+        for (int32_t depth = 0; depth < lookahead; ++depth) {
+            current = next_dedicated_prefill_layer(current);
+            if (current < 0) {
+                return -1;
+            }
+        }
+        return current;
+    }
+
+    prefill_prefetch_stage_slot * prefill_stage_slot_for_lane(source_lane lane) {
+        for (auto & slot : prefill_prefetch_stage_slots) {
+            if (slot.launch_lane == lane) {
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    bool prefill_stage_exists_for_layer(int32_t layer) const {
+        for (const auto & slot : prefill_prefetch_stage_slots) {
+            if (slot.target_layer == layer) {
+                return true;
+            }
+            if (slot.ready != nullptr && slot.ready->layer == layer) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void prefill_inline_progress_begin_if_needed(int layer, int64_t n_tokens, int64_t micro_batch_tokens, bool micro_batch_auto) {
         if (!transient_shared_scratch || !perf_profile || !flash_moe_prefill_inline_progress_enabled()) {
+            return;
+        }
+
+        // The empty-run warmup drives a tiny routed prefill (typically 2 tokens)
+        // that only adds terminal noise and does not provide useful progress signal.
+        if (n_tokens <= 2) {
             return;
         }
 
@@ -1550,18 +1686,21 @@ private:
             int64_t n_tokens) const {
         prefill_selected_plan plan;
         std::vector<int32_t> expert_counts(expert_count, 0);
+        std::vector<float> expert_weight_sums(expert_count, 0.0f);
         std::vector<int32_t> expert_to_index(expert_count, -1);
 
         GGML_ASSERT(selected_experts.size() == size_t(topk * n_tokens));
         GGML_ASSERT(weights.size() == size_t(topk * n_tokens));
 
-        for (const int32_t expert : selected_experts) {
+        for (size_t flat_idx = 0; flat_idx < selected_experts.size(); ++flat_idx) {
+            const int32_t expert = selected_experts[flat_idx];
             if (expert < 0 || expert >= expert_count) {
                 throw std::runtime_error(format(
                         "Flash-MoE expert id %d is out of range for dedicated prefill MoE with %d experts",
                         expert, expert_count));
             }
             expert_counts[expert]++;
+            expert_weight_sums[expert] += weights[flat_idx];
         }
 
         plan.unique_experts.reserve(selected_experts.size());
@@ -1570,6 +1709,17 @@ private:
                 plan.unique_experts.push_back(expert);
             }
         }
+        plan.hot_experts = plan.unique_experts;
+        std::sort(plan.hot_experts.begin(), plan.hot_experts.end(),
+                [&](const int32_t & lhs, const int32_t & rhs) {
+                    if (expert_counts[lhs] != expert_counts[rhs]) {
+                        return expert_counts[lhs] > expert_counts[rhs];
+                    }
+                    if (expert_weight_sums[lhs] != expert_weight_sums[rhs]) {
+                        return expert_weight_sums[lhs] > expert_weight_sums[rhs];
+                    }
+                    return lhs < rhs;
+                });
 
         const auto * order_entry =
                 state.down_entry != nullptr ? state.down_entry :
@@ -1805,6 +1955,18 @@ private:
                 weights_host,
                 topk,
                 n_tokens);
+        state.prefill_last_hot_experts = plan.hot_experts;
+        auto active_prefetch_stage = take_prefill_next_prefetch_stage(layer);
+        if (active_prefetch_stage != nullptr) {
+            prefill_next_predictor_stats.layer_calls++;
+            prefill_next_predictor_stats.predicted_experts += active_prefetch_stage->predicted_experts.size();
+            prefill_next_predictor_stats.actual_experts += plan.unique_experts.size();
+            prefill_next_predictor_stats.overlap_experts += count_overlap_experts(
+                    active_prefetch_stage->predicted_experts,
+                    plan.unique_experts);
+        }
+        launch_prefill_next_hot_prefetch(layer);
+        write_trace_record(layer, topk, n_tokens, state.pending_prefill_selected_experts, nullptr);
         state.pending_prefill_valid = false;
         reset_transient_layer_state(state);
         local_stats.unique_experts = plan.unique_experts.size();
@@ -2130,12 +2292,48 @@ private:
                 use_gate_up_merged ? state.tertiary_down_entry : state.tertiary_up_entry,
                 use_gate_up_merged ? nullptr : state.tertiary_down_entry,
             };
+            std::vector<int32_t> staged_expert_to_index(expert_count, -1);
+            if (active_prefetch_stage != nullptr) {
+                for (size_t idx = 0; idx < active_prefetch_stage->experts.size(); ++idx) {
+                    const int32_t expert = active_prefetch_stage->experts[idx].expert;
+                    if (expert >= 0 && expert < expert_count) {
+                        staged_expert_to_index[expert] = int32_t(idx);
+                    }
+                }
+            }
+            std::vector<int32_t> expert_to_plan_index(expert_count, -1);
+            for (size_t idx = 0; idx < plan.unique_experts.size(); ++idx) {
+                expert_to_plan_index[plan.unique_experts[idx]] = int32_t(idx);
+            }
+            std::vector<size_t> processing_order;
+            processing_order.reserve(plan.unique_experts.size());
+            std::vector<bool> process_seen(plan.unique_experts.size(), false);
+            if (active_prefetch_stage != nullptr) {
+                for (const int32_t expert : active_prefetch_stage->predicted_experts) {
+                    if (expert < 0 || expert >= expert_count) {
+                        continue;
+                    }
+                    const int32_t plan_index = expert_to_plan_index[expert];
+                    if (plan_index >= 0) {
+                        processing_order.push_back(size_t(plan_index));
+                        process_seen[size_t(plan_index)] = true;
+                    }
+                }
+            }
+            for (size_t idx = 0; idx < plan.unique_experts.size(); ++idx) {
+                if (process_seen[idx]) {
+                    continue;
+                }
+                processing_order.push_back(idx);
+                process_seen[idx] = true;
+            }
 
             struct prefill_ready_expert {
                 size_t expert_index = 0;
                 int32_t expert = -1;
                 source_lane lane = source_lane::primary;
                 bool miss = false;
+                bool host_prefetched = false;
                 std::array<std::vector<uint8_t>, 3> family_bytes;
                 std::array<install_metrics, 3> family_metrics = {};
                 std::array<ssize_t, 3> family_total_read = { 0, 0, 0 };
@@ -2156,24 +2354,37 @@ private:
 
             auto load_prefill_batch = [&](size_t start_index) -> prefill_batch_result {
                 prefill_batch_result batch;
-                if (start_index >= plan.unique_experts.size()) {
+                if (start_index >= processing_order.size()) {
                     return batch;
                 }
 
-                const size_t end_index = std::min(plan.unique_experts.size(), start_index + prefill_bank_depth);
+                const size_t end_index = std::min(processing_order.size(), start_index + prefill_bank_depth);
                 batch.experts.reserve(end_index - start_index);
 
-                for (size_t expert_index = start_index; expert_index < end_index; ++expert_index) {
+                for (size_t order_index = start_index; order_index < end_index; ++order_index) {
+                    const size_t expert_index = processing_order[order_index];
                     prefill_ready_expert loaded;
                     loaded.expert_index = expert_index;
                     loaded.expert = plan.unique_experts[expert_index];
                     loaded.lane = expert_lanes[expert_index];
                     loaded.miss = expert_reservations[expert_index].miss;
                     if (loaded.miss) {
-                        for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
-                            const auto * primary_entry = primary_entries[family_index];
-                            if (primary_entry != nullptr) {
-                                loaded.family_bytes[family_index].resize(primary_entry->bytes_per_expert);
+                        const int32_t staged_index =
+                                loaded.expert >= 0 && loaded.expert < expert_count ?
+                                        staged_expert_to_index[loaded.expert] :
+                                        -1;
+                        if (staged_index >= 0 && active_prefetch_stage != nullptr) {
+                            loaded.host_prefetched = true;
+                            const auto & staged_expert = active_prefetch_stage->experts[size_t(staged_index)];
+                            for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
+                                loaded.family_bytes[family_index] = staged_expert.family_bytes[family_index];
+                            }
+                        } else {
+                            for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
+                                const auto * primary_entry = primary_entries[family_index];
+                                if (primary_entry != nullptr) {
+                                    loaded.family_bytes[family_index].resize(primary_entry->bytes_per_expert);
+                                }
                             }
                         }
                     }
@@ -2198,7 +2409,7 @@ private:
 
                 if (!use_combined_tasks) {
                     for (auto & loaded : batch.experts) {
-                        if (!loaded.miss) {
+                        if (!loaded.miss || loaded.host_prefetched) {
                             continue;
                         }
 
@@ -2281,7 +2492,7 @@ private:
 
                 for (size_t batch_index = 0; batch_index < batch.experts.size(); ++batch_index) {
                     auto & loaded = batch.experts[batch_index];
-                    if (!loaded.miss) {
+                    if (!loaded.miss || loaded.host_prefetched) {
                         continue;
                     }
 
@@ -2426,7 +2637,7 @@ private:
                 }
 
                 for (auto & loaded : batch.experts) {
-                    if (!loaded.miss) {
+                    if (!loaded.miss || loaded.host_prefetched) {
                         continue;
                     }
 
@@ -2471,7 +2682,7 @@ private:
 
             while (!current_batch.experts.empty()) {
                 std::future<prefill_batch_result> next_batch_future;
-                if (next_batch_start < plan.unique_experts.size()) {
+                if (next_batch_start < processing_order.size()) {
                     const size_t async_start = next_batch_start;
                     next_batch_future = std::async(std::launch::async, [&, async_start]() {
                         return load_prefill_batch(async_start);
@@ -3026,6 +3237,9 @@ private:
         const bool use_colors = flash_moe_log_colors_enabled();
         const char * ansi_reset = use_colors ? "\033[0m" : "";
         const char * ansi_label = use_colors ? "\033[1m\x1b[38;5;39m" : "";
+        const char * ansi_data = use_colors ? "\033[1m\x1b[38;5;196m" : "";
+        const char * ansi_compute = use_colors ? "\033[1m\x1b[38;5;226m" : "";
+        const char * ansi_balanced = use_colors ? "\033[1m\x1b[38;5;82m" : "";
         const char * ansi_slot_hit = use_colors ? "\033[1m\x1b[38;5;82m" : "";
         const char * ansi_replay_hit = use_colors ? "\033[1m\x1b[38;5;214m" : "";
 
@@ -3045,8 +3259,16 @@ private:
                     __func__, ansi_label, ansi_reset, ansi_slot_hit, refs_per_expert, ansi_reset);
             LLAMA_LOG_INFO("%s:   %sprefill source overlap:%s %.2fx task/wall\n",
                     __func__, ansi_label, ansi_reset, io_parallelism);
-            LLAMA_LOG_INFO("%s:   %sprefill read bandwidth:%s wall=%.2f GB/s task=%.2f GB/s\n",
-                    __func__, ansi_label, ansi_reset, read_bw_wall_gbps, read_bw_task_gbps);
+            LLAMA_LOG_INFO("%s:   %sprefill read bandwidth:%s wall=%s%.2f GB/s%s task=%s%.2f GB/s%s\n",
+                    __func__,
+                    ansi_label,
+                    ansi_reset,
+                    ansi_balanced,
+                    read_bw_wall_gbps,
+                    ansi_reset,
+                    ansi_balanced,
+                    read_bw_task_gbps,
+                    ansi_reset);
             const int64_t prefill_data_us =
                     source_accounted_us + total.prefill_stage_us + total.prefill_replay_us + total.upload_us;
             const int64_t prefill_compute_total_us =
@@ -3055,21 +3277,118 @@ private:
                     prefill_data_us > prefill_compute_total_us * 11 / 10 ? "data" :
                     prefill_compute_total_us > prefill_data_us * 11 / 10 ? "compute" :
                     "balanced";
-            LLAMA_LOG_INFO("%s:   %sprefill pacing:%s data=%.3f ms (read=%.3f stage=%.3f replay=%.3f upload=%.3f) compute=%.3f ms setup=%.3f ms bottleneck=%s\n",
+            const char * bottleneck_color =
+                    std::strcmp(bottleneck, "data") == 0 ? ansi_data :
+                    std::strcmp(bottleneck, "compute") == 0 ? ansi_compute :
+                    ansi_balanced;
+            const double routed_prefill_ms = breakdown_total_us / 1000.0;
+            const bool have_overall_prefill =
+                    overall_prompt_eval_us != nullptr &&
+                    overall_prompt_eval_tokens != nullptr &&
+                    *overall_prompt_eval_us > 0;
+            const double overall_prefill_ms = have_overall_prefill ?
+                    (double(*overall_prompt_eval_us) / 1000.0) :
+                    routed_prefill_ms;
+            const uint64_t overall_prefill_tokens = have_overall_prefill ?
+                    uint64_t(std::max(0, *overall_prompt_eval_tokens)) :
+                    uint64_t(std::llround(token_estimate));
+            const double prefill_tps =
+                    overall_prefill_ms > 0.0 && overall_prefill_tokens > 0 ?
+                    (1000.0 * double(overall_prefill_tokens) / overall_prefill_ms) : 0.0;
+            const double dense_prefill_ms =
+                    have_overall_prefill ? std::max(0.0, overall_prefill_ms - routed_prefill_ms) : 0.0;
+            const double routed_prefill_pct =
+                    have_overall_prefill && overall_prefill_ms > 0.0 ? 100.0 * std::min(overall_prefill_ms, routed_prefill_ms) / overall_prefill_ms : 0.0;
+            const double dense_prefill_pct =
+                    have_overall_prefill && overall_prefill_ms > 0.0 ? 100.0 * dense_prefill_ms / overall_prefill_ms : 0.0;
+            LLAMA_LOG_INFO("%s:   %sprefill pacing:%s %sdata%s=%.3f ms (read=%.3f stage=%.3f replay=%.3f upload=%.3f) %scompute%s=%.3f ms setup=%.3f ms\n",
                     __func__,
                     ansi_label,
+                    ansi_reset,
+                    ansi_data,
                     ansi_reset,
                     prefill_data_us / 1000.0,
                     source_accounted_us / 1000.0,
                     total.prefill_stage_us / 1000.0,
                     total.prefill_replay_us / 1000.0,
                     total.upload_us / 1000.0,
+                    ansi_compute,
+                    ansi_reset,
                     total.prefill_compute_us / 1000.0,
-                    total.prefill_setup_us / 1000.0,
-                    bottleneck);
+                    total.prefill_setup_us / 1000.0);
+            LLAMA_LOG_INFO("%s:   %sbottleneck:%s %s%s%s\n",
+                    __func__,
+                    ansi_label,
+                    ansi_reset,
+                    bottleneck_color,
+                    bottleneck,
+                    ansi_reset);
+            LLAMA_LOG_INFO("%s:   %sprefill:%s %.1f t/s, %stokens:%s %" PRIu64 "\n",
+                    __func__,
+                    ansi_label,
+                    ansi_reset,
+                    prefill_tps,
+                    ansi_label,
+                    ansi_reset,
+                    overall_prefill_tokens);
+            if (have_overall_prefill) {
+                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s %.3f ms (%.1f%%), %srouted MoE:%s %.3f ms (%.1f%%)\n",
+                        __func__,
+                        ansi_label,
+                        ansi_reset,
+                        dense_prefill_ms,
+                        dense_prefill_pct,
+                        ansi_label,
+                        ansi_reset,
+                        routed_prefill_ms,
+                        routed_prefill_pct);
+            } else {
+                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s unavailable, %srouted MoE:%s %.3f ms\n",
+                        __func__,
+                        ansi_label,
+                        ansi_reset,
+                        ansi_label,
+                        ansi_reset,
+                        routed_prefill_ms);
+            }
         } else {
             LLAMA_LOG_INFO("%s:   %sslot-bank cached expert hit rate:%s %s%.1f%%%s\n",
                     __func__, ansi_label, ansi_reset, ansi_slot_hit, hit_pct, ansi_reset);
+            const double routed_decode_ms = total.total_us / 1000.0;
+            const bool have_overall_decode =
+                    overall_decode_eval_us != nullptr &&
+                    overall_decode_eval_tokens != nullptr &&
+                    *overall_decode_eval_us > 0 &&
+                    *overall_decode_eval_tokens > 0;
+            const double overall_decode_ms = have_overall_decode ?
+                    (double(*overall_decode_eval_us) / 1000.0) :
+                    routed_decode_ms;
+            const double dense_decode_ms =
+                    have_overall_decode ? std::max(0.0, overall_decode_ms - routed_decode_ms) : 0.0;
+            const double routed_decode_pct =
+                    have_overall_decode && overall_decode_ms > 0.0 ? 100.0 * std::min(overall_decode_ms, routed_decode_ms) / overall_decode_ms : 0.0;
+            const double dense_decode_pct =
+                    have_overall_decode && overall_decode_ms > 0.0 ? 100.0 * dense_decode_ms / overall_decode_ms : 0.0;
+            if (have_overall_decode) {
+                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s %.3f ms (%.1f%%), %srouted MoE:%s %.3f ms (%.1f%%)\n",
+                        __func__,
+                        ansi_label,
+                        ansi_reset,
+                        dense_decode_ms,
+                        dense_decode_pct,
+                        ansi_label,
+                        ansi_reset,
+                        routed_decode_ms,
+                        routed_decode_pct);
+            } else {
+                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s unavailable, %srouted MoE:%s %.3f ms\n",
+                        __func__,
+                        ansi_label,
+                        ansi_reset,
+                        ansi_label,
+                        ansi_reset,
+                        routed_decode_ms);
+            }
         }
 
 #ifdef GGML_USE_METAL
@@ -3264,6 +3583,279 @@ private:
 
         current[best_lane] -= total_weight;
         return static_cast<source_lane>(best_lane);
+    }
+
+    void harvest_ready_prefill_next_prefetch() {
+        for (auto & slot : prefill_prefetch_stage_slots) {
+            if (!slot.future.valid()) {
+                continue;
+            }
+            if (slot.ready != nullptr) {
+                continue;
+            }
+            if (slot.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                continue;
+            }
+
+            auto stage = slot.future.get();
+            slot.target_layer = stage != nullptr ? stage->layer : -1;
+            if (stage != nullptr && stage->stats.calls > 0) {
+                accumulate_metrics(prefill_next_prefetch_stats, stage->stats);
+            }
+            slot.ready = std::move(stage);
+        }
+    }
+
+    std::shared_ptr<prefill_host_prefetch_stage> take_prefill_next_prefetch_stage(int32_t layer) {
+        harvest_ready_prefill_next_prefetch();
+        for (auto & slot : prefill_prefetch_stage_slots) {
+            if (slot.ready == nullptr || slot.ready->layer != layer) {
+                continue;
+            }
+
+            auto stage = std::move(slot.ready);
+            slot.ready.reset();
+            slot.target_layer = -1;
+            return stage;
+        }
+        return nullptr;
+    }
+
+    void launch_prefill_next_hot_prefetch_for_lane(int32_t layer, source_lane launch_lane, int32_t lookahead) {
+        if (!transient_shared_scratch || prefill_next_hot_prefetch_experts <= 0) {
+            return;
+        }
+
+        harvest_ready_prefill_next_prefetch();
+
+        auto * slot = prefill_stage_slot_for_lane(launch_lane);
+        if (slot == nullptr) {
+            return;
+        }
+        if (slot->future.valid() || slot->ready != nullptr) {
+            return;
+        }
+        if (launch_lane == source_lane::secondary && !secondary_sidecar_enabled) {
+            return;
+        }
+        if (launch_lane == source_lane::tertiary && !tertiary_sidecar_enabled) {
+            return;
+        }
+
+        const int32_t target_layer = nth_dedicated_prefill_layer(layer, lookahead);
+        if (target_layer < 0 || target_layer >= (int32_t) layers.size()) {
+            return;
+        }
+        if (prefill_stage_exists_for_layer(target_layer)) {
+            return;
+        }
+
+        const auto & target_state = layers[target_layer];
+        if (!target_state.enabled || target_state.prefill_last_hot_experts.empty()) {
+            return;
+        }
+
+        std::vector<int32_t> predicted_experts = target_state.prefill_last_hot_experts;
+        if ((int32_t) predicted_experts.size() > prefill_next_hot_prefetch_experts) {
+            predicted_experts.resize(prefill_next_hot_prefetch_experts);
+        }
+        if (predicted_experts.empty()) {
+            return;
+        }
+
+        const bool use_gate_up_merged =
+                target_state.prefetch_gate_up_entry != nullptr &&
+                target_state.prefetch_gate_entry == nullptr &&
+                target_state.prefetch_up_entry == nullptr &&
+                target_state.prefetch_down_entry != nullptr;
+        const std::array<ggml_tensor *, 3> tensors = {
+            use_gate_up_merged ? target_state.gate_up_tensor : target_state.gate_tensor,
+            use_gate_up_merged ? target_state.down_tensor : target_state.up_tensor,
+            use_gate_up_merged ? nullptr : target_state.down_tensor,
+        };
+        const std::array<const llama_flash_moe_sidecar_entry *, 3> primary_entries = {
+            use_gate_up_merged ? target_state.prefetch_gate_up_entry : target_state.prefetch_gate_entry,
+            use_gate_up_merged ? target_state.prefetch_down_entry : target_state.prefetch_up_entry,
+            use_gate_up_merged ? nullptr : target_state.prefetch_down_entry,
+        };
+        const std::array<const llama_flash_moe_sidecar_entry *, 3> secondary_entries = {
+            use_gate_up_merged ? target_state.secondary_gate_up_entry : target_state.secondary_gate_entry,
+            use_gate_up_merged ? target_state.secondary_down_entry : target_state.secondary_up_entry,
+            use_gate_up_merged ? nullptr : target_state.secondary_down_entry,
+        };
+        const std::array<const llama_flash_moe_sidecar_entry *, 3> tertiary_entries = {
+            use_gate_up_merged ? target_state.tertiary_gate_up_entry : target_state.tertiary_gate_entry,
+            use_gate_up_merged ? target_state.tertiary_down_entry : target_state.tertiary_up_entry,
+            use_gate_up_merged ? nullptr : target_state.tertiary_down_entry,
+        };
+        const bool fixed_launch_lane = prefill_next_hot_exclusive_drives && launch_lane != source_lane::primary;
+        const bool use_prefetch_distribution = !fixed_launch_lane && prefetch_distribute_enabled;
+        const auto distribution_weights = prefetch_distribute_weights;
+
+        auto lane_entries_available = [&](source_lane lane) {
+            if (lane == source_lane::primary) {
+                return true;
+            }
+            const auto & lane_entries = lane == source_lane::secondary ? secondary_entries : tertiary_entries;
+            for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
+                if (primary_entries[family_index] != nullptr && lane_entries[family_index] == nullptr) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (fixed_launch_lane && !lane_entries_available(launch_lane)) {
+            return;
+        }
+
+        slot->target_layer = target_layer;
+        slot->future = std::async(std::launch::async, [this,
+                                                       target_layer,
+                                                       launch_lane,
+                                                       fixed_launch_lane,
+                                                       predicted_experts = std::move(predicted_experts),
+                                                       tensors,
+                                                       primary_entries,
+                                                       secondary_entries,
+                                                       tertiary_entries,
+                                                       use_prefetch_distribution,
+                                                       distribution_weights]() mutable {
+            auto stage = std::make_shared<prefill_host_prefetch_stage>();
+            stage->layer = target_layer;
+            stage->predicted_experts = predicted_experts;
+            if (predicted_experts.empty()) {
+                return stage;
+            }
+
+            const int64_t t_stage_start_us = ggml_time_us();
+            stage->stats.calls = 1;
+            std::array<int32_t, 3> distribution_current = { 0, 0, 0 };
+
+            auto note_lane = [&](source_lane lane) {
+                switch (lane) {
+                    case source_lane::primary:
+                        stage->stats.lane_primary_experts++;
+                        break;
+                    case source_lane::secondary:
+                        stage->stats.lane_secondary_experts++;
+                        break;
+                    case source_lane::tertiary:
+                        stage->stats.lane_tertiary_experts++;
+                        break;
+                }
+            };
+
+            auto note_lane_io = [&](source_lane lane, const install_metrics & metrics) {
+                switch (lane) {
+                    case source_lane::primary:
+                        stage->stats.lane_primary_bytes += metrics.bytes;
+                        stage->stats.lane_primary_preads += metrics.pread_ops;
+                        break;
+                    case source_lane::secondary:
+                        stage->stats.lane_secondary_bytes += metrics.bytes;
+                        stage->stats.lane_secondary_preads += metrics.pread_ops;
+                        break;
+                    case source_lane::tertiary:
+                        stage->stats.lane_tertiary_bytes += metrics.bytes;
+                        stage->stats.lane_tertiary_preads += metrics.pread_ops;
+                        break;
+                }
+            };
+
+            auto note_family = [&](size_t family_index, const install_metrics & metrics) {
+                const routed_family family =
+                        primary_entries[2] == nullptr ?
+                                (family_index == 0 ? routed_family::gate_up : routed_family::down) :
+                                (family_index == 0 ? routed_family::gate :
+                                        family_index == 1 ? routed_family::up : routed_family::down);
+                switch (family) {
+                    case routed_family::gate_up:
+                        stage->stats.gate_up_install_us += metrics.install_us;
+                        stage->stats.gate_up_bytes += metrics.bytes;
+                        break;
+                    case routed_family::gate:
+                        stage->stats.gate_install_us += metrics.install_us;
+                        stage->stats.gate_bytes += metrics.bytes;
+                        break;
+                    case routed_family::up:
+                        stage->stats.up_install_us += metrics.install_us;
+                        stage->stats.up_bytes += metrics.bytes;
+                        break;
+                    case routed_family::down:
+                        stage->stats.down_install_us += metrics.install_us;
+                        stage->stats.down_bytes += metrics.bytes;
+                        break;
+                }
+            };
+
+            for (const int32_t expert : predicted_experts) {
+                if (expert < 0 || expert >= expert_count) {
+                    continue;
+                }
+
+                source_lane lane = fixed_launch_lane ? launch_lane : source_lane::primary;
+                if (!fixed_launch_lane && use_prefetch_distribution) {
+                    lane = next_weighted_lane(distribution_current, distribution_weights);
+                }
+                note_lane(lane);
+
+                prefill_host_prefetch_expert staged_expert;
+                staged_expert.expert = expert;
+                stage->stats.unique_experts++;
+                stage->stats.miss_experts++;
+
+                for (size_t family_index = 0; family_index < primary_entries.size(); ++family_index) {
+                    const auto * default_entry = primary_entries[family_index];
+                    if (default_entry == nullptr) {
+                        continue;
+                    }
+
+                    const auto * lane_entry = default_entry;
+                    if (lane == source_lane::secondary && secondary_entries[family_index] != nullptr) {
+                        lane_entry = secondary_entries[family_index];
+                    } else if (lane == source_lane::tertiary && tertiary_entries[family_index] != nullptr) {
+                        lane_entry = tertiary_entries[family_index];
+                    }
+
+                    staged_expert.family_bytes[family_index].resize(default_entry->bytes_per_expert);
+                    const auto metrics = read_expert_bytes(
+                            tensors[family_index],
+                            lane_entry,
+                            nullptr,
+                            nullptr,
+                            expert,
+                            staged_expert.family_bytes[family_index].data(),
+                            1,
+                            false,
+                            false);
+                    stage->stats.bytes_loaded += metrics.bytes;
+                    stage->stats.pread_ops += metrics.pread_ops;
+                    stage->stats.resident_copy_ops += metrics.resident_copy_ops;
+                    stage->stats.source_us += metrics.source_us;
+                    stage->stats.install_us += metrics.install_us;
+                    note_family(family_index, metrics);
+                    note_lane_io(lane, metrics);
+                }
+
+                stage->experts.emplace_back(std::move(staged_expert));
+            }
+
+            stage->stats.total_us = ggml_time_us() - t_stage_start_us;
+            return stage;
+        });
+    }
+
+    void launch_prefill_next_hot_prefetch(int32_t layer) {
+        if (!transient_shared_scratch || prefill_next_hot_prefetch_experts <= 0) {
+            return;
+        }
+
+        if (prefill_next_hot_exclusive_drives) {
+            launch_prefill_next_hot_prefetch_for_lane(layer, source_lane::secondary, 1);
+            launch_prefill_next_hot_prefetch_for_lane(layer, source_lane::tertiary, 2);
+        } else {
+            launch_prefill_next_hot_prefetch_for_lane(layer, source_lane::primary, 1);
+        }
     }
 
     void start_read_pool() {
@@ -4078,7 +4670,12 @@ private:
             layer_metrics.emplace_back((int32_t) il, stats);
         }
 
-        if (total.calls == 0 && prefetch_stats.calls == 0 && predictor_prefetch_stats.calls == 0 && oracle_prime_stats.miss_experts == 0) {
+        if (total.calls == 0 &&
+            prefetch_stats.calls == 0 &&
+            predictor_prefetch_stats.calls == 0 &&
+            prefill_next_prefetch_stats.calls == 0 &&
+            prefill_next_predictor_stats.layer_calls == 0 &&
+            oracle_prime_stats.miss_experts == 0) {
             return;
         }
 
@@ -4169,6 +4766,19 @@ private:
                     prefetch_stats.source_us / 1000.0, prefetch_stats.upload_us / 1000.0,
                     prefetch_stats.pread_ops, prefetch_stats.resident_copy_ops);
         }
+        if (prefill_next_prefetch_stats.calls > 0) {
+            LLAMA_LOG_INFO("%s: Flash-MoE prefill-next-hot-prefetch calls=%" PRIu64 " uniq=%" PRIu64 " bytes=%.2f GiB total=%.3f ms source=%.3f ms pread=%" PRIu64 " lane-experts=%" PRIu64 ":%" PRIu64 ":%" PRIu64 "\n",
+                    __func__,
+                    prefill_next_prefetch_stats.calls,
+                    prefill_next_prefetch_stats.unique_experts,
+                    prefill_next_prefetch_stats.bytes_loaded / 1024.0 / 1024.0 / 1024.0,
+                    prefill_next_prefetch_stats.total_us / 1000.0,
+                    prefill_next_prefetch_stats.source_us / 1000.0,
+                    prefill_next_prefetch_stats.pread_ops,
+                    prefill_next_prefetch_stats.lane_primary_experts,
+                    prefill_next_prefetch_stats.lane_secondary_experts,
+                    prefill_next_prefetch_stats.lane_tertiary_experts);
+        }
         if (predictor_prefetch_stats.calls > 0) {
             const double predict_prefetch_hit_pct = predictor_prefetch_stats.unique_experts > 0 ?
                     100.0 * double(predictor_prefetch_stats.hit_experts) / double(predictor_prefetch_stats.unique_experts) : 0.0;
@@ -4191,6 +4801,19 @@ private:
                     prediction_mode_name(),
                     predictor_stats.overlap_experts, predictor_stats.predicted_experts,
                     predictor_precision, predictor_coverage, predictor_stats.layer_calls);
+        }
+        if (prefill_next_predictor_stats.layer_calls > 0) {
+            const double predictor_precision = prefill_next_predictor_stats.predicted_experts > 0 ?
+                    100.0 * double(prefill_next_predictor_stats.overlap_experts) / double(prefill_next_predictor_stats.predicted_experts) : 0.0;
+            const double predictor_coverage = prefill_next_predictor_stats.actual_experts > 0 ?
+                    100.0 * double(prefill_next_predictor_stats.overlap_experts) / double(prefill_next_predictor_stats.actual_experts) : 0.0;
+            LLAMA_LOG_INFO("%s: Flash-MoE prefill-next-hot overlap=%" PRIu64 "/%" PRIu64 " precision=%.1f%% coverage=%.1f%% layers=%" PRIu64 "\n",
+                    __func__,
+                    prefill_next_predictor_stats.overlap_experts,
+                    prefill_next_predictor_stats.predicted_experts,
+                    predictor_precision,
+                    predictor_coverage,
+                    prefill_next_predictor_stats.layer_calls);
         }
 
         if (resident_prime_stats.miss_experts > 0) {
@@ -5387,7 +6010,12 @@ private:
         return totals;
     }
 
-    void write_trace(int layer, int64_t n_expert_used, int64_t n_tokens) {
+    void write_trace_record(
+            int layer,
+            int64_t n_expert_used,
+            int64_t n_tokens,
+            const std::vector<int32_t> & experts,
+            const std::vector<int32_t> * slots) {
         if (trace_fp == nullptr) {
             return;
         }
@@ -5396,17 +6024,23 @@ private:
                 "{\"seq\":%" PRIu64 ",\"layer\":%d,\"n_expert_used\":%" PRId64 ",\"n_tokens\":%" PRId64 ",\"experts\":[",
                 trace_seq++, layer, n_expert_used, n_tokens);
 
-        for (size_t i = 0; i < topk_ids.size(); ++i) {
-            std::fprintf(trace_fp, "%s%d", i == 0 ? "" : ",", topk_ids[i]);
+        for (size_t i = 0; i < experts.size(); ++i) {
+            std::fprintf(trace_fp, "%s%d", i == 0 ? "" : ",", experts[i]);
         }
 
         std::fprintf(trace_fp, "],\"slots\":[");
-        for (size_t i = 0; i < slot_ids.size(); ++i) {
-            std::fprintf(trace_fp, "%s%d", i == 0 ? "" : ",", slot_ids[i]);
+        if (slots != nullptr) {
+            for (size_t i = 0; i < slots->size(); ++i) {
+                std::fprintf(trace_fp, "%s%d", i == 0 ? "" : ",", (*slots)[i]);
+            }
         }
 
         std::fprintf(trace_fp, "]}\n");
         std::fflush(trace_fp);
+    }
+
+    void write_trace(int layer, int64_t n_expert_used, int64_t n_tokens) {
+        write_trace_record(layer, n_expert_used, n_tokens, topk_ids, &slot_ids);
     }
 };
 
@@ -5482,14 +6116,19 @@ llama_context::llama_context(
     }
 
     if (model.flash_moe_slot_bank_enabled()) {
-        flash_moe_slot_runtime = std::make_unique<llama_flash_moe_slot_runtime>(model, !cparams.no_perf);
+        flash_moe_slot_runtime = std::make_unique<llama_flash_moe_slot_runtime>(
+                model, !cparams.no_perf, false, 0,
+                nullptr, nullptr,
+                &flash_moe_decode_eval_us, &flash_moe_decode_eval_tokens);
         if (model.flash_moe_prefill_layer_major_enabled()) {
             const int32_t resolved_prefill_micro_batch =
                     llama_moe_prefill_micro_batch_is_auto(cparams.moe_prefill_micro_batch) ?
                             -1 :
                             (int32_t) cparams.moe_prefill_micro_batch;
             flash_moe_prefill_runtime = std::make_unique<llama_flash_moe_slot_runtime>(
-                    model, !cparams.no_perf, true, resolved_prefill_micro_batch);
+                    model, !cparams.no_perf, true, resolved_prefill_micro_batch,
+                    &flash_moe_prefill_eval_us, &flash_moe_prefill_eval_tokens,
+                    nullptr, nullptr);
         }
         flash_moe_cb_eval_downstream = cparams.cb_eval;
         flash_moe_cb_eval_downstream_user_data = cparams.cb_eval_user_data;
@@ -5548,6 +6187,16 @@ llama_context::llama_context(
     if (model.flash_moe_predict_top1_prev_enabled()) {
         LLAMA_LOG_INFO("%s: --moe-predict-top1-prev is enabled; each layer reuses only the first previous-token routed expert as the next-token slot-bank prefetch target\n",
                 __func__);
+    }
+    if (model.flash_moe_prefill_next_hot_experts() > 0) {
+        LLAMA_LOG_INFO("%s: --moe-prefill-next-hot-experts=%d is enabled; dedicated prefill host-stages up to %d hot experts predicted for layer L+1 from that target layer's last call while layer L computes\n",
+                __func__,
+                model.flash_moe_prefill_next_hot_experts(),
+                model.flash_moe_prefill_next_hot_experts());
+        if (model.flash_moe_prefill_next_hot_exclusive_drives_enabled()) {
+            LLAMA_LOG_INFO("%s: --moe-prefill-next-hot-exclusive-drives is enabled; dedicated prefill keeps current-layer demand on the primary drive, pins L+1 staging to the secondary drive, and pins L+2 staging to the tertiary drive when available\n",
+                    __func__);
+        }
     }
     if (model.flash_moe_demand_distribute_enabled()) {
         const auto weights = model.flash_moe_demand_distribute_weights();
@@ -6160,6 +6809,17 @@ void llama_context::synchronize() {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_p_eval += n_queued_tokens;
+    }
+
+    const int64_t eval_wall_us = t_compute_start_us > 0 ? ggml_time_us() - t_compute_start_us : 0;
+    if (eval_wall_us > 0) {
+        if (flash_moe_active_runtime == flash_moe_slot_runtime.get()) {
+            flash_moe_decode_eval_us += eval_wall_us;
+            flash_moe_decode_eval_tokens += n_queued_tokens;
+        } else if (flash_moe_active_runtime == flash_moe_prefill_runtime.get()) {
+            flash_moe_prefill_eval_us += eval_wall_us;
+            flash_moe_prefill_eval_tokens += n_queued_tokens;
+        }
     }
 
     // get a more accurate load time, upon first eval
@@ -8248,6 +8908,10 @@ void llama_context::perf_reset() {
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
+    flash_moe_prefill_eval_us = 0;
+    flash_moe_decode_eval_us  = 0;
+    flash_moe_prefill_eval_tokens = 0;
+    flash_moe_decode_eval_tokens  = 0;
     n_reused    = 0;
 }
 

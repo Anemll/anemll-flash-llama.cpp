@@ -2319,6 +2319,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_BANKS"));
     add_opt(common_arg(
+        {"--moe-prefill-next-hot-experts"}, "N",
+        "prototype one-lookahead layer-major prefill host staging budget: while layer L computes, prefetch up to N hot experts predicted for layer L+1 from that target layer's last call (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_next_hot_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-prefill-next-hot-exclusive-drives", "--moe-prefill-exclusive-drive-prefetch"},
+        {"--no-moe-prefill-next-hot-exclusive-drives", "--no-moe-prefill-exclusive-drive-prefetch"},
+        string_format("pin dedicated prefill next-hot host staging to the sidecars only: current-layer demand stays on the primary drive, layer L+1 stages on the secondary drive, and layer L+2 stages on the tertiary drive when available (default: %s)", params.moe_prefill_next_hot_exclusive_drives ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefill_next_hot_exclusive_drives = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXCLUSIVE_DRIVES"));
+    add_opt(common_arg(
         {"--moe-topk"}, "N",
         "experimental runtime reduction-only override for routed experts per token (0 = model metadata, must be <= GGUF MoE top-k)",
         [](common_params & params, int value) {

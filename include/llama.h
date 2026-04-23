@@ -386,6 +386,10 @@ extern "C" {
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
         int32_t moe_prefill_cache_io_split; // prefill-only split override; 0 follows moe_cache_io_split
         int32_t moe_prefetch_cache_io_split; // prefetch-only split override; 0 follows moe_cache_io_split
+
+        // NOTE: new fields must be appended at the end to preserve ABI for out-of-tree consumers.
+        bool moe_prefill_next_hot_exclusive_drives; // pin prefill next-hot host staging to secondary/tertiary sidecars
+        int32_t moe_prefill_next_hot_experts; // prototype one-lookahead prefill hot-expert host staging budget
     };
 
     struct llama_sampler_seq_config {

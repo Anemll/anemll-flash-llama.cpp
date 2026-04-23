@@ -597,6 +597,7 @@ struct llama_model {
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
     bool flash_moe_secondary_sidecar_enabled() const;
+    bool flash_moe_tertiary_sidecar_enabled() const;
     bool flash_moe_demand_stripe_enabled() const;
     bool flash_moe_demand_distribute_enabled() const;
     bool flash_moe_prefill_stripe_enabled() const;
@@ -604,8 +605,10 @@ struct llama_model {
     bool flash_moe_prefetch_stripe_enabled() const;
     bool flash_moe_prefetch_distribute_enabled() const;
     bool flash_moe_prefill_layer_major_enabled() const;
+    bool flash_moe_prefill_next_hot_exclusive_drives_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
     int32_t flash_moe_prefill_banks() const;
+    int32_t flash_moe_prefill_next_hot_experts() const;
     int32_t flash_moe_cache_io_split() const;
     int32_t flash_moe_prefill_cache_io_split() const;
     int32_t flash_moe_prefetch_cache_io_split() const;

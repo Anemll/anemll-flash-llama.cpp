@@ -912,6 +912,9 @@ int main(int argc, char ** argv) {
                             (params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192),
                     params.moe_prefill_micro_batch > 0 ? "" : " (follows prefill-batch)");
         }
+        fprintf(stderr, "  prefill-next-hot = %d\n", params.moe_prefill_next_hot_experts);
+        fprintf(stderr, "  prefill-next-hot-exclusive-drives = %s\n",
+                params.moe_prefill_next_hot_exclusive_drives ? "on" : "off");
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
         fprintf(stderr, "  prefetch-cache-io-split = %d%s\n",

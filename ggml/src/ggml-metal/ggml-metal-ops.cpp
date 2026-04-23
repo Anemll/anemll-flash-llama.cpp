@@ -90,6 +90,22 @@ static int16_t ggml_metal_flash_attn_nonvec_env_walk_mode() {
     return walk;
 }
 
+static bool ggml_metal_flash_attn_mem_debug_enabled() {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_MEM_DEBUG");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = std::strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
 static bool ggml_metal_flash_attn_vec_metal4_env_enabled() {
     static int enabled = -1;
     if (enabled != -1) {
@@ -206,11 +222,12 @@ static int ggml_metal_flash_attn_nonvec_nwg_env_override() {
         case 2:
         case 4:
         case 8:
+        case 16:
             override_nwg = parsed;
             break;
         default:
             std::fprintf(stderr,
-                    "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_2PASS_NWG=%s (supported: 1,2,4,8)\n",
+                    "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_2PASS_NWG=%s (supported: 1,2,4,8,16)\n",
                     __func__,
                     value);
             std::fflush(stderr);
@@ -230,6 +247,111 @@ static bool ggml_metal_flash_attn_nonvec_metal4_supported_type(enum ggml_type ty
 
 static bool ggml_metal_flash_attn_nonvec_2pass_supported_type(enum ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16;
+}
+
+static int ggml_metal_flash_attn_nonvec_chunk_mode_env_override() {
+    static int override_mode = -2;
+    if (override_mode != -2) {
+        return override_mode;
+    }
+
+    override_mode = -1;
+
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_2PASS_CHUNK_MODE");
+    if (value == nullptr || value[0] == '\0') {
+        return override_mode;
+    }
+
+    if (std::strcmp(value, "strided") == 0 || std::strcmp(value, "legacy") == 0 || std::strcmp(value, "0") == 0) {
+        override_mode = GGML_METAL_FLASH_ATTN_CHUNK_STRIDED;
+        return override_mode;
+    }
+
+    if (std::strcmp(value, "contiguous") == 0 || std::strcmp(value, "chunked") == 0 || std::strcmp(value, "1") == 0) {
+        override_mode = GGML_METAL_FLASH_ATTN_CHUNK_CONTIGUOUS;
+        return override_mode;
+    }
+
+    std::fprintf(stderr,
+            "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_2PASS_CHUNK_MODE=%s (supported: strided, contiguous)\n",
+            __func__,
+            value);
+    std::fflush(stderr);
+
+    return override_mode;
+}
+
+static int ggml_metal_flash_attn_nonvec_chunk_target_tokens_env_override() {
+    static int override_tokens = -2;
+    if (override_tokens != -2) {
+        return override_tokens;
+    }
+
+    override_tokens = -1;
+
+    const char * value = std::getenv("GGML_METAL_FLASH_ATTN_NONVEC_2PASS_CHUNK_TOKENS");
+    if (value == nullptr || value[0] == '\0') {
+        return override_tokens;
+    }
+
+    const int parsed = std::atoi(value);
+    if (parsed > 0) {
+        override_tokens = parsed;
+        return override_tokens;
+    }
+
+    std::fprintf(stderr,
+            "%s: ignoring unsupported GGML_METAL_FLASH_ATTN_NONVEC_2PASS_CHUNK_TOKENS=%s (must be > 0)\n",
+            __func__,
+            value);
+    std::fflush(stderr);
+
+    return override_tokens;
+}
+
+static int32_t ggml_metal_flash_attn_nonvec_chunk_mode_hint(const ggml_tensor * op) {
+    if (op == nullptr) {
+        return GGML_METAL_FLASH_ATTN_CHUNK_STRIDED;
+    }
+
+    const int override_mode = ggml_metal_flash_attn_nonvec_chunk_mode_env_override();
+    if (override_mode >= 0) {
+        return override_mode;
+    }
+
+    // Keep contiguous chunk ownership opt-in only for now. It can help some
+    // 32K-48K prefill cases, but it is still numerically different from the
+    // strided reference path and has regressed at 64K in current testing.
+    return GGML_METAL_FLASH_ATTN_CHUNK_STRIDED;
+}
+
+static int32_t ggml_metal_flash_attn_nonvec_chunk_mode(const ggml_tensor * op, int32_t nwg) {
+    if (op == nullptr || nwg <= 1) {
+        return GGML_METAL_FLASH_ATTN_CHUNK_STRIDED;
+    }
+
+    return ggml_metal_flash_attn_nonvec_chunk_mode_hint(op);
+}
+
+static int32_t ggml_metal_flash_attn_nonvec_round_up_pow2(int32_t value) {
+    int32_t result = 1;
+    while (result < value && result < 16) {
+        result <<= 1;
+    }
+
+    return result;
+}
+
+static int32_t ggml_metal_flash_attn_nonvec_nwg_for_contiguous_chunks(int64_t kv) {
+    const int override_target = ggml_metal_flash_attn_nonvec_chunk_target_tokens_env_override();
+    const int32_t target_tokens = override_target > 0 ? override_target : 16384;
+
+    if (kv < 2LL*target_tokens) {
+        return 1;
+    }
+
+    const int32_t desired_chunks = (int32_t) ((kv + target_tokens - 1)/target_tokens);
+    return ggml_metal_flash_attn_nonvec_round_up_pow2(desired_chunks);
 }
 
 static bool ggml_metal_is_token_char(char c) {
@@ -304,6 +426,11 @@ static int32_t ggml_metal_flash_attn_nonvec_nwg(const ggml_tensor * op) {
     }
 
     const int64_t kv = op->src[1]->ne[1];
+    const int32_t chunk_mode_hint = ggml_metal_flash_attn_nonvec_chunk_mode_hint(op);
+
+    if (chunk_mode_hint == GGML_METAL_FLASH_ATTN_CHUNK_CONTIGUOUS) {
+        return ggml_metal_flash_attn_nonvec_nwg_for_contiguous_chunks(kv);
+    }
 
     if (kv > 32768) {
         return 8;
@@ -381,6 +508,14 @@ static const char * ggml_metal_walk_mode_name(int32_t walk_mode) {
     }
 }
 
+static const char * ggml_metal_flash_attn_chunk_mode_name(int32_t chunk_mode) {
+    switch (chunk_mode) {
+        case GGML_METAL_FLASH_ATTN_CHUNK_CONTIGUOUS: return "contiguous";
+        case GGML_METAL_FLASH_ATTN_CHUNK_STRIDED:
+        default: return "strided";
+    }
+}
+
 static void ggml_metal_flash_attn_log_path_once(
         const ggml_tensor * op,
         bool is_vec,
@@ -391,6 +526,7 @@ static void ggml_metal_flash_attn_log_path_once(
         bool has_kvpad,
         int32_t nsg,
         int32_t walk_mode,
+        int32_t chunk_mode,
         int32_t nwg) {
     if (!ggml_metal_flash_attn_debug_enabled() || op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr) {
         return;
@@ -408,7 +544,7 @@ static void ggml_metal_flash_attn_log_path_once(
     char key[256];
     std::snprintf(
             key, sizeof(key),
-            "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+            "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
             is_vec ? 1 : 0,
             use_metal4_sdpa ? 1 : 0,
             q, kv, dk, dv,
@@ -417,6 +553,7 @@ static void ggml_metal_flash_attn_log_path_once(
             has_scap ? 1 : 0,
             nsg,
             walk_mode,
+            chunk_mode,
             nwg);
 
     static std::mutex mu;
@@ -431,7 +568,7 @@ static void ggml_metal_flash_attn_log_path_once(
 
     std::fprintf(
             stderr,
-            "%s: path=%s%s%s phase=%s q=%d kv=%d dk=%d dv=%d nsg=%d nwg=%d walk=%s mask=%s bias=%s scap=%s kvpad=%s\n",
+            "%s: path=%s%s%s phase=%s q=%d kv=%d dk=%d dv=%d nsg=%d nwg=%d walk=%s chunk=%s mask=%s bias=%s scap=%s kvpad=%s\n",
             __func__,
             is_vec ? "vec" : "non-vec",
             nwg > 1 ? "+2pass" : "",
@@ -444,11 +581,96 @@ static void ggml_metal_flash_attn_log_path_once(
             nsg,
             nwg,
             ggml_metal_walk_mode_name(walk_mode),
+            ggml_metal_flash_attn_chunk_mode_name(chunk_mode),
             has_mask ? "yes" : "no",
             has_bias ? "yes" : "no",
             has_scap ? "yes" : "no",
             has_kvpad ? "yes" : "no");
     std::fprintf(stderr, "%s: tensor types q=%s k=%s v=%s\n", __func__, qt, kt, vt);
+    std::fflush(stderr);
+}
+
+static void ggml_metal_flash_attn_log_mem_once(
+        const ggml_tensor * op,
+        bool is_vec,
+        bool use_metal4_sdpa,
+        bool has_mask,
+        bool has_kvpad,
+        int32_t nsg,
+        int32_t chunk_mode,
+        int32_t nwg) {
+    if (!ggml_metal_flash_attn_mem_debug_enabled() || op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr) {
+        return;
+    }
+
+    const int32_t q  = int32_t(op->src[0]->ne[1]);
+    const int32_t kv = int32_t(op->src[1]->ne[1]);
+    const int32_t dk = int32_t(op->src[1]->ne[0]);
+    const int32_t dv = int32_t(op->src[2]->ne[0]);
+    const char * phase = q <= 1 ? "decode-like" : "prefill-like";
+
+    char key[256];
+    std::snprintf(
+            key, sizeof(key),
+            "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+            is_vec ? 1 : 0,
+            use_metal4_sdpa ? 1 : 0,
+            q, kv, dk, dv,
+            has_mask ? 1 : 0,
+            nsg,
+            chunk_mode,
+            nwg);
+
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> seen;
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!seen.emplace(key, true).second) {
+            return;
+        }
+    }
+
+    const size_t dst_bytes   = ggml_nbytes(op);
+    const size_t extra_pad   = ggml_metal_op_flash_attn_ext_extra_pad(op);
+    const size_t extra_blk   = ggml_metal_op_flash_attn_ext_extra_blk(op);
+    const size_t extra_tmp   = ggml_metal_op_flash_attn_ext_extra_tmp(op);
+    const size_t extra_total = extra_pad + extra_blk + extra_tmp;
+    const size_t op_bound    = dst_bytes + extra_total;
+
+    const bool pad_reserved       = extra_pad != 0;
+    const bool pad_forced_reserve = pad_reserved && !has_kvpad;
+    const bool tmp_reserved       = extra_tmp != 0;
+    const bool tmp_used_runtime   = is_vec ? (nwg > 1) : (nwg > 1);
+    const bool tmp_forced_reserve = tmp_reserved && !tmp_used_runtime;
+
+    std::fprintf(
+            stderr,
+            "%s: path=%s%s%s phase=%s q=%d kv=%d dk=%d dv=%d nsg=%d nwg=%d chunk=%s dst=%zu extra_pad=%zu extra_blk=%zu extra_tmp=%zu extra_total=%zu op_bound=%zu kvpad_runtime=%s pad_reserved=%s pad_forced=%s tmp_reserved=%s tmp_runtime=%s tmp_forced=%s\n",
+            __func__,
+            is_vec ? "vec" : "non-vec",
+            nwg > 1 ? "+2pass" : "",
+            use_metal4_sdpa ? "+metal4" : "",
+            phase,
+            q,
+            kv,
+            dk,
+            dv,
+            nsg,
+            nwg,
+            ggml_metal_flash_attn_chunk_mode_name(chunk_mode),
+            dst_bytes,
+            extra_pad,
+            extra_blk,
+            extra_tmp,
+            extra_total,
+            op_bound,
+            has_kvpad ? "yes" : "no",
+            pad_reserved ? "yes" : "no",
+            pad_forced_reserve ? "yes" : "no",
+            tmp_reserved ? "yes" : "no",
+            tmp_used_runtime ? "yes" : "no",
+            tmp_forced_reserve ? "yes" : "no");
     std::fflush(stderr);
 }
 
@@ -5036,6 +5258,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(!op->src[3] || op->src[3]->type == GGML_TYPE_F16);
     GGML_ASSERT(!op->src[3] || op->src[3]->ne[1] >= op->src[0]->ne[1] &&
             "the Flash-Attention Metal kernel requires the mask to be at least n_queries big");
+    GGML_ASSERT(!op->src[3] || op->src[3]->ne[0] >= op->src[1]->ne[1] &&
+            "the Flash-Attention Metal kernel requires the mask KV width to be at least the KV cache width");
 
     float scale;
     float max_bias;
@@ -5203,8 +5427,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
         const int32_t nwg = ggml_metal_flash_attn_nonvec_nwg(op);
+        const int32_t chunk_mode = ggml_metal_flash_attn_nonvec_chunk_mode(op, nwg);
 
-        ggml_metal_flash_attn_log_path_once(op, false, use_metal4_qk, has_mask, has_bias, has_scap, has_kvpad, nsg, walk_mode, nwg);
+        ggml_metal_flash_attn_log_path_once(op, false, use_metal4_qk, has_mask, has_bias, has_scap, has_kvpad, nsg, walk_mode, chunk_mode, nwg);
+        ggml_metal_flash_attn_log_mem_once(op, false, use_metal4_qk, has_mask, has_kvpad, nsg, chunk_mode, nwg);
 
         ggml_metal_kargs_flash_attn_ext args = {
             /*.ne01          =*/ ne01,
@@ -5241,7 +5467,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_metal4_qk, nsg, walk_mode, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_metal4_qk, nsg, walk_mode, chunk_mode, nwg);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5362,6 +5588,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // each workgroup handles nsg*nkpsg cache values
         int32_t nwg = 1;
         if (use_metal4_sdpa) {
+            // The current Metal4 vec kernel has a simdgroup-local masked-block
+            // early-continue before later threadgroup barriers. Keeping NSG=1
+            // avoids divergent simdgroups in the same threadgroup around those
+            // barriers. Do not tune this upward without refactoring the kernel
+            // control flow to make the skip decision threadgroup-uniform.
             nwg = 32;
             nsg = 1;
         } else if (false) {
@@ -5377,7 +5608,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
-        ggml_metal_flash_attn_log_path_once(op, true, use_metal4_sdpa, has_mask, has_bias, has_scap, has_kvpad, 0, GGML_METAL_MUL_MM_WALK_LEGACY, nwg);
+        ggml_metal_flash_attn_log_path_once(op, true, use_metal4_sdpa, has_mask, has_bias, has_scap, has_kvpad, (int32_t) nsg, GGML_METAL_MUL_MM_WALK_LEGACY, GGML_METAL_FLASH_ATTN_CHUNK_STRIDED, nwg);
+        ggml_metal_flash_attn_log_mem_once(op, true, use_metal4_sdpa, has_mask, has_kvpad, (int32_t) nsg, GGML_METAL_FLASH_ATTN_CHUNK_STRIDED, nwg);
 
         ggml_metal_kargs_flash_attn_ext_vec args = {
             /*.ne01          =*/ ne01,

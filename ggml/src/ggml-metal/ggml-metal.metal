@@ -5612,6 +5612,7 @@ constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
 constant int32_t FC_flash_attn_ext_walk_mode [[function_constant(FC_FLASH_ATTN_EXT + 23)]];
 constant int32_t FC_flash_attn_ext_nwg  [[function_constant(FC_FLASH_ATTN_EXT + 24)]];
+constant int32_t FC_flash_attn_ext_chunk_mode [[function_constant(FC_FLASH_ATTN_EXT + 25)]];
 
 static inline uint ggml_metal_compact1by1(uint x);
 static inline uint2 ggml_metal_morton_decode_2d(uint code);
@@ -5733,12 +5734,12 @@ void kernel_flash_attn_ext_impl(
     threadgroup half2 * sm2 = (threadgroup half2 *) (shmem_f16 + Q*T + 2*C);
 
     // per-query mask pointers
-    device const half2 * pm2[NQ];
+    device const half2 * pm2_base[NQ];
 
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2_base[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
     {
@@ -5805,12 +5806,22 @@ void kernel_flash_attn_ext_impl(
             slope = pow(base, exph);
         }
 
+        const int nblk0 = (args.ne11 + C - 1)/C;
+        const bool contiguous_chunking = FC_flash_attn_ext_chunk_mode == GGML_METAL_FLASH_ATTN_CHUNK_CONTIGUOUS;
+        const int ic0_begin = contiguous_chunking ? (nblk0*iwg)/NWG : iwg;
+        const int ic0_end = contiguous_chunking ? (nblk0*(iwg + 1))/NWG : nblk0;
+        const int ic0_step = contiguous_chunking ? 1 : NWG;
+
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic0 = iwg; ; ic0 += NWG) {
+        for (int ic0 = ic0_begin; ic0 < ic0_end; ic0 += ic0_step) {
             int ic = ic0*C;
-            if (ic >= args.ne11) {
-                break;
+
+            device const half2 * pm2_cur[NQ];
+            if (FC_flash_attn_ext_has_mask) {
+                FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                    pm2_cur[jj] = pm2_base[jj] + ic/2;
+                }
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -5841,7 +5852,7 @@ void kernel_flash_attn_ext_impl(
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
                         const short j = jj*NSG + sgitg;
 
-                        pm2[jj] = (device const half2 *) ((device const half *) mask +
+                        pm2_cur[jj] = (device const half2 *) ((device const half *) mask +
                                 (iq1 + j)*C +
                                 (iq2%args.ne32)*(C*args.ne31) +
                                 (iq3%args.ne33)*(C*args.ne31*args.ne32));
@@ -5858,10 +5869,6 @@ void kernel_flash_attn_ext_impl(
                 blk_cur = blk[ic0];
 
                 if (blk_cur == 0) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
-                    }
-
                     continue;
                 }
 
@@ -5870,16 +5877,10 @@ void kernel_flash_attn_ext_impl(
                         const short j = jj*NSG + sgitg;
 
                         if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2_cur[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
                         } else {
-                            sm2[j*SH + tiisg] = pm2[jj][tiisg];
+                            sm2[j*SH + tiisg] = pm2_cur[jj][tiisg];
                         }
-
-                        pm2[jj] += NW;
-                    }
-                } else if (blk_cur == 2) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
                     }
                 }
 

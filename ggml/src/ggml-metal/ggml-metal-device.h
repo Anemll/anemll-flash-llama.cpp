@@ -221,6 +221,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    use_metal4_qk,
         int32_t nsg,
         int32_t walk_mode,
+        int32_t chunk_mode,
         int32_t nwg);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(

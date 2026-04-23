@@ -504,6 +504,34 @@ Notes:
 - `--assignment-out /tmp/oracle-bins.json` writes the oracle per-layer expert assignment for later repacker experiments
 - the prototype is most useful when you want to compare "expert binning" against weighted striping on the same trace
 
+## Analyze a one-lookahead prefetch oracle
+
+If you want to use an existing `--moe-trace` log as the oracle for a single future prefetch window, use:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_prefetch_oracle.py \
+  --sidecar ~/Models/flash/Kimi-K2.5-sidecar \
+  --trace /tmp/kimi-k25-trace.jsonl \
+  --phase prefill \
+  --prefetch-experts 4 \
+  --prefetch-experts 8 \
+  --prefetch-experts 16
+```
+
+What it does:
+
+- replays the routed call order from `--moe-trace`
+- treats the next routed call in the current prefill slab as the single prefetched target
+- reports the exact one-step next-layer ceiling (`oracle-next-layer`)
+- reports unique-expert coverage, raw-ref coverage, precision, and useful vs wasted prefetch bytes
+
+Notes:
+
+- `--phase prefill` is the usual starting point for long-prompt Kimi analysis; use `decode` or `all` if you want to inspect those phases too
+- with `--moe-prefill-layer-major`, the meaningful unit is the prompt slab set by `--moe-prefill-batch`; the oracle is modeling `layer L -> layer L+1` inside that slab, not a later separate prefill pass
+- if you later want to compare against a history-based warm-start heuristic, add `--strategy prev-layer-lastcall`; it reuses the hottest experts from the last time the target layer ran and is only meaningful when a layer appears multiple times in the filtered trace
+- the current tool models one lookahead only; it does not try to chain two or three future prefetch buffers yet
+
 ## Plan a cross-machine layer split
 
 If you want to keep a fully resident prefix on one machine and run the remaining layers through Flash-MoE on another, use:

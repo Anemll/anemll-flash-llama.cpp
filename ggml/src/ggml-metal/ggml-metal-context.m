@@ -11,6 +11,8 @@
 
 #import <Metal/Metal.h>
 
+#include <string.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -80,6 +82,139 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
+
+static bool ggml_metal_flash_attn_mem_debug_enabled_ctx(void) {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = getenv("GGML_METAL_FLASH_ATTN_MEM_DEBUG");
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static void ggml_metal_graph_log_flash_attn_mem_summary(struct ggml_cgraph * gf) {
+    if (!ggml_metal_flash_attn_mem_debug_enabled_ctx() || gf == NULL) {
+        return;
+    }
+
+    size_t total_pad = 0;
+    size_t total_blk = 0;
+    size_t total_tmp = 0;
+    size_t total_extra = 0;
+    size_t peak_op_extra = 0;
+    size_t peak_op_bound = 0;
+
+    int n_flash = 0;
+    int n_prefill = 0;
+    int n_decode = 0;
+    int n_vec = 0;
+    int n_nonvec = 0;
+    int32_t max_q = 0;
+    int32_t max_kv = 0;
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        if (node == NULL || node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+
+        n_flash++;
+
+        const int32_t q = node->src[0] ? (int32_t) node->src[0]->ne[1] : 0;
+        const int32_t kv = node->src[1] ? (int32_t) node->src[1]->ne[1] : 0;
+        max_q = MAX(max_q, q);
+        max_kv = MAX(max_kv, kv);
+
+        if (q <= 1) {
+            n_decode++;
+        } else {
+            n_prefill++;
+        }
+
+        if (ggml_metal_op_flash_attn_ext_use_vec(node)) {
+            n_vec++;
+        } else {
+            n_nonvec++;
+        }
+
+        const size_t extra_pad = ggml_metal_op_flash_attn_ext_extra_pad(node);
+        const size_t extra_blk = ggml_metal_op_flash_attn_ext_extra_blk(node);
+        const size_t extra_tmp = ggml_metal_op_flash_attn_ext_extra_tmp(node);
+        const size_t extra = extra_pad + extra_blk + extra_tmp;
+        const size_t bound = ggml_nbytes(node) + extra;
+
+        total_pad += extra_pad;
+        total_blk += extra_blk;
+        total_tmp += extra_tmp;
+        total_extra += extra;
+        peak_op_extra = MAX(peak_op_extra, extra);
+        peak_op_bound = MAX(peak_op_bound, bound);
+    }
+
+    if (n_flash == 0) {
+        return;
+    }
+
+    static size_t peak_graph_extra = 0;
+    static size_t peak_graph_bound = 0;
+
+    const size_t prev_peak_graph_extra = peak_graph_extra;
+    const size_t prev_peak_graph_bound = peak_graph_bound;
+    peak_graph_extra = MAX(peak_graph_extra, total_extra);
+    peak_graph_bound = MAX(peak_graph_bound, peak_op_bound);
+
+    char key[256];
+    snprintf(
+            key, sizeof(key),
+            "%d|%d|%d|%d|%d|%zu|%zu|%zu|%zu|%zu|%d|%d",
+            n_flash,
+            n_prefill,
+            n_decode,
+            n_vec,
+            n_nonvec,
+            total_pad,
+            total_blk,
+            total_tmp,
+            total_extra,
+            peak_op_bound,
+            max_q,
+            max_kv);
+
+    static char last_key[256] = { 0 };
+    const bool high_water_grew = peak_graph_extra != prev_peak_graph_extra || peak_graph_bound != prev_peak_graph_bound;
+    if (!high_water_grew && strcmp(last_key, key) == 0) {
+        return;
+    }
+    snprintf(last_key, sizeof(last_key), "%s", key);
+
+    fprintf(
+            stderr,
+            "%s: flash_attn_mem nodes=%d prefill=%d decode=%d vec=%d nonvec=%d total_pad=%zu total_blk=%zu total_tmp=%zu total_extra=%zu peak_op_extra=%zu peak_op_bound=%zu graph_high_water_extra=%zu graph_high_water_bound=%zu max_q=%d max_kv=%d\n",
+            __func__,
+            n_flash,
+            n_prefill,
+            n_decode,
+            n_vec,
+            n_nonvec,
+            total_pad,
+            total_blk,
+            total_tmp,
+            total_extra,
+            peak_op_extra,
+            peak_op_bound,
+            peak_graph_extra,
+            peak_graph_bound,
+            max_q,
+            max_kv);
+    fflush(stderr);
+}
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -461,6 +596,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     @autoreleasepool {
         ctx->gf = gf;
+
+        ggml_metal_graph_log_flash_attn_mem_summary(gf);
 
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
         ctx->n_nodes_1 = gf->n_nodes - ctx->n_nodes_0;

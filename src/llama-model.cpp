@@ -546,8 +546,10 @@ struct llama_model::impl {
     bool flash_moe_predict_prev_token_enabled = false;
     bool flash_moe_predict_top1_prev_enabled = false;
     bool flash_moe_prefill_layer_major_enabled = false;
+    bool flash_moe_prefill_next_hot_exclusive_drives_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
     int32_t flash_moe_prefill_banks = 1;
+    int32_t flash_moe_prefill_next_hot_experts = 0;
     int32_t flash_moe_cache_io_split = 4;
     int32_t flash_moe_prefill_cache_io_split = 4;
     int32_t flash_moe_prefetch_cache_io_split = 4;
@@ -721,7 +723,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->flash_moe_predict_prev_token_enabled = params.moe_predict_prev_token;
     pimpl->flash_moe_predict_top1_prev_enabled = params.moe_predict_top1_prev;
     pimpl->flash_moe_prefill_layer_major_enabled = params.moe_prefill_layer_major;
+    pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled = params.moe_prefill_next_hot_exclusive_drives;
     pimpl->flash_moe_prefill_banks = std::max<int32_t>(1, params.moe_prefill_banks);
+    pimpl->flash_moe_prefill_next_hot_experts = std::max<int32_t>(0, params.moe_prefill_next_hot_experts);
     pimpl->flash_moe_cache_io_split = std::max<int32_t>(1, params.moe_cache_io_split);
     pimpl->flash_moe_prefill_cache_io_split = params.moe_prefill_cache_io_split > 0 ?
             std::max<int32_t>(1, params.moe_prefill_cache_io_split) :
@@ -3170,6 +3174,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     __func__, pimpl->flash_moe_prefill_banks);
             pimpl->flash_moe_prefill_banks = 1;
         }
+        if (pimpl->flash_moe_prefill_next_hot_experts > 0 && !pimpl->flash_moe_prefill_layer_major_enabled) {
+            LLAMA_LOG_INFO("%s: ignoring --moe-prefill-next-hot-experts=%d because --moe-prefill-layer-major is not enabled\n",
+                    __func__, pimpl->flash_moe_prefill_next_hot_experts);
+            pimpl->flash_moe_prefill_next_hot_experts = 0;
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                pimpl->flash_moe_prefill_next_hot_experts <= 0) {
+            LLAMA_LOG_INFO("%s: ignoring --moe-prefill-next-hot-exclusive-drives because --moe-prefill-next-hot-experts is disabled\n",
+                    __func__);
+            pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled = false;
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+            throw std::runtime_error("Flash-MoE exclusive drive prefill prefetch needs --moe-secondary-sidecar");
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+            LLAMA_LOG_INFO("%s: --moe-prefill-next-hot-exclusive-drives is enabled without --moe-tertiary-sidecar; only the secondary L+1 lane will be used\n",
+                    __func__);
+        }
 
         if (pimpl->flash_moe_prefill_stripe_enabled) {
             if (pimpl->flash_moe_prefill_stripe_weights[1] > 0 &&
@@ -3220,6 +3244,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 params.moe_prefetch_temporal_sparse ||
                 params.moe_predict_prev_token ||
                 params.moe_predict_top1_prev ||
+                params.moe_prefill_next_hot_experts > 0 ||
                 llama_flash_moe_mode_is(params, "oracle-prefetch");
 
         if (pimpl->flash_moe_prefetch_stripe_enabled && !prefetch_mode_active) {
@@ -9202,6 +9227,10 @@ bool llama_model::flash_moe_secondary_sidecar_enabled() const {
     return !pimpl->flash_moe_secondary_sidecar_entries.empty();
 }
 
+bool llama_model::flash_moe_tertiary_sidecar_enabled() const {
+    return !pimpl->flash_moe_tertiary_sidecar_entries.empty();
+}
+
 bool llama_model::flash_moe_demand_stripe_enabled() const {
     return pimpl->flash_moe_demand_stripe_enabled;
 }
@@ -9230,12 +9259,20 @@ bool llama_model::flash_moe_prefill_layer_major_enabled() const {
     return pimpl->flash_moe_prefill_layer_major_enabled;
 }
 
+bool llama_model::flash_moe_prefill_next_hot_exclusive_drives_enabled() const {
+    return pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled;
+}
+
 int32_t llama_model::flash_moe_slot_bank_size() const {
     return pimpl->flash_moe_slot_bank_size;
 }
 
 int32_t llama_model::flash_moe_prefill_banks() const {
     return std::max<int32_t>(1, pimpl->flash_moe_prefill_banks);
+}
+
+int32_t llama_model::flash_moe_prefill_next_hot_experts() const {
+    return std::max<int32_t>(0, pimpl->flash_moe_prefill_next_hot_experts);
 }
 
 int32_t llama_model::flash_moe_cache_io_split() const {
@@ -10069,6 +10106,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_cache_io_split          =*/ 4,
         /*.moe_prefill_cache_io_split  =*/ 0,
         /*.moe_prefetch_cache_io_split =*/ 0,
+        /*.moe_prefill_next_hot_exclusive_drives =*/ false,
+        /*.moe_prefill_next_hot_experts =*/ 0,
     };
 
     return result;

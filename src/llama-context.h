@@ -366,12 +366,16 @@ private:
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;
     mutable int64_t t_eval_us   = 0;
+    mutable int64_t flash_moe_prefill_eval_us = 0;
+    mutable int64_t flash_moe_decode_eval_us  = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
+    mutable int32_t flash_moe_prefill_eval_tokens = 0;
+    mutable int32_t flash_moe_decode_eval_tokens  = 0;
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };

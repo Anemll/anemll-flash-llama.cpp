@@ -1541,6 +1541,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    use_metal4_qk,
         int32_t nsg,
         int32_t walk_mode,
+        int32_t chunk_mode,
         int32_t nwg) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -1562,7 +1563,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_m4qk=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_walk=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_m4qk=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_walk=%d_chunk=%d_nwg=%d",
             base,
             has_mask,
             has_sinks,
@@ -1575,6 +1576,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             ns20,
             nsg,
             walk_mode,
+            chunk_mode,
             nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1595,6 +1597,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
         ggml_metal_cv_set_int32(cv, walk_mode, FC_FLASH_ATTN_EXT + 23);
         ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT + 24);
+        ggml_metal_cv_set_int32(cv, chunk_mode, FC_FLASH_ATTN_EXT + 25);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
