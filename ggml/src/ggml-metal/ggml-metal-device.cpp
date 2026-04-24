@@ -68,6 +68,16 @@ static int16_t ggml_metal_mul_mm_env_walk_mode() {
     return walk;
 }
 
+static bool ggml_metal_in_memory_fp16_activations_enabled() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_IN_MEMORY_FP16_ACTIVATIONS");
+    return value != nullptr &&
+            value[0] != '\0' &&
+            std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 &&
+            std::strcmp(value, "off") != 0 &&
+            std::strcmp(value, "no") != 0;
+}
+
 ggml_metal_device_t ggml_metal_device_get(int device) {
     static std::vector<ggml_metal_device_ptr> devs;
 
@@ -744,10 +754,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_types(
 
     const bool bc_inp = src0_ne0 % 32 != 0;
     const bool bc_out = out_ne0 % 64 != 0 || out_ne1 % 32 != 0;
+    const bool allow_f16_src1 = ggml_metal_in_memory_fp16_activations_enabled();
     const bool use_flashmoe_metal4_kernel =
             use_m5_expert &&
             ((f16_output &&
-              tsrc1 == GGML_TYPE_F32 &&
+              (tsrc1 == GGML_TYPE_F32 || (allow_f16_src1 && tsrc1 == GGML_TYPE_F16)) &&
               (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K)) ||
              (tsrc0 == GGML_TYPE_F16 && tsrc1 == GGML_TYPE_F16));
     // Keep the first custom Metal4 expert kernel numerically aligned with the proven

@@ -15,6 +15,7 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct llama_flash_moe_progress_stats;
 
 struct llama_cparams;
 
@@ -42,6 +43,17 @@ struct llm_flash_moe_slot_runtime_i {
     virtual ggml_tensor * select_routed_weight_tensor(int layer, ggml_tensor * tensor) = 0;
     virtual bool wants_tensor(const ggml_tensor * tensor) const = 0;
     virtual bool handle_tensor(ggml_tensor * tensor) = 0;
+    virtual bool progress_get_data(llama_flash_moe_progress_stats & out) const = 0;
+    virtual void set_prefill_batch_progress(
+            uint32_t current_batch,
+            uint32_t total_batches,
+            uint32_t batch_tokens,
+            uint32_t total_tokens) {
+        (void) current_batch;
+        (void) total_batches;
+        (void) batch_tokens;
+        (void) total_tokens;
+    }
 };
 
 // certain models (typically multi-modal) can produce different types of graphs

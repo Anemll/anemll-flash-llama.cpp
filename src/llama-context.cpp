@@ -70,6 +70,52 @@ static int32_t llama_moe_prefill_micro_batch_auto_for_tokens(int64_t prompt_toke
     return 160;
 }
 
+static std::vector<int32_t> llama_moe_prefill_bucket_sizes_for_limit(int64_t limit_tokens) {
+    static constexpr std::array<int32_t, 9> canonical_buckets = {
+        2048, 1024, 512, 256, 128, 64, 32, 16, 8,
+    };
+
+    std::vector<int32_t> buckets;
+    if (limit_tokens <= 0) {
+        return buckets;
+    }
+
+    for (const int32_t bucket : canonical_buckets) {
+        if (bucket <= limit_tokens) {
+            buckets.push_back(bucket);
+        }
+    }
+
+    if (buckets.empty()) {
+        buckets.push_back(int32_t(limit_tokens));
+    }
+
+    return buckets;
+}
+
+static int32_t llama_moe_prefill_select_bucket_size(
+        int64_t remaining_tokens,
+        const std::vector<int32_t> & buckets) {
+    GGML_ASSERT(!buckets.empty());
+
+    for (const int32_t bucket : buckets) {
+        if (bucket <= remaining_tokens) {
+            return bucket;
+        }
+    }
+
+    return buckets.back();
+}
+
+static bool llama_moe_prefill_greedy_buckets_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_IN_MEMORY_GREEDY_BUCKETS");
+        enabled = value != nullptr && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
 static void flash_moe_prepare_trace_output_path(const char * path) {
     if (path == nullptr || path[0] == '\0') {
         return;
@@ -213,6 +259,123 @@ static bool flash_moe_prefill_split_glu_compare_enabled() {
     return enabled == 1;
 }
 
+static bool flash_moe_prefill_m5_split_repack_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_M5_SPLIT_REPACK", false) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool flash_moe_prefill_m5_split_repack_compare_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DEBUG_COMPARE_M5_SPLIT_REPACK", false) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool flash_moe_prefill_m5_split_repack_debug_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DEBUG_M5_SPLIT_REPACK", false) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool flash_moe_in_memory_prefill_debug_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DEBUG_IN_MEMORY_PREFILL", false) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool flash_moe_in_memory_prefill_fp16_activations_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_IN_MEMORY_FP16_ACTIVATIONS", false) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static int32_t flash_moe_prefill_m5_split_repack_min_visible_cols() {
+    static int32_t min_cols = -1;
+    if (min_cols == -1) {
+        // Keep the experimental default conservative until the split-aware
+        // kernel can avoid the wasted cross-slice MM work on tiny chunks.
+        min_cols = 49;
+
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_M5_SPLIT_REPACK_MIN_COLS");
+        if (value != nullptr && value[0] != '\0') {
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && parsed > 8) {
+                min_cols = int32_t(std::min<long>(parsed, std::numeric_limits<int32_t>::max()));
+            }
+        }
+    }
+
+    return min_cols;
+}
+
+static int64_t flash_moe_prefill_gcd_i64(int64_t a, int64_t b) {
+    a = std::llabs(a);
+    b = std::llabs(b);
+    while (b != 0) {
+        const int64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+static int64_t flash_moe_prefill_lcm_i64(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    return (a / flash_moe_prefill_gcd_i64(a, b)) * b;
+}
+
+static int32_t flash_moe_prefill_pick_split_slices(
+        int64_t width,
+        int32_t logical_cols,
+        int64_t align_elems,
+        int32_t min_visible_cols) {
+    if (width <= 0 || logical_cols <= 0 || logical_cols > 8 || align_elems <= 0) {
+        return 0;
+    }
+
+    if (width % align_elems != 0) {
+        return 0;
+    }
+
+    const int64_t units = width / align_elems;
+    int32_t best = 0;
+    for (int64_t slices = 2; slices <= units; ++slices) {
+        if (units % slices != 0) {
+            continue;
+        }
+        if (logical_cols * slices <= min_visible_cols - 1) {
+            continue;
+        }
+        best = int32_t(slices);
+        break;
+    }
+
+    return best;
+}
+
+static inline float flash_moe_prefill_silu_f32(float x) {
+    return x / (1.0f + std::exp(-x));
+}
+
+static inline float flash_moe_prefill_gelu_f32(float x) {
+    static constexpr float sq2_over_pi = 0.7978845608028654f;
+    static constexpr float coef_a = 0.044715f;
+    return 0.5f * x * (1.0f + std::tanh(sq2_over_pi * x * (1.0f + coef_a * x * x)));
+}
+
 static ggml_tensor * flash_moe_prefill_mul_mat_f16(
         ggml_context * ctx,
         ggml_tensor  * a,
@@ -231,6 +394,60 @@ static ggml_tensor * flash_moe_prefill_mul_mat_f16(
     result->src[1] = b;
 
     return result;
+}
+
+static ggml_tensor * flash_moe_prefill_pack_k_slices_device(
+        ggml_context * ctx,
+        ggml_tensor  * input,
+        int32_t        slices) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(input != nullptr);
+    GGML_ASSERT(slices >= 1);
+
+    if (slices == 1) {
+        return input;
+    }
+
+    GGML_ASSERT(input->ne[0] % slices == 0);
+
+    const int64_t slice_width = input->ne[0] / slices;
+    ggml_tensor * reshaped = ggml_reshape_3d(ctx, input, slice_width, slices, input->ne[1]);
+    ggml_tensor * permuted = ggml_permute(ctx, reshaped, 0, 2, 1, 3);
+    ggml_tensor * packed3d = ggml_cont(ctx, permuted);
+    return ggml_reshape_2d(ctx, packed3d, slice_width, input->ne[1] * slices);
+}
+
+static ggml_tensor * flash_moe_prefill_reduce_packed_slice_blocks(
+        ggml_context * ctx,
+        const std::vector<ggml_tensor *> & slice_outputs,
+        int64_t rows,
+        int32_t logical_cols,
+        ggml_type accum_type = GGML_TYPE_F32) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(!slice_outputs.empty());
+    GGML_ASSERT(rows > 0);
+    GGML_ASSERT(logical_cols > 0);
+
+    ggml_tensor * accum = ggml_view_2d(
+            ctx, slice_outputs[0], rows, logical_cols, slice_outputs[0]->nb[1], 0);
+    if (accum->type != accum_type) {
+        accum = ggml_cast(ctx, accum, accum_type);
+    }
+    for (size_t slice = 1; slice < slice_outputs.size(); ++slice) {
+        ggml_tensor * block = ggml_view_2d(
+                ctx,
+                slice_outputs[slice],
+                rows,
+                logical_cols,
+                slice_outputs[slice]->nb[1],
+                size_t(slice) * size_t(logical_cols) * size_t(slice_outputs[slice]->nb[1]));
+        if (block->type != accum_type) {
+            block = ggml_cast(ctx, block, accum_type);
+        }
+        accum = ggml_add(ctx, accum, block);
+    }
+
+    return accum;
 }
 
 static ggml_tensor * flash_moe_prefill_split_glu(
@@ -1386,6 +1603,9 @@ private:
     int64_t prefill_inline_micro_batch_tokens = 0;
     bool prefill_inline_micro_batch_auto = false;
     int64_t prefill_inline_start_us = 0;
+    uint32_t prefill_inline_batch_index = 0;
+    uint32_t prefill_inline_batch_total = 0;
+    int64_t prefill_inline_total_tokens = 0;
     bool oracle_primed = false;
     bool oracle_prefetch_primed = false;
     size_t oracle_prefetch_repairs = 0;
@@ -1519,10 +1739,16 @@ private:
                         0.0;
         const char * tps_color = flash_moe_log_colors_enabled() ? "\033[33m" : "";
         const char * tps_reset = flash_moe_log_colors_enabled() ? "\033[0m" : "";
+        const uint32_t batch_index = prefill_inline_batch_total > 0 ? prefill_inline_batch_index : 1;
+        const uint32_t batch_total = prefill_inline_batch_total > 0 ? prefill_inline_batch_total : 1;
+        const int64_t total_tokens = prefill_inline_total_tokens > 0 ? prefill_inline_total_tokens : prefill_inline_tokens;
 
         std::fprintf(stderr,
-                "\r\033[KFlash-MoE prefill layer-major progress: %" PRId64 " tok batch, micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)",
+                "\r\033[KFlash-MoE prefill layer-major progress: batch %u/%u, %" PRId64 "/%" PRId64 " tok, micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)",
+                batch_index,
+                batch_total,
                 prefill_inline_tokens,
+                total_tokens,
                 prefill_inline_micro_batch_tokens,
                 prefill_inline_micro_batch_auto ? "(auto)" : "",
                 prefill_inline_layers_done,
@@ -1543,6 +1769,9 @@ private:
             prefill_inline_micro_batch_tokens = 0;
             prefill_inline_micro_batch_auto = false;
             prefill_inline_start_us = 0;
+            prefill_inline_batch_index = 0;
+            prefill_inline_batch_total = 0;
+            prefill_inline_total_tokens = 0;
         }
     }
 
@@ -1568,25 +1797,43 @@ private:
             int64_t rows,
             std::vector<float> & out) const {
         GGML_ASSERT(tensor != nullptr);
-        GGML_ASSERT(tensor->type == GGML_TYPE_F32);
         out.resize(size_t(width * rows));
+
+        auto decode_row = [&](const uint8_t * src, float * dst) {
+            switch (tensor->type) {
+                case GGML_TYPE_F32:
+                    std::memcpy(dst, src, size_t(width) * sizeof(float));
+                    break;
+                case GGML_TYPE_F16:
+                    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(src), dst, width);
+                    break;
+                case GGML_TYPE_BF16:
+                    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(src), dst, width);
+                    break;
+                default:
+                    throw std::runtime_error(format(
+                            "Flash-MoE dedicated prefill MoE does not support row read for tensor type %s",
+                            ggml_type_name(tensor->type)));
+            }
+        };
 
         if (const uint8_t * src = tensor_host_data(tensor)) {
             for (int64_t row = 0; row < rows; ++row) {
-                std::memcpy(
-                        out.data() + row * width,
+                decode_row(
                         src + size_t(row) * tensor->nb[1],
-                        size_t(width) * sizeof(float));
+                        out.data() + row * width);
             }
             return;
         }
 
+        std::vector<uint8_t> temp(ggml_row_size(tensor->type, width));
         for (int64_t row = 0; row < rows; ++row) {
             ggml_backend_tensor_get(
                     tensor,
-                    out.data() + row * width,
+                    temp.data(),
                     size_t(row) * tensor->nb[1],
-                    size_t(width) * sizeof(float));
+                    temp.size());
+            decode_row(temp.data(), out.data() + row * width);
         }
     }
 
@@ -1799,6 +2046,9 @@ private:
 
         if (dev == nullptr) {
             dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+            }
         }
 
         if (dev == nullptr) {
@@ -1916,6 +2166,14 @@ private:
             const ggml_tensor * weights_tensor) {
         GGML_ASSERT(uses_dedicated_prefill_moe(layer));
         auto & state = layers[layer];
+        const bool debug_in_memory_prefill = flash_moe_in_memory_prefill_debug_enabled();
+        auto debug_log = [&](const std::string & msg) {
+            if (!debug_in_memory_prefill) {
+                return;
+            }
+            std::fprintf(stderr, "%s: %s\n", __func__, msg.c_str());
+            std::fflush(stderr);
+        };
 
         const int64_t n_embd = cur_tensor->ne[0];
         const int64_t n_tokens = cur_tensor->ne[1];
@@ -1924,6 +2182,17 @@ private:
             std::memset(dst->data, 0, ggml_nbytes(dst));
             return;
         }
+
+        debug_log(format(
+                "enter layer=%d n_embd=%lld n_tokens=%lld topk=%lld cur_type=%s selected_type=%s weights_type=%s dst_type=%s",
+                layer,
+                (long long) n_embd,
+                (long long) n_tokens,
+                (long long) topk,
+                ggml_type_name(cur_tensor->type),
+                ggml_type_name(selected_experts_tensor->type),
+                ggml_type_name(weights_tensor->type),
+                ggml_type_name(dst->type)));
 
         routed_metrics local_stats;
         local_stats.calls = 1;
@@ -1938,6 +2207,12 @@ private:
         read_tensor_rows_f32(cur_tensor, n_embd, n_tokens, cur_host);
         read_weights_tensor(weights_tensor, topk, n_tokens, weights_host);
         local_stats.topk_read_us += ggml_time_us() - t_read_start_us;
+        debug_log(format(
+                "after_input_read layer=%d cur_rows=%zu weights=%zu read_us=%lld",
+                layer,
+                cur_host.size(),
+                weights_host.size(),
+                (long long) local_stats.topk_read_us));
 
         if (!state.pending_prefill_valid ||
             state.pending_prefill_topk != topk ||
@@ -2064,6 +2339,17 @@ private:
                              flash_moe_prefill_metal_dequant_to_f16_supported(gate_entry->quant_type) &&
                              flash_moe_prefill_metal_dequant_to_f16_supported(up_entry->quant_type))
                     );
+            const bool metal_split_repack_capable =
+                    ggml_backend_is_metal(exec_backend) &&
+                    down_entry != nullptr &&
+                    flash_moe_prefill_metal_split_glu_supported(down_entry->quant_type) &&
+                    (
+                            (use_gate_up_merged && gate_up_entry != nullptr &&
+                             flash_moe_prefill_metal_split_glu_supported(gate_up_entry->quant_type)) ||
+                            (!use_gate_up_merged && gate_entry != nullptr && up_entry != nullptr &&
+                             flash_moe_prefill_metal_split_glu_supported(gate_entry->quant_type) &&
+                             flash_moe_prefill_metal_split_glu_supported(up_entry->quant_type))
+                    );
             const bool metal_split_glu_capable =
                     ggml_backend_is_metal(exec_backend) &&
                     m5_expert_mm_min_tokens > 0 &&
@@ -2079,7 +2365,28 @@ private:
 #else
             const int32_t m5_expert_mm_min_tokens = 0;
             const bool metal_expert_mm_capable = false;
+            const bool metal_split_repack_capable = false;
             const bool metal_split_glu_capable = false;
+#endif
+
+#ifdef GGML_USE_METAL
+            const char * split_repack_env = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_M5_SPLIT_REPACK");
+            const char * split_repack_debug_env = std::getenv("LLAMA_FLASH_MOE_DEBUG_M5_SPLIT_REPACK");
+            if (split_repack_debug_env != nullptr && split_repack_debug_env[0] != '\0') {
+                std::fprintf(stderr,
+                        "%s: split_repack_entry layer=%d chunk_tokens=%d merged=%d backend_is_metal=%d enabled=%d compare=%d env=%s debug_env=%s capable=%d\n",
+                        __func__,
+                        layer,
+                        int32_t(chunk_tokens),
+                        use_gate_up_merged ? 1 : 0,
+                        ggml_backend_is_metal(exec_backend) ? 1 : 0,
+                        flash_moe_prefill_m5_split_repack_enabled() ? 1 : 0,
+                        flash_moe_prefill_m5_split_repack_compare_enabled() ? 1 : 0,
+                        split_repack_env != nullptr ? split_repack_env : "<unset>",
+                        split_repack_debug_env != nullptr ? split_repack_debug_env : "<unset>",
+                        metal_split_repack_capable ? 1 : 0);
+                std::fflush(stderr);
+            }
 #endif
 
             ggml_tensor * cur_in = ggml_new_tensor_2d(temp_ctx, GGML_TYPE_F32, n_embd, chunk_tokens);
@@ -2179,6 +2486,268 @@ private:
             std::memset(dst_f32, 0, ggml_nbytes(dst));
 
             std::array<int32_t, 3> distribution_current = { 0, 0, 0 };
+
+#ifdef GGML_USE_METAL
+            struct flash_moe_m5_expert_mm_scope {
+                explicit flash_moe_m5_expert_mm_scope(bool active) : active(active) {
+                    if (active) {
+                        ggml_metal_op_mul_mat_set_experimental_m5_expert_active(true);
+                    }
+                }
+
+                ~flash_moe_m5_expert_mm_scope() {
+                    if (active) {
+                        ggml_metal_op_mul_mat_set_experimental_m5_expert_active(false);
+                    }
+                }
+
+                bool active;
+            };
+
+            struct split_repack_debug_stats {
+                uint64_t candidate_chunks = 0;
+                uint64_t used_chunks = 0;
+                uint64_t used_stage1_only_chunks = 0;
+                uint64_t skipped_not_capable = 0;
+                uint64_t skipped_unsupported_type = 0;
+                uint64_t skipped_gate_slices = 0;
+                uint64_t skipped_down_slices = 0;
+            } split_repack_stats;
+            int split_repack_debug_logs = 0;
+
+            auto log_split_repack_debug = [&](const char * reason, int expert, int32_t ref_chunk,
+                                              ggml_type gate_type, ggml_type up_type, ggml_type down_type,
+                                              int32_t gate_slices, int32_t down_slices) {
+                if (!flash_moe_prefill_m5_split_repack_debug_enabled() || split_repack_debug_logs >= 24) {
+                    return;
+                }
+
+                std::fprintf(stderr,
+                        "%s: split_repack_debug layer=%d expert=%d chunk=%d reason=%s merged=%d gate=%s up=%s down=%s gate_slices=%d down_slices=%d min_cols=%d\n",
+                        __func__, layer, expert, ref_chunk, reason, use_gate_up_merged ? 1 : 0,
+                        ggml_type_name(gate_type), ggml_type_name(up_type), ggml_type_name(down_type),
+                        gate_slices, down_slices, flash_moe_prefill_m5_split_repack_min_visible_cols());
+                std::fflush(stderr);
+                split_repack_debug_logs++;
+            };
+
+            auto compare_split_repack_outputs = [&](int expert, int32_t ref_chunk,
+                                                   const std::vector<float> & ref_vals,
+                                                   const std::vector<float> & test_vals) {
+                static int compare_logs = 0;
+
+                if (ref_vals.size() != test_vals.size()) {
+                    std::fprintf(stderr,
+                            "%s: split_repack_compare size mismatch layer=%d expert=%d ref=%zu test=%zu\n",
+                            __func__, layer, expert, ref_vals.size(), test_vals.size());
+                    std::fflush(stderr);
+                    return;
+                }
+
+                double sum_abs = 0.0;
+                float max_abs = 0.0f;
+                size_t max_idx = 0;
+                for (size_t i = 0; i < ref_vals.size(); ++i) {
+                    const float diff = std::fabs(ref_vals[i] - test_vals[i]);
+                    sum_abs += diff;
+                    if (diff > max_abs) {
+                        max_abs = diff;
+                        max_idx = i;
+                    }
+                }
+
+                if (compare_logs < 16) {
+                    const double mean_abs = ref_vals.empty() ? 0.0 : sum_abs / double(ref_vals.size());
+                    std::fprintf(stderr,
+                            "%s: split_repack_compare layer=%d expert=%d chunk=%d max_abs=%g mean_abs=%g idx=%zu ref=%g test=%g\n",
+                            __func__, layer, expert, ref_chunk, double(max_abs), mean_abs, max_idx,
+                            ref_vals.empty() ? 0.0 : double(ref_vals[max_idx]),
+                            test_vals.empty() ? 0.0 : double(test_vals[max_idx]));
+                    std::fflush(stderr);
+                    compare_logs++;
+                }
+            };
+
+            auto try_m5_split_repack_chunk = [&](int expert, int32_t ref_chunk, float expert_output_scale,
+                                                 std::vector<float> & out_scaled) -> bool {
+                if (!flash_moe_prefill_m5_split_repack_enabled() ||
+                    !ggml_backend_is_metal(exec_backend) ||
+                    ref_chunk <= 0 || ref_chunk > 8) {
+                    return false;
+                }
+
+                const ggml_type gate_type = use_gate_up_merged ? gate_up_w->type : gate_w->type;
+                const ggml_type up_type = use_gate_up_merged ? gate_up_w->type : up_w->type;
+                const ggml_type down_type = down_w->type;
+                if (!flash_moe_prefill_metal_split_glu_supported(gate_type) ||
+                    !flash_moe_prefill_metal_split_glu_supported(up_type) ||
+                    !flash_moe_prefill_metal_split_glu_supported(down_type)) {
+                    split_repack_stats.skipped_unsupported_type++;
+                    log_split_repack_debug("unsupported_type", expert, ref_chunk, gate_type, up_type, down_type, 0, 0);
+                    return false;
+                }
+
+                const int64_t gate_align = use_gate_up_merged ?
+                        ggml_blck_size(gate_type) :
+                        flash_moe_prefill_lcm_i64(ggml_blck_size(gate_type), ggml_blck_size(up_type));
+                const int32_t gate_slices = flash_moe_prefill_pick_split_slices(
+                        n_embd,
+                        ref_chunk,
+                        gate_align,
+                        flash_moe_prefill_m5_split_repack_min_visible_cols());
+                if (gate_slices < 2) {
+                    split_repack_stats.skipped_gate_slices++;
+                    log_split_repack_debug("gate_unsliced", expert, ref_chunk, gate_type, up_type, down_type, gate_slices, 0);
+                    return false;
+                }
+
+                const int64_t n_ff = use_gate_up_merged ? gate_up_w->ne[1] / 2 : gate_w->ne[1];
+                const int32_t down_slices = flash_moe_prefill_pick_split_slices(
+                        n_ff,
+                        ref_chunk,
+                        ggml_blck_size(down_type),
+                        flash_moe_prefill_m5_split_repack_min_visible_cols());
+                const bool split_down_stage = down_slices >= 2;
+
+                const int64_t gate_slice_width = n_embd / gate_slices;
+                const int64_t stage1_rows = use_gate_up_merged ? gate_up_w->ne[1] : gate_w->ne[1];
+                std::vector<float> split_output(size_t(n_embd * ref_chunk), 0.0f);
+
+                ggml_context * split_ctx = nullptr;
+                ggml_backend_buffer_t split_buffer = nullptr;
+                try {
+                    ggml_init_params params = {
+                        /*.mem_size   =*/ 4 * 1024 * 1024,
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    split_ctx = ggml_init(params);
+                    if (split_ctx == nullptr) {
+                        throw std::runtime_error("Flash-MoE split-repack failed to create a temporary graph context");
+                    }
+
+                    ggml_tensor * split_input = ggml_new_tensor_2d(split_ctx, GGML_TYPE_F32, n_embd, ref_chunk);
+                    ggml_tensor * gate_pack_tensor = flash_moe_prefill_pack_k_slices_device(split_ctx, split_input, gate_slices);
+                    ggml_tensor * act_tensor = nullptr;
+
+                    if (use_gate_up_merged) {
+                        std::vector<ggml_tensor *> gate_up_outputs;
+                        gate_up_outputs.reserve(size_t(gate_slices));
+                        for (int32_t slice = 0; slice < gate_slices; ++slice) {
+                            const size_t slice_offset = ggml_row_size(gate_type, int64_t(slice) * gate_slice_width);
+                            ggml_tensor * gate_up_view = ggml_view_2d(
+                                    split_ctx, gate_up_w, gate_slice_width, gate_up_w->ne[1], gate_up_w->nb[1], slice_offset);
+                            gate_up_outputs.push_back(flash_moe_prefill_mul_mat_f16(split_ctx, gate_up_view, gate_pack_tensor));
+                        }
+
+                        ggml_tensor * gate_up_acc = flash_moe_prefill_reduce_packed_slice_blocks(
+                                split_ctx, gate_up_outputs, stage1_rows, ref_chunk);
+                        ggml_tensor * gate_tensor = ggml_view_2d(
+                                split_ctx, gate_up_acc, n_ff, ref_chunk, gate_up_acc->nb[1], 0);
+                        ggml_tensor * up_tensor = ggml_view_2d(
+                                split_ctx, gate_up_acc, n_ff, ref_chunk, gate_up_acc->nb[1], n_ff * gate_up_acc->nb[0]);
+                        act_tensor = ggml_geglu_split(split_ctx, gate_tensor, up_tensor);
+                    } else {
+                        std::vector<ggml_tensor *> gate_outputs;
+                        std::vector<ggml_tensor *> up_outputs;
+                        gate_outputs.reserve(size_t(gate_slices));
+                        up_outputs.reserve(size_t(gate_slices));
+                        for (int32_t slice = 0; slice < gate_slices; ++slice) {
+                            const size_t slice_offset = ggml_row_size(gate_type, int64_t(slice) * gate_slice_width);
+                            ggml_tensor * gate_view = ggml_view_2d(
+                                    split_ctx, gate_w, gate_slice_width, gate_w->ne[1], gate_w->nb[1], slice_offset);
+                            ggml_tensor * up_view = ggml_view_2d(
+                                    split_ctx, up_w, gate_slice_width, up_w->ne[1], up_w->nb[1], slice_offset);
+                            gate_outputs.push_back(flash_moe_prefill_mul_mat_f16(split_ctx, gate_view, gate_pack_tensor));
+                            up_outputs.push_back(flash_moe_prefill_mul_mat_f16(split_ctx, up_view, gate_pack_tensor));
+                        }
+
+                        ggml_tensor * gate_acc = flash_moe_prefill_reduce_packed_slice_blocks(
+                                split_ctx, gate_outputs, n_ff, ref_chunk);
+                        ggml_tensor * up_acc = flash_moe_prefill_reduce_packed_slice_blocks(
+                                split_ctx, up_outputs, n_ff, ref_chunk);
+                        act_tensor = ggml_swiglu_split(split_ctx, gate_acc, up_acc);
+                    }
+
+                    ggml_tensor * act_for_down = act_tensor;
+                    if (act_for_down->type != GGML_TYPE_F32) {
+                        act_for_down = ggml_cast(split_ctx, act_for_down, GGML_TYPE_F32);
+                    }
+
+                    ggml_tensor * final_output = nullptr;
+                    if (split_down_stage) {
+                        const int64_t down_slice_width = n_ff / down_slices;
+                        ggml_tensor * packed_act = flash_moe_prefill_pack_k_slices_device(split_ctx, act_for_down, down_slices);
+                        std::vector<ggml_tensor *> down_outputs;
+                        down_outputs.reserve(size_t(down_slices));
+                        for (int32_t slice = 0; slice < down_slices; ++slice) {
+                            const size_t slice_offset = ggml_row_size(down_type, int64_t(slice) * down_slice_width);
+                            ggml_tensor * down_view = ggml_view_2d(
+                                    split_ctx, down_w, down_slice_width, down_w->ne[1], down_w->nb[1], slice_offset);
+                            down_outputs.push_back(flash_moe_prefill_mul_mat_f16(split_ctx, down_view, packed_act));
+                        }
+                        final_output = flash_moe_prefill_reduce_packed_slice_blocks(
+                                split_ctx, down_outputs, n_embd, ref_chunk);
+                    } else {
+                        final_output = ggml_mul_mat(split_ctx, down_w, act_for_down);
+                    }
+
+                    ggml_tensor * final_cont = ggml_cont(split_ctx, final_output);
+                    ggml_cgraph * split_graph = ggml_new_graph_custom(split_ctx, 1024, false);
+                    ggml_build_forward_expand(split_graph, final_cont);
+
+                    split_buffer = ggml_backend_alloc_ctx_tensors(split_ctx, exec_backend);
+                    if (split_buffer == nullptr) {
+                        throw std::runtime_error("Flash-MoE split-repack failed to allocate temporary tensors");
+                    }
+
+                    ggml_backend_tensor_set(split_input, gathered_inputs.data(), 0, ggml_nbytes(split_input));
+
+                    flash_moe_m5_expert_mm_scope scope(true);
+                    const ggml_status status = ggml_backend_graph_compute(exec_backend, split_graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        throw std::runtime_error(format(
+                                "Flash-MoE split-repack compute failed for layer %d with status %d",
+                                layer, int(status)));
+                    }
+
+                    read_tensor_rows_f32(final_cont, n_embd, ref_chunk, split_output);
+                } catch (...) {
+                    if (split_buffer != nullptr) {
+                        ggml_backend_buffer_free(split_buffer);
+                    }
+                    if (split_ctx != nullptr) {
+                        ggml_free(split_ctx);
+                    }
+                    throw;
+                }
+
+                if (split_buffer != nullptr) {
+                    ggml_backend_buffer_free(split_buffer);
+                }
+                if (split_ctx != nullptr) {
+                    ggml_free(split_ctx);
+                }
+
+                out_scaled.assign(size_t(n_embd * ref_chunk), 0.0f);
+                for (int32_t token = 0; token < ref_chunk; ++token) {
+                    const float * src_row = split_output.data() + size_t(token) * size_t(n_embd);
+                    float * dst_row = out_scaled.data() + size_t(token) * size_t(n_embd);
+                    for (int64_t row = 0; row < n_embd; ++row) {
+                        dst_row[row] = expert_output_scale * src_row[row];
+                    }
+                }
+
+                split_repack_stats.used_chunks++;
+                if (!split_down_stage) {
+                    split_repack_stats.used_stage1_only_chunks++;
+                    log_split_repack_debug("used_stage1_only", expert, ref_chunk, gate_type, up_type, down_type, gate_slices, down_slices);
+                } else {
+                    log_split_repack_debug("used", expert, ref_chunk, gate_type, up_type, down_type, gate_slices, down_slices);
+                }
+                return true;
+            };
+#endif
 
             auto select_lane = [&]() {
                 if (prefill_distribute_enabled && !prefill_stripe_enabled) {
@@ -2764,6 +3333,24 @@ private:
                         const bool use_metal_expert_mm_for_chunk =
                                 use_metal_expert_mm_for_expert &&
                                 ref_chunk > 8;
+                        const bool use_metal_split_repack_for_chunk =
+                                metal_split_repack_capable &&
+                                ref_chunk <= 8;
+                        if (flash_moe_prefill_m5_split_repack_enabled() && ref_chunk <= 8) {
+                            split_repack_stats.candidate_chunks++;
+                            if (!metal_split_repack_capable) {
+                                split_repack_stats.skipped_not_capable++;
+                                log_split_repack_debug(
+                                        "not_capable",
+                                        loaded.expert,
+                                        ref_chunk,
+                                        use_gate_up_merged ? gate_up_w->type : gate_w->type,
+                                        use_gate_up_merged ? gate_up_w->type : up_w->type,
+                                        down_w->type,
+                                        0,
+                                        0);
+                            }
+                        }
                         static bool split_glu_stage_compare_done = false;
                         const bool debug_compare_split_glu =
                                 !split_glu_stage_compare_done &&
@@ -2787,23 +3374,46 @@ private:
                                     size_t(n_embd) * sizeof(float));
                         }
 
+#ifdef GGML_USE_METAL
+                        std::vector<float> split_repack_output;
+                        const bool used_split_repack =
+                                use_metal_split_repack_for_chunk &&
+                                try_m5_split_repack_chunk(loaded.expert, ref_chunk, expert_output_scale, split_repack_output);
+                        if (used_split_repack) {
+                            if (flash_moe_prefill_m5_split_repack_compare_enabled()) {
+                                ggml_backend_tensor_set(cur_in, gathered_inputs.data(), 0, ggml_nbytes(cur_in));
+                                const ggml_status status_ref = ggml_backend_graph_compute(exec_backend, temp_graph);
+                                if (status_ref != GGML_STATUS_SUCCESS) {
+                                    throw std::runtime_error(format(
+                                            "Flash-MoE split-repack compare baseline failed for layer %d with status %d",
+                                            layer, int(status_ref)));
+                                }
+
+                                std::vector<float> baseline_output;
+                                read_tensor_rows_f32(out, n_embd, ref_chunk, baseline_output);
+                                for (float & value : baseline_output) {
+                                    value *= expert_output_scale;
+                                }
+                                compare_split_repack_outputs(loaded.expert, ref_chunk, baseline_output, split_repack_output);
+                            }
+
+                            for (int32_t j = 0; j < ref_chunk; ++j) {
+                                const int32_t token = plan.expert_ref_tokens[size_t(ref_begin + ref_offset + j)];
+                                const float weight = plan.expert_ref_weights[size_t(ref_begin + ref_offset + j)];
+                                float * dst_row = dst_f32 + size_t(token) * size_t(n_embd);
+                                const float * src_row = split_repack_output.data() + size_t(j) * size_t(n_embd);
+                                for (int64_t col = 0; col < n_embd; ++col) {
+                                    dst_row[col] += weight * src_row[col];
+                                }
+                            }
+                            local_stats.prefill_compute_us += ggml_time_us() - t_compute_start_us;
+                            continue;
+                        }
+#endif
+
                         ggml_backend_tensor_set(cur_in, gathered_inputs.data(), 0, ggml_nbytes(cur_in));
 #ifdef GGML_USE_METAL
-                        struct flash_moe_m5_expert_mm_scope {
-                            explicit flash_moe_m5_expert_mm_scope(bool active) : active(active) {
-                                if (active) {
-                                    ggml_metal_op_mul_mat_set_experimental_m5_expert_active(true);
-                                }
-                            }
-
-                            ~flash_moe_m5_expert_mm_scope() {
-                                if (active) {
-                                    ggml_metal_op_mul_mat_set_experimental_m5_expert_active(false);
-                                }
-                            }
-
-                            bool active;
-                        } m5_expert_mm_scope(use_metal_expert_mm_for_chunk);
+                        flash_moe_m5_expert_mm_scope m5_expert_mm_scope(use_metal_expert_mm_for_chunk);
 #endif
                         const ggml_status status_ref = ggml_backend_graph_compute(
                                 exec_backend,
@@ -2896,6 +3506,21 @@ private:
                         }
                         local_stats.prefill_compute_us += ggml_time_us() - t_compute_start_us;
                     }
+                }
+
+                if (flash_moe_prefill_m5_split_repack_debug_enabled() && split_repack_stats.candidate_chunks > 0) {
+                    std::fprintf(stderr,
+                            "%s: split_repack_summary layer=%d candidates=%" PRIu64 " used=%" PRIu64 " used_stage1_only=%" PRIu64 " skipped_not_capable=%" PRIu64 " skipped_type=%" PRIu64 " skipped_gate=%" PRIu64 " skipped_down=%" PRIu64 "\n",
+                            __func__,
+                            layer,
+                            split_repack_stats.candidate_chunks,
+                            split_repack_stats.used_chunks,
+                            split_repack_stats.used_stage1_only_chunks,
+                            split_repack_stats.skipped_not_capable,
+                            split_repack_stats.skipped_unsupported_type,
+                            split_repack_stats.skipped_gate_slices,
+                            split_repack_stats.skipped_down_slices);
+                    std::fflush(stderr);
                 }
 
                 if (!next_batch_future.valid()) {
@@ -3404,7 +4029,18 @@ private:
     }
 
 public:
-    bool progress_get_data(llama_flash_moe_progress_stats & out) const {
+    void set_prefill_batch_progress(
+            uint32_t current_batch,
+            uint32_t total_batches,
+            uint32_t batch_tokens,
+            uint32_t total_tokens) override {
+        prefill_inline_batch_index = current_batch;
+        prefill_inline_batch_total = total_batches;
+        prefill_inline_tokens = batch_tokens;
+        prefill_inline_total_tokens = total_tokens;
+    }
+
+    bool progress_get_data(llama_flash_moe_progress_stats & out) const override {
         routed_metrics total;
         for (const auto & layer : layers) {
             if (layer.stats.calls == 0) {
@@ -6044,6 +6680,1899 @@ private:
     }
 };
 
+class llama_flash_moe_in_memory_prefill_runtime : public llm_flash_moe_slot_runtime_i {
+public:
+    explicit llama_flash_moe_in_memory_prefill_runtime(
+            const llama_model & model,
+            bool perf_profile,
+            int32_t prefill_micro_batch_tokens = 0,
+            const int64_t * overall_prompt_eval_us = nullptr,
+            const int32_t * overall_prompt_eval_tokens = nullptr)
+            : model(model),
+              expert_count(model.hparams.n_expert),
+              perf_profile(perf_profile),
+              prefill_micro_batch_tokens(prefill_micro_batch_tokens == -1 ? -1 : std::max<int32_t>(0, prefill_micro_batch_tokens)),
+              overall_prompt_eval_us(overall_prompt_eval_us),
+              overall_prompt_eval_tokens(overall_prompt_eval_tokens) {
+        layers.resize(model.layers.size());
+        prefill_moe_ud.resize(model.layers.size());
+
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            auto & state = layers[il];
+            const auto & layer = model.layers[il];
+            state.enabled = layer_supports_dedicated_prefill(layer);
+            if (!state.enabled) {
+                continue;
+            }
+
+            state.gate_up_tensor = layer.ffn_gate_up_exps;
+            state.gate_tensor    = layer.ffn_gate_exps;
+            state.up_tensor      = layer.ffn_up_exps;
+            state.down_tensor    = layer.ffn_down_exps;
+        }
+    }
+
+    ~llama_flash_moe_in_memory_prefill_runtime() override {
+        for (auto & [_, backend] : prefill_exec_backends) {
+            if (backend != nullptr) {
+                ggml_backend_free(backend);
+            }
+        }
+        if (prefill_cpu_backend != nullptr) {
+            ggml_backend_free(prefill_cpu_backend);
+        }
+    }
+
+    bool uses_layer(int layer) const override {
+        return layer >= 0 && layer < (int) layers.size() && layers[layer].enabled;
+    }
+
+    bool uses_native_slot_map(int layer) const override {
+        GGML_UNUSED(layer);
+        return false;
+    }
+
+    bool uses_dedicated_prefill_moe(int layer) const override {
+        return uses_layer(layer);
+    }
+
+    void bind_slot_ids_input(int layer, ggml_tensor * slot_ids) override {
+        GGML_UNUSED(layer);
+        GGML_UNUSED(slot_ids);
+    }
+
+    ggml_tensor * build_slot_ids_tensor(ggml_context * ctx0, ggml_tensor * selected_experts, int layer) override {
+        GGML_UNUSED(ctx0);
+        GGML_UNUSED(layer);
+        return selected_experts;
+    }
+
+    ggml_tensor * build_prefill_moe_tensor(
+            ggml_context * ctx0,
+            ggml_tensor * cur,
+            ggml_tensor * selected_experts,
+            ggml_tensor * weights,
+            int layer) override {
+        if (!uses_dedicated_prefill_moe(layer)) {
+            return nullptr;
+        }
+
+        auto & userdata = prefill_moe_ud[layer];
+        userdata.runtime = this;
+        userdata.layer = layer;
+
+        return ggml_map_custom3(ctx0, cur, selected_experts, weights, prefill_moe_custom_op, 1, &userdata);
+    }
+
+    ggml_tensor * select_routed_weight_tensor(int layer, ggml_tensor * tensor) override {
+        GGML_UNUSED(layer);
+        return tensor;
+    }
+
+    bool wants_tensor(const ggml_tensor * tensor) const override {
+        int layer = -1;
+        return parse_topk_layer(ggml_get_name(tensor), layer) && uses_layer(layer);
+    }
+
+    bool handle_tensor(ggml_tensor * tensor) override {
+        int layer = -1;
+        if (!parse_topk_layer(ggml_get_name(tensor), layer) || !uses_layer(layer)) {
+            return true;
+        }
+
+        capture_prefill_topk(layer, tensor);
+        return true;
+    }
+
+    void set_prefill_batch_progress(
+            uint32_t current_batch,
+            uint32_t total_batches,
+            uint32_t batch_tokens,
+            uint32_t total_tokens) override {
+        prefill_inline_batch_index = current_batch;
+        prefill_inline_batch_total = total_batches;
+        prefill_inline_tokens = batch_tokens;
+        prefill_inline_total_tokens = total_tokens;
+    }
+
+    bool progress_get_data(llama_flash_moe_progress_stats & out) const override {
+        routed_metrics total;
+        for (const auto & layer : layers) {
+            if (layer.stats.calls == 0) {
+                continue;
+            }
+            accumulate_metrics(total, layer.stats);
+        }
+
+        if (total.calls == 0) {
+            return false;
+        }
+
+        std::memset(&out, 0, sizeof(out));
+        out.available = true;
+        out.prefill_profile = true;
+        out.unique_experts = total.unique_experts;
+        out.miss_experts = total.miss_experts;
+        out.token_refs = total.token_refs;
+        out.bytes_loaded = total.bytes_loaded;
+        out.cache_hit_pct = total.unique_experts > 0 ? 100.0 * double(total.hit_experts) / double(total.unique_experts) : 0.0;
+
+        const int64_t source_wall_us = total.source_wall_us > 0 ? total.source_wall_us : total.source_us;
+        out.reload_bw_gbps = source_wall_us > 0 ?
+                (double(total.bytes_loaded) / 1e9) / (double(source_wall_us) / 1e6) : 0.0;
+
+        const uint64_t dedup_saved = total.token_refs > total.unique_experts ? total.token_refs - total.unique_experts : 0;
+        out.dedup_saved_pct = total.token_refs > 0 ? 100.0 * double(dedup_saved) / double(total.token_refs) : 0.0;
+        out.reuse_factor = total.unique_experts > 0 ? double(total.token_refs) / double(total.unique_experts) : 0.0;
+
+        return true;
+    }
+
+private:
+    struct prefill_moe_userdata {
+        llama_flash_moe_in_memory_prefill_runtime * runtime = nullptr;
+        int layer = -1;
+    };
+
+    struct prefill_selected_plan {
+        std::vector<int32_t> unique_experts;
+        std::vector<int32_t> expert_ref_offsets;
+        std::vector<int32_t> expert_ref_tokens;
+        std::vector<float>   expert_ref_weights;
+        int32_t max_refs_per_expert = 0;
+        int32_t max_tokens_per_expert = 0;
+    };
+
+    struct routed_metrics {
+        uint64_t calls = 0;
+        uint64_t prompt_tokens = 0;
+        uint64_t token_refs = 0;
+        uint64_t unique_experts = 0;
+        uint64_t hit_experts = 0;
+        uint64_t miss_experts = 0;
+        uint64_t max_refs_per_expert = 0;
+        uint64_t max_tokens_per_expert = 0;
+        uint64_t bytes_loaded = 0;
+        int64_t total_us = 0;
+        int64_t topk_read_us = 0;
+        int64_t source_us = 0;
+        int64_t source_wall_us = 0;
+        int64_t prefill_stage_us = 0;
+        int64_t prefill_compute_us = 0;
+        int64_t prefill_setup_us = 0;
+        uint64_t gate_up_bytes = 0;
+        uint64_t gate_bytes = 0;
+        uint64_t up_bytes = 0;
+        uint64_t down_bytes = 0;
+        uint64_t prefill_stage_bytes = 0;
+    };
+
+    struct layer_state {
+        bool enabled = false;
+        ggml_tensor * gate_up_tensor = nullptr;
+        ggml_tensor * gate_tensor    = nullptr;
+        ggml_tensor * up_tensor      = nullptr;
+        ggml_tensor * down_tensor    = nullptr;
+        std::vector<int32_t> pending_prefill_selected_experts;
+        int64_t pending_prefill_topk = 0;
+        int64_t pending_prefill_tokens = 0;
+        bool pending_prefill_valid = false;
+        routed_metrics stats;
+    };
+
+    int32_t dedicated_prefill_layer_count() const {
+        int32_t count = 0;
+        for (size_t layer = 0; layer < layers.size(); ++layer) {
+            if (uses_dedicated_prefill_moe((int) layer)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    int32_t first_dedicated_prefill_layer() const {
+        for (size_t layer = 0; layer < layers.size(); ++layer) {
+            if (uses_dedicated_prefill_moe((int) layer)) {
+                return (int32_t) layer;
+            }
+        }
+        return -1;
+    }
+
+    void prefill_inline_progress_begin_if_needed(int layer, int64_t n_tokens, int64_t micro_batch_tokens, bool micro_batch_auto) {
+        if (!perf_profile || !flash_moe_prefill_inline_progress_enabled()) {
+            return;
+        }
+
+        if (n_tokens <= 2 || layer != first_dedicated_prefill_layer()) {
+            return;
+        }
+
+        prefill_inline_total_layers = dedicated_prefill_layer_count();
+        prefill_inline_layers_done = 0;
+        prefill_inline_tokens = n_tokens;
+        prefill_inline_micro_batch_tokens = micro_batch_tokens;
+        prefill_inline_micro_batch_auto = micro_batch_auto;
+        prefill_inline_start_us = ggml_time_us();
+        prefill_inline_chunk_stats = {};
+        prefill_inline_progress_active = prefill_inline_total_layers > 0;
+    }
+
+    void prefill_inline_progress_accumulate_layer(const routed_metrics & stats) {
+        if (!prefill_inline_progress_active) {
+            return;
+        }
+
+        accumulate_metrics(prefill_inline_chunk_stats, stats);
+    }
+
+    void prefill_inline_progress_advance() {
+        if (!prefill_inline_progress_active) {
+            return;
+        }
+
+        prefill_inline_layers_done = std::min(prefill_inline_total_layers, prefill_inline_layers_done + 1);
+        const double progress_frac = prefill_inline_total_layers > 0 ?
+                double(prefill_inline_layers_done) / double(prefill_inline_total_layers) : 1.0;
+        const double progress_pct = 100.0 * progress_frac;
+        const double elapsed_s =
+                prefill_inline_start_us > 0 ? double(ggml_time_us() - prefill_inline_start_us) / 1e6 : 0.0;
+        const double est_tps =
+                progress_frac > 0.0 && elapsed_s > 0.0 ?
+                        (double(prefill_inline_tokens) * progress_frac) / elapsed_s :
+                        0.0;
+        const char * tps_color = flash_moe_log_colors_enabled() ? "\033[33m" : "";
+        const char * tps_reset = flash_moe_log_colors_enabled() ? "\033[0m" : "";
+        const uint32_t batch_index = prefill_inline_batch_total > 0 ? prefill_inline_batch_index : 1;
+        const uint32_t batch_total = prefill_inline_batch_total > 0 ? prefill_inline_batch_total : 1;
+        const int64_t total_tokens = prefill_inline_total_tokens > 0 ? prefill_inline_total_tokens : prefill_inline_tokens;
+
+        std::fprintf(stderr,
+                "\r\033[KFlash-MoE prefill layer-major progress: batch %u/%u, %" PRId64 "/%" PRId64 " tok, micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)",
+                batch_index,
+                batch_total,
+                prefill_inline_tokens,
+                total_tokens,
+                prefill_inline_micro_batch_tokens,
+                prefill_inline_micro_batch_auto ? "(auto)" : "",
+                prefill_inline_layers_done,
+                prefill_inline_total_layers,
+                progress_pct,
+                tps_color,
+                est_tps,
+                tps_reset);
+        std::fflush(stderr);
+
+        if (prefill_inline_layers_done >= prefill_inline_total_layers) {
+            std::fprintf(stderr, "%s", "\n");
+            print_prefill_inline_chunk_stats(batch_index, batch_total, total_tokens, elapsed_s, est_tps);
+            std::fflush(stderr);
+            prefill_inline_progress_reset();
+        }
+    }
+
+    void prefill_inline_progress_finish() {
+        if (!prefill_inline_progress_active) {
+            return;
+        }
+
+        std::fprintf(stderr, "%s", "\n");
+        std::fflush(stderr);
+        prefill_inline_progress_reset();
+    }
+
+    void prefill_inline_progress_reset() {
+        prefill_inline_progress_active = false;
+        prefill_inline_total_layers = 0;
+        prefill_inline_layers_done = 0;
+        prefill_inline_tokens = 0;
+        prefill_inline_micro_batch_tokens = 0;
+        prefill_inline_micro_batch_auto = false;
+        prefill_inline_start_us = 0;
+        prefill_inline_batch_index = 0;
+        prefill_inline_batch_total = 0;
+        prefill_inline_total_tokens = 0;
+        prefill_inline_chunk_stats = {};
+    }
+
+    void print_prefill_inline_chunk_stats(
+            uint32_t batch_index,
+            uint32_t batch_total,
+            int64_t total_tokens,
+            double elapsed_s,
+            double est_tps) const {
+        const routed_metrics & stats = prefill_inline_chunk_stats;
+        if (stats.calls == 0) {
+            return;
+        }
+
+        const double setup_ms = double(stats.prefill_setup_us) / 1000.0;
+        const double topk_ms = double(stats.topk_read_us) / 1000.0;
+        const double source_ms = double(stats.source_wall_us > 0 ? stats.source_wall_us : stats.source_us) / 1000.0;
+        const double stage_ms = double(stats.prefill_stage_us) / 1000.0;
+        const double compute_ms = double(stats.prefill_compute_us) / 1000.0;
+        const double stage_gbps = stats.prefill_stage_us > 0 ?
+                (double(stats.prefill_stage_bytes) / 1e9) / (double(stats.prefill_stage_us) / 1e6) : 0.0;
+        const double source_gbps = (stats.source_wall_us > 0 || stats.source_us > 0) ?
+                (double(stats.bytes_loaded) / 1e9) / (double(stats.source_wall_us > 0 ? stats.source_wall_us : stats.source_us) / 1e6) : 0.0;
+        const double reuse = stats.unique_experts > 0 ? double(stats.token_refs) / double(stats.unique_experts) : 0.0;
+
+        LLAMA_LOG_INFO(
+                "Flash-MoE prefill layer-major chunk stats: batch %u/%u, tokens=%" PRId64 "/%" PRId64 ", layers=%d, tps=%.1f, wall=%.1f ms, "
+                "setup=%.1f ms, topk=%.1f ms, source=%.1f ms (%.2f GB/s), stage=%.1f ms (%.2f GB/s), "
+                "compute=%.1f ms, unique=%" PRIu64 ", refs=%" PRIu64 ", reuse=%.2fx, max_refs/expert=%" PRIu64 "\n",
+                batch_index,
+                batch_total,
+                prefill_inline_tokens,
+                total_tokens,
+                prefill_inline_total_layers,
+                est_tps,
+                elapsed_s * 1000.0,
+                setup_ms,
+                topk_ms,
+                source_ms,
+                source_gbps,
+                stage_ms,
+                stage_gbps,
+                compute_ms,
+                stats.unique_experts,
+                stats.token_refs,
+                reuse,
+                stats.max_refs_per_expert);
+    }
+
+    static void prefill_moe_custom_op(
+            ggml_tensor * dst,
+            const ggml_tensor * a,
+            const ggml_tensor * b,
+            const ggml_tensor * c,
+            int ith,
+            int nth,
+            void * userdata) {
+        GGML_UNUSED(nth);
+
+        if (ith != 0) {
+            return;
+        }
+
+        auto * prefill_userdata = static_cast<prefill_moe_userdata *>(userdata);
+        GGML_ASSERT(prefill_userdata != nullptr);
+        GGML_ASSERT(prefill_userdata->runtime != nullptr);
+        GGML_ASSERT(prefill_userdata->layer >= 0);
+
+        prefill_userdata->runtime->compute_prefill_moe_tensor(
+                prefill_userdata->layer,
+                dst,
+                a,
+                b,
+                c);
+    }
+
+    bool layer_supports_dedicated_prefill(const llama_layer & model_layer) const {
+        const bool separate_gate_up_down =
+                model_layer.ffn_gate_up_exps == nullptr &&
+                model_layer.ffn_gate_exps    != nullptr &&
+                model_layer.ffn_up_exps      != nullptr &&
+                model_layer.ffn_down_exps    != nullptr &&
+                model_layer.ffn_gate_exps_b  == nullptr &&
+                model_layer.ffn_up_exps_b    == nullptr &&
+                model_layer.ffn_down_exps_b  == nullptr;
+
+        const bool merged_gate_up_down =
+                model_layer.ffn_gate_up_exps != nullptr &&
+                model_layer.ffn_gate_exps    == nullptr &&
+                model_layer.ffn_up_exps      == nullptr &&
+                model_layer.ffn_down_exps    != nullptr &&
+                model_layer.ffn_gate_up_exps_b == nullptr &&
+                model_layer.ffn_down_exps_b    == nullptr;
+
+        switch (model.arch) {
+            case LLM_ARCH_MINIMAX_M2:
+            case LLM_ARCH_GLM_DSA:
+            case LLM_ARCH_DEEPSEEK2:
+            case LLM_ARCH_QWEN35MOE:
+                return separate_gate_up_down;
+            case LLM_ARCH_GEMMA4:
+                return merged_gate_up_down;
+            default:
+                return false;
+        }
+    }
+
+    static bool parse_topk_layer(const char * name, int & layer) {
+        return name != nullptr && sscanf(name, "ffn_moe_topk-%d", &layer) == 1;
+    }
+
+    static uint8_t * tensor_cpu_visible_data(ggml_tensor * tensor) {
+        if (tensor == nullptr) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (buf == nullptr || tensor->data == nullptr) {
+            return nullptr;
+        }
+
+        if (ggml_backend_buffer_is_host(buf)) {
+            return static_cast<uint8_t *>(tensor->data);
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // Extra CPU-side weight buffers such as CPU_REPACK keep the tensor data in
+            // normal memory but do not advertise is_host/get_tensor.
+            return static_cast<uint8_t *>(tensor->data);
+        }
+
+        return nullptr;
+    }
+
+    static const uint8_t * tensor_cpu_visible_data(const ggml_tensor * tensor) {
+        return tensor_cpu_visible_data(const_cast<ggml_tensor *>(tensor));
+    }
+
+    static bool tensor_uses_cpu_repack_layout(const ggml_tensor * tensor) {
+        if (tensor == nullptr) {
+            return false;
+        }
+
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (buf == nullptr) {
+            return false;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        return buft != nullptr && std::strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") == 0;
+    }
+
+    static size_t expert_bytes_for_tensor(const ggml_tensor * tensor) {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(tensor->ne[2] > 0);
+        GGML_ASSERT(tensor->ne[3] == 1);
+        return size_t(tensor->nb[2]);
+    }
+
+    static bool plain_quant_mul_mat_supported(ggml_type type) {
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool tensor_needs_f32_staging(const ggml_tensor * tensor) {
+        return tensor != nullptr &&
+                ggml_is_quantized(tensor->type) &&
+                !plain_quant_mul_mat_supported(tensor->type);
+    }
+
+    void read_tensor_expert_bytes(
+            const ggml_tensor * tensor,
+            int32_t expert,
+            std::vector<uint8_t> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(expert >= 0 && expert < tensor->ne[2]);
+
+        if (tensor_uses_cpu_repack_layout(tensor)) {
+            throw std::runtime_error(format(
+                    "Flash-MoE in-memory prefill cannot read expert %d from tensor %s backed by CPU_REPACK; routed experts must stay in canonical CPU/host buffers",
+                    expert,
+                    ggml_get_name(tensor) != nullptr ? ggml_get_name(tensor) : "<unnamed>"));
+        }
+
+        const size_t bytes_per_expert = expert_bytes_for_tensor(tensor);
+        out.resize(bytes_per_expert);
+
+        if (const uint8_t * src = tensor_cpu_visible_data(tensor)) {
+            std::memcpy(out.data(), src + size_t(expert) * bytes_per_expert, bytes_per_expert);
+            return;
+        }
+
+        ggml_backend_tensor_get(
+                tensor,
+                out.data(),
+                size_t(expert) * bytes_per_expert,
+                bytes_per_expert);
+    }
+
+    void dequantize_expert_bytes_f32(
+            const ggml_tensor * tensor,
+            const std::vector<uint8_t> & src,
+            std::vector<float> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(ggml_is_quantized(tensor->type));
+
+        const ggml_type_traits * qtype = ggml_get_type_traits(tensor->type);
+        if (qtype == nullptr || qtype->to_float == nullptr) {
+            throw std::runtime_error(format(
+                    "Flash-MoE in-memory prefill cannot dequantize expert tensor type %s",
+                    ggml_type_name(tensor->type)));
+        }
+
+        const int64_t ncols = tensor->ne[0];
+        const int64_t nrows = tensor->ne[1];
+        const size_t row_size = ggml_row_size(tensor->type, ncols);
+        GGML_ASSERT(src.size() == row_size * size_t(nrows));
+
+        out.resize(size_t(ncols * nrows));
+        for (int64_t row = 0; row < nrows; ++row) {
+            qtype->to_float(
+                    src.data() + size_t(row) * row_size,
+                    out.data() + size_t(row) * size_t(ncols),
+                    ncols);
+        }
+    }
+
+    void read_topk_ids_tensor(const ggml_tensor * tensor, int64_t n_expert_used, int64_t n_tokens) {
+        const size_t row_bytes = size_t(n_expert_used) * sizeof(int32_t);
+        const size_t n_ids = size_t(n_expert_used * n_tokens);
+        topk_ids.resize(n_ids);
+
+        if (const uint8_t * src = tensor_cpu_visible_data(tensor)) {
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                std::memcpy(
+                        topk_ids.data() + token * n_expert_used,
+                        src + size_t(token) * tensor->nb[1],
+                        row_bytes);
+            }
+            return;
+        }
+
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            ggml_backend_tensor_get(
+                    tensor,
+                    topk_ids.data() + token * n_expert_used,
+                    size_t(token) * tensor->nb[1],
+                    row_bytes);
+        }
+    }
+
+    void read_tensor_rows_f32(
+            const ggml_tensor * tensor,
+            int64_t width,
+            int64_t rows,
+            std::vector<float> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        out.resize(size_t(width * rows));
+
+        auto decode_row = [&](const uint8_t * src, float * dst) {
+            switch (tensor->type) {
+                case GGML_TYPE_F32:
+                    std::memcpy(dst, src, size_t(width) * sizeof(float));
+                    break;
+                case GGML_TYPE_F16:
+                    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(src), dst, width);
+                    break;
+                case GGML_TYPE_BF16:
+                    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(src), dst, width);
+                    break;
+                default:
+                    throw std::runtime_error(format(
+                            "Flash-MoE in-memory prefill does not support row read for tensor type %s",
+                            ggml_type_name(tensor->type)));
+            }
+        };
+
+        if (const uint8_t * src = tensor_cpu_visible_data(tensor)) {
+            for (int64_t row = 0; row < rows; ++row) {
+                decode_row(
+                        src + size_t(row) * tensor->nb[1],
+                        out.data() + row * width);
+            }
+            return;
+        }
+
+        std::vector<uint8_t> temp(ggml_row_size(tensor->type, width));
+        for (int64_t row = 0; row < rows; ++row) {
+            ggml_backend_tensor_get(
+                    tensor,
+                    temp.data(),
+                    size_t(row) * tensor->nb[1],
+                    temp.size());
+            decode_row(temp.data(), out.data() + row * width);
+        }
+    }
+
+    void read_weights_tensor(
+            const ggml_tensor * tensor,
+            int64_t topk,
+            int64_t n_tokens,
+            std::vector<float> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+        GGML_ASSERT(tensor->ne[0] == 1);
+        out.resize(size_t(topk * n_tokens));
+
+        if (const uint8_t * src = tensor_cpu_visible_data(tensor)) {
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                for (int64_t k = 0; k < topk; ++k) {
+                    const auto * value = reinterpret_cast<const float *>(
+                            src + size_t(token) * tensor->nb[2] + size_t(k) * tensor->nb[1]);
+                    out[size_t(token) * size_t(topk) + size_t(k)] = *value;
+                }
+            }
+            return;
+        }
+
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t k = 0; k < topk; ++k) {
+                float value = 0.0f;
+                ggml_backend_tensor_get(
+                        tensor,
+                        &value,
+                        size_t(token) * tensor->nb[2] + size_t(k) * tensor->nb[1],
+                        sizeof(value));
+                out[size_t(token) * size_t(topk) + size_t(k)] = value;
+            }
+        }
+    }
+
+    void read_tensor_vector_f32(
+            const ggml_tensor * tensor,
+            int64_t count,
+            std::vector<float> & out) const {
+        GGML_ASSERT(tensor != nullptr);
+        out.resize(size_t(count));
+
+        auto decode = [&](const uint8_t * src) {
+            switch (tensor->type) {
+                case GGML_TYPE_F32:
+                    std::memcpy(out.data(), src, size_t(count) * sizeof(float));
+                    break;
+                case GGML_TYPE_F16:
+                    ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(src), out.data(), count);
+                    break;
+                case GGML_TYPE_BF16:
+                    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(src), out.data(), count);
+                    break;
+                default:
+                    throw std::runtime_error(format(
+                            "Flash-MoE in-memory prefill does not support scale tensor type %s",
+                            ggml_type_name(tensor->type)));
+            }
+        };
+
+        if (const uint8_t * src = tensor_cpu_visible_data(tensor)) {
+            decode(src);
+            return;
+        }
+
+        std::vector<uint8_t> temp(ggml_row_size(tensor->type, count));
+        ggml_backend_tensor_get(tensor, temp.data(), 0, temp.size());
+        decode(temp.data());
+    }
+
+    void capture_prefill_topk(int layer, const ggml_tensor * tensor) {
+        GGML_ASSERT(uses_dedicated_prefill_moe(layer));
+
+        auto & state = layers[layer];
+        const int64_t n_expert_used = tensor->ne[0];
+        const int64_t n_tokens = tensor->ne[1];
+        if (!activation_logged) {
+            activation_logged = true;
+            LLAMA_LOG_INFO("%s: Flash-MoE in-memory layer-major prefill runtime active for layer %d (tokens=%lld, topk=%lld)\n",
+                    __func__, layer, (long long) n_tokens, (long long) n_expert_used);
+        }
+
+        read_topk_ids_tensor(tensor, n_expert_used, n_tokens);
+        state.pending_prefill_selected_experts = topk_ids;
+        state.pending_prefill_topk = n_expert_used;
+        state.pending_prefill_tokens = n_tokens;
+        state.pending_prefill_valid = true;
+    }
+
+    prefill_selected_plan build_prefill_selected_plan(
+            const layer_state & state,
+            const std::vector<int32_t> & selected_experts,
+            const std::vector<float> & weights,
+            int64_t topk,
+            int64_t n_tokens) const {
+        prefill_selected_plan plan;
+        std::vector<int32_t> expert_counts(expert_count, 0);
+        std::vector<float> expert_weight_sums(expert_count, 0.0f);
+        std::vector<int32_t> expert_to_index(expert_count, -1);
+
+        GGML_ASSERT(selected_experts.size() == size_t(topk * n_tokens));
+        GGML_ASSERT(weights.size() == size_t(topk * n_tokens));
+
+        for (size_t flat_idx = 0; flat_idx < selected_experts.size(); ++flat_idx) {
+            const int32_t expert = selected_experts[flat_idx];
+            if (expert < 0 || expert >= expert_count) {
+                throw std::runtime_error(format(
+                        "Flash-MoE expert id %d is out of range for in-memory prefill with %d experts",
+                        expert, expert_count));
+            }
+            expert_counts[expert]++;
+            expert_weight_sums[expert] += weights[flat_idx];
+        }
+
+        plan.unique_experts.reserve(selected_experts.size());
+        for (int32_t expert = 0; expert < expert_count; ++expert) {
+            if (expert_counts[expert] > 0) {
+                plan.unique_experts.push_back(expert);
+            }
+        }
+
+        const ggml_tensor * order_tensor =
+                state.down_tensor != nullptr ? state.down_tensor :
+                state.gate_up_tensor != nullptr ? state.gate_up_tensor :
+                state.up_tensor != nullptr ? state.up_tensor :
+                state.gate_tensor;
+        std::sort(plan.unique_experts.begin(), plan.unique_experts.end(),
+                [&](const int32_t & lhs, const int32_t & rhs) {
+                    if (expert_counts[lhs] != expert_counts[rhs]) {
+                        return expert_counts[lhs] > expert_counts[rhs];
+                    }
+                    if (expert_weight_sums[lhs] != expert_weight_sums[rhs]) {
+                        return expert_weight_sums[lhs] > expert_weight_sums[rhs];
+                    }
+                    if (order_tensor != nullptr) {
+                        const uint64_t lhs_off = uint64_t(lhs) * uint64_t(expert_bytes_for_tensor(order_tensor));
+                        const uint64_t rhs_off = uint64_t(rhs) * uint64_t(expert_bytes_for_tensor(order_tensor));
+                        if (lhs_off != rhs_off) {
+                            return lhs_off < rhs_off;
+                        }
+                    }
+                    return lhs < rhs;
+                });
+
+        plan.expert_ref_offsets.resize(plan.unique_experts.size() + 1, 0);
+        int32_t cursor = 0;
+        for (size_t idx = 0; idx < plan.unique_experts.size(); ++idx) {
+            const int32_t expert = plan.unique_experts[idx];
+            expert_to_index[expert] = (int32_t) idx;
+            plan.expert_ref_offsets[idx] = cursor;
+            cursor += expert_counts[expert];
+            plan.max_refs_per_expert = std::max(plan.max_refs_per_expert, expert_counts[expert]);
+        }
+        plan.expert_ref_offsets[plan.unique_experts.size()] = cursor;
+        plan.expert_ref_tokens.resize(cursor);
+        plan.expert_ref_weights.resize(cursor);
+        std::fill(expert_counts.begin(), expert_counts.end(), 0);
+
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t k = 0; k < topk; ++k) {
+                const size_t flat_idx = size_t(token) * size_t(topk) + size_t(k);
+                const int32_t expert = selected_experts[flat_idx];
+                const int32_t expert_index = expert_to_index[expert];
+                GGML_ASSERT(expert_index >= 0);
+
+                const int32_t out_idx =
+                        plan.expert_ref_offsets[size_t(expert_index)] +
+                        expert_counts[expert]++;
+                plan.expert_ref_tokens[size_t(out_idx)] = (int32_t) token;
+                plan.expert_ref_weights[size_t(out_idx)] = weights[flat_idx];
+            }
+        }
+
+        for (size_t expert_index = 0; expert_index < plan.unique_experts.size(); ++expert_index) {
+            const int32_t begin = plan.expert_ref_offsets[expert_index];
+            const int32_t end = plan.expert_ref_offsets[expert_index + 1];
+            int32_t last_token = -1;
+            int32_t distinct_tokens = 0;
+            for (int32_t i = begin; i < end; ++i) {
+                const int32_t token = plan.expert_ref_tokens[size_t(i)];
+                if (token != last_token) {
+                    last_token = token;
+                    distinct_tokens++;
+                }
+            }
+            plan.max_tokens_per_expert = std::max(plan.max_tokens_per_expert, distinct_tokens);
+        }
+
+        return plan;
+    }
+
+    ggml_backend_t get_prefill_exec_backend(const ggml_tensor * reference) {
+        ggml_backend_dev_t dev = nullptr;
+        if (reference != nullptr) {
+            ggml_backend_buffer_t buf = reference->view_src ? reference->view_src->buffer : reference->buffer;
+            if (buf != nullptr) {
+                dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            }
+        }
+
+        if (dev == nullptr) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+
+        if (dev == nullptr) {
+            if (prefill_cpu_backend == nullptr) {
+                prefill_cpu_backend = ggml_backend_cpu_init();
+                if (prefill_cpu_backend != nullptr) {
+                    ggml_backend_cpu_set_n_threads(prefill_cpu_backend, 1);
+                }
+            }
+            return prefill_cpu_backend;
+        }
+
+        auto it = prefill_exec_backends.find(dev);
+        if (it != prefill_exec_backends.end()) {
+            return it->second;
+        }
+
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend == nullptr) {
+            if (prefill_cpu_backend == nullptr) {
+                prefill_cpu_backend = ggml_backend_cpu_init();
+                if (prefill_cpu_backend != nullptr) {
+                    ggml_backend_cpu_set_n_threads(prefill_cpu_backend, 1);
+                }
+            }
+            return prefill_cpu_backend;
+        }
+
+        if (ggml_backend_is_cpu(backend)) {
+            ggml_backend_cpu_set_n_threads(backend, 1);
+        }
+
+        prefill_exec_backends.emplace(dev, backend);
+        return backend;
+    }
+
+    static void accumulate_metrics(routed_metrics & dst, const routed_metrics & src) {
+        dst.calls += src.calls;
+        dst.prompt_tokens += src.prompt_tokens;
+        dst.token_refs += src.token_refs;
+        dst.unique_experts += src.unique_experts;
+        dst.hit_experts += src.hit_experts;
+        dst.miss_experts += src.miss_experts;
+        dst.max_refs_per_expert = std::max(dst.max_refs_per_expert, src.max_refs_per_expert);
+        dst.max_tokens_per_expert = std::max(dst.max_tokens_per_expert, src.max_tokens_per_expert);
+        dst.bytes_loaded += src.bytes_loaded;
+        dst.total_us += src.total_us;
+        dst.topk_read_us += src.topk_read_us;
+        dst.source_us += src.source_us;
+        dst.source_wall_us += src.source_wall_us;
+        dst.prefill_stage_us += src.prefill_stage_us;
+        dst.prefill_compute_us += src.prefill_compute_us;
+        dst.prefill_setup_us += src.prefill_setup_us;
+        dst.gate_up_bytes += src.gate_up_bytes;
+        dst.gate_bytes += src.gate_bytes;
+        dst.up_bytes += src.up_bytes;
+        dst.down_bytes += src.down_bytes;
+        dst.prefill_stage_bytes += src.prefill_stage_bytes;
+    }
+
+    void compute_prefill_moe_tensor(
+            int layer,
+            ggml_tensor * dst,
+            const ggml_tensor * cur_tensor,
+            const ggml_tensor * selected_experts_tensor,
+            const ggml_tensor * weights_tensor) {
+        GGML_ASSERT(uses_dedicated_prefill_moe(layer));
+        auto & state = layers[layer];
+        const bool debug_in_memory_prefill = flash_moe_in_memory_prefill_debug_enabled();
+        auto debug_log = [&](const std::string & msg) {
+            if (!debug_in_memory_prefill) {
+                return;
+            }
+            std::fprintf(stderr, "%s: %s\n", __func__, msg.c_str());
+            std::fflush(stderr);
+        };
+
+        const int64_t n_embd = cur_tensor->ne[0];
+        const int64_t n_tokens = cur_tensor->ne[1];
+        const int64_t topk = selected_experts_tensor->ne[0];
+        if (n_tokens <= 0 || topk <= 0) {
+            std::memset(dst->data, 0, ggml_nbytes(dst));
+            return;
+        }
+
+        debug_log(format(
+                "enter layer=%d n_embd=%lld n_tokens=%lld topk=%lld cur_type=%s selected_type=%s weights_type=%s dst_type=%s",
+                layer,
+                (long long) n_embd,
+                (long long) n_tokens,
+                (long long) topk,
+                ggml_type_name(cur_tensor->type),
+                ggml_type_name(selected_experts_tensor->type),
+                ggml_type_name(weights_tensor->type),
+                ggml_type_name(dst->type)));
+
+        routed_metrics local_stats;
+        local_stats.calls = 1;
+        local_stats.prompt_tokens = uint64_t(n_tokens);
+        local_stats.token_refs = uint64_t(n_tokens * topk);
+        const int64_t t_total_start_us = ggml_time_us();
+
+        std::vector<float> cur_host;
+        std::vector<float> weights_host;
+
+        const int64_t t_read_start_us = ggml_time_us();
+        read_tensor_rows_f32(cur_tensor, n_embd, n_tokens, cur_host);
+        read_weights_tensor(weights_tensor, topk, n_tokens, weights_host);
+        local_stats.topk_read_us += ggml_time_us() - t_read_start_us;
+        debug_log(format(
+                "after_input_read layer=%d cur_rows=%zu weights=%zu read_us=%lld",
+                layer,
+                cur_host.size(),
+                weights_host.size(),
+                (long long) local_stats.topk_read_us));
+
+        if (!state.pending_prefill_valid ||
+            state.pending_prefill_topk != topk ||
+            state.pending_prefill_tokens != n_tokens) {
+            read_topk_ids_tensor(selected_experts_tensor, topk, n_tokens);
+            state.pending_prefill_selected_experts = topk_ids;
+            state.pending_prefill_topk = topk;
+            state.pending_prefill_tokens = n_tokens;
+            state.pending_prefill_valid = true;
+        }
+
+        const auto plan = build_prefill_selected_plan(
+                state,
+                state.pending_prefill_selected_experts,
+                weights_host,
+                topk,
+                n_tokens);
+        state.pending_prefill_valid = false;
+        debug_log(format(
+                "after_plan layer=%d unique=%zu max_refs=%d max_tokens=%d selected=%zu",
+                layer,
+                plan.unique_experts.size(),
+                int(plan.max_refs_per_expert),
+                int(plan.max_tokens_per_expert),
+                state.pending_prefill_selected_experts.size()));
+
+        local_stats.unique_experts = plan.unique_experts.size();
+        local_stats.hit_experts = 0;
+        local_stats.miss_experts = plan.unique_experts.size();
+        local_stats.max_refs_per_expert = uint64_t(std::max<int64_t>(0, plan.max_refs_per_expert));
+        local_stats.max_tokens_per_expert = uint64_t(std::max<int64_t>(0, plan.max_tokens_per_expert));
+
+        const bool use_gate_up_merged =
+                state.gate_up_tensor != nullptr &&
+                state.gate_tensor == nullptr &&
+                state.up_tensor == nullptr &&
+                state.down_tensor != nullptr;
+        GGML_ASSERT(
+                (use_gate_up_merged && state.gate_up_tensor != nullptr && state.down_tensor != nullptr) ||
+                (!use_gate_up_merged && state.gate_tensor != nullptr && state.up_tensor != nullptr && state.down_tensor != nullptr));
+
+        const bool gate_up_needs_f32 = tensor_needs_f32_staging(state.gate_up_tensor);
+        const bool gate_needs_f32 = tensor_needs_f32_staging(state.gate_tensor);
+        const bool up_needs_f32 = tensor_needs_f32_staging(state.up_tensor);
+        const bool down_needs_f32 = tensor_needs_f32_staging(state.down_tensor);
+        const ggml_type gate_up_exec_type = gate_up_needs_f32 ? GGML_TYPE_F32 : (state.gate_up_tensor != nullptr ? state.gate_up_tensor->type : GGML_TYPE_COUNT);
+        const ggml_type gate_exec_type = gate_needs_f32 ? GGML_TYPE_F32 : (state.gate_tensor != nullptr ? state.gate_tensor->type : GGML_TYPE_COUNT);
+        const ggml_type up_exec_type = up_needs_f32 ? GGML_TYPE_F32 : (state.up_tensor != nullptr ? state.up_tensor->type : GGML_TYPE_COUNT);
+        const ggml_type down_exec_type = down_needs_f32 ? GGML_TYPE_F32 : (state.down_tensor != nullptr ? state.down_tensor->type : GGML_TYPE_COUNT);
+        std::vector<float> gate_up_expert_scales;
+        std::vector<float> gate_expert_scales;
+        std::vector<float> up_expert_scales;
+        std::vector<float> down_expert_scales;
+        if (model.layers[layer].ffn_up_exps_s != nullptr) {
+            read_tensor_vector_f32(model.layers[layer].ffn_up_exps_s, expert_count, up_expert_scales);
+        }
+        if (model.layers[layer].ffn_gate_exps_s != nullptr) {
+            read_tensor_vector_f32(model.layers[layer].ffn_gate_exps_s, expert_count, gate_expert_scales);
+        }
+        if (use_gate_up_merged && !up_expert_scales.empty()) {
+            gate_up_expert_scales = up_expert_scales;
+            up_expert_scales.clear();
+        }
+        if (model.layers[layer].ffn_down_exps_s != nullptr) {
+            read_tensor_vector_f32(model.layers[layer].ffn_down_exps_s, expert_count, down_expert_scales);
+        }
+
+        ggml_backend_t exec_backend = get_prefill_exec_backend(cur_tensor);
+        if (exec_backend == nullptr) {
+            throw std::runtime_error("Flash-MoE in-memory prefill could not initialize an execution backend");
+        }
+        debug_log(format(
+                "exec_backend layer=%d backend=%s",
+                layer,
+                ggml_backend_name(exec_backend)));
+
+#ifdef GGML_USE_METAL
+        const bool log_prefill_mul_mat_stats =
+                perf_profile &&
+                ggml_backend_is_metal(exec_backend) &&
+                flash_moe_prefill_verbose_layer_stats_enabled();
+        if (log_prefill_mul_mat_stats) {
+            ggml_metal_op_mul_mat_reset_stats();
+        }
+#endif
+
+        const bool prefill_micro_batch_auto = prefill_micro_batch_tokens == -1;
+        const int64_t configured_micro_batch_tokens =
+                prefill_micro_batch_auto ?
+                        llama_moe_prefill_micro_batch_auto_for_tokens(n_tokens) :
+                        prefill_micro_batch_tokens;
+        const int64_t bucket_limit_tokens = std::max<int64_t>(
+                1,
+                configured_micro_batch_tokens > 0 ?
+                        std::min<int64_t>(plan.max_refs_per_expert, configured_micro_batch_tokens) :
+                        plan.max_refs_per_expert);
+        const std::vector<int32_t> available_bucket_sizes = llama_moe_prefill_bucket_sizes_for_limit(bucket_limit_tokens);
+        std::vector<int32_t> bucket_sizes = available_bucket_sizes;
+        if (!llama_moe_prefill_greedy_buckets_enabled() && !available_bucket_sizes.empty()) {
+            // Preserve the original fixed-microbatch behavior by default. Greedy
+            // 512/256/... tails reduce padding but add many tiny graph submits.
+            bucket_sizes.assign(1, available_bucket_sizes.front());
+        }
+        const int32_t max_bucket_tokens = bucket_sizes.empty() ? 1 : bucket_sizes.front();
+        const size_t prefill_bank_depth = size_t(std::max<int32_t>(1, model.flash_moe_prefill_banks()));
+        const size_t exec_bank_count = std::max<size_t>(
+                size_t(1),
+                std::min<size_t>(prefill_bank_depth, std::max<size_t>(size_t(1), plan.unique_experts.size())));
+
+        const size_t ctx_mem_size =
+                8 * 1024 * 1024 +
+                exec_bank_count * (192 + 64 * std::max<size_t>(size_t(1), bucket_sizes.size())) * ggml_tensor_overhead() +
+                ggml_graph_overhead_custom(int(exec_bank_count * 128 * std::max<size_t>(size_t(1), bucket_sizes.size())), false);
+        ggml_init_params init_params = {
+            /*.mem_size   =*/ ctx_mem_size,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        const int64_t t_setup_start_us = ggml_time_us();
+        ggml_context * temp_ctx = ggml_init(init_params);
+        if (temp_ctx == nullptr) {
+            throw std::runtime_error("Flash-MoE in-memory prefill failed to create a temporary graph context");
+        }
+
+        ggml_backend_buffer_t temp_buffer = nullptr;
+        ggml_backend_t upload_backend = nullptr;
+        std::vector<ggml_backend_event_t> upload_events;
+        auto cleanup_upload_backend = [&]() {
+            for (ggml_backend_event_t event : upload_events) {
+                if (event != nullptr) {
+                    ggml_backend_event_synchronize(event);
+                    ggml_backend_event_free(event);
+                }
+            }
+            upload_events.clear();
+            if (upload_backend != nullptr) {
+                ggml_backend_free(upload_backend);
+                upload_backend = nullptr;
+            }
+        };
+        try {
+            prefill_inline_progress_begin_if_needed(layer, n_tokens, configured_micro_batch_tokens, prefill_micro_batch_auto);
+            debug_log(format(
+                    "setup layer=%d configured_micro=%lld bucket_limit=%lld max_bucket=%d auto=%d merged=%d gate_f32=%d up_f32=%d down_f32=%d",
+                    layer,
+                    (long long) configured_micro_batch_tokens,
+                    (long long) bucket_limit_tokens,
+                    max_bucket_tokens,
+                    prefill_micro_batch_auto ? 1 : 0,
+                    use_gate_up_merged ? 1 : 0,
+                    gate_needs_f32 ? 1 : 0,
+                    up_needs_f32 ? 1 : 0,
+                    down_needs_f32 ? 1 : 0));
+
+#ifdef GGML_USE_METAL
+            const int32_t m5_expert_mm_min_tokens = flash_moe_prefill_m5_expert_mm_min_tokens();
+            const ggml_type gate_up_type = state.gate_up_tensor != nullptr ? state.gate_up_tensor->type : GGML_TYPE_COUNT;
+            const ggml_type gate_type = state.gate_tensor != nullptr ? state.gate_tensor->type : GGML_TYPE_COUNT;
+            const ggml_type up_type = state.up_tensor != nullptr ? state.up_tensor->type : GGML_TYPE_COUNT;
+            const ggml_type down_type = state.down_tensor != nullptr ? state.down_tensor->type : GGML_TYPE_COUNT;
+            const bool has_pre_act_scales =
+                    !gate_up_expert_scales.empty() ||
+                    !gate_expert_scales.empty() ||
+                    !up_expert_scales.empty();
+            const bool has_f32_staging =
+                    gate_up_needs_f32 ||
+                    gate_needs_f32 ||
+                    up_needs_f32 ||
+                    down_needs_f32;
+            const bool metal_expert_mm_capable =
+                    ggml_backend_is_metal(exec_backend) &&
+                    m5_expert_mm_min_tokens > 0 &&
+                    max_bucket_tokens > 8 &&
+                    !has_pre_act_scales &&
+                    !has_f32_staging &&
+                    (
+                            (use_gate_up_merged &&
+                             flash_moe_prefill_metal_dequant_to_f16_supported(gate_up_type) &&
+                             flash_moe_prefill_metal_dequant_to_f16_supported(down_type)) ||
+                            (!use_gate_up_merged &&
+                             flash_moe_prefill_metal_dequant_to_f16_supported(gate_type) &&
+                             flash_moe_prefill_metal_dequant_to_f16_supported(up_type) &&
+                             flash_moe_prefill_metal_dequant_to_f16_supported(down_type))
+                    );
+#else
+            const int32_t m5_expert_mm_min_tokens = 0;
+            const bool metal_expert_mm_capable = false;
+#endif
+
+            struct prefill_bucket_graph {
+                int32_t bucket_tokens = 0;
+                ggml_tensor * cur_in = nullptr;
+                ggml_tensor * cur_in_mm = nullptr;
+                ggml_tensor * out = nullptr;
+                ggml_tensor * out_mm = nullptr;
+                ggml_cgraph * graph = nullptr;
+                ggml_cgraph * graph_mm = nullptr;
+            };
+
+            struct prefill_exec_bank {
+                size_t index = 0;
+                ggml_tensor * gate_up_w = nullptr;
+                ggml_tensor * gate_w = nullptr;
+                ggml_tensor * up_w = nullptr;
+                ggml_tensor * down_w = nullptr;
+                ggml_tensor * gate_up_scale_in = nullptr;
+                ggml_tensor * gate_scale_in = nullptr;
+                ggml_tensor * up_scale_in = nullptr;
+                std::vector<prefill_bucket_graph> bucket_graphs;
+                ggml_backend_event_t upload_event = nullptr;
+                bool upload_pending = false;
+            };
+
+            auto find_bucket_graph = [](prefill_exec_bank & bank, int32_t bucket_tokens) -> prefill_bucket_graph * {
+                for (auto & bucket : bank.bucket_graphs) {
+                    if (bucket.bucket_tokens == bucket_tokens) {
+                        return &bucket;
+                    }
+                }
+                return nullptr;
+            };
+
+            const bool use_fp16_expert_mm_activations =
+                    metal_expert_mm_capable &&
+                    flash_moe_in_memory_prefill_fp16_activations_enabled();
+            if (has_f32_staging && perf_profile) {
+                LLAMA_LOG_WARN("%s: in-memory prefill layer=%d has FP32-staged expert weights; M5 expert-mm path disabled for this layer\n",
+                        __func__, layer);
+            }
+
+            auto build_exec_bank = [&](size_t bank_index) {
+                prefill_exec_bank bank;
+                bank.index = bank_index;
+
+                if (use_gate_up_merged) {
+                    bank.gate_up_w = ggml_new_tensor_2d(temp_ctx, gate_up_exec_type, state.gate_up_tensor->ne[0], state.gate_up_tensor->ne[1]);
+                    bank.down_w = ggml_new_tensor_2d(temp_ctx, down_exec_type, state.down_tensor->ne[0], state.down_tensor->ne[1]);
+                    if (!gate_up_expert_scales.empty()) {
+                        bank.gate_up_scale_in = ggml_new_tensor_1d(temp_ctx, GGML_TYPE_F32, 1);
+                    }
+
+                    GGML_ASSERT(ggml_nbytes(bank.gate_up_w) == (gate_up_needs_f32 ? sizeof(float) * size_t(state.gate_up_tensor->ne[0] * state.gate_up_tensor->ne[1]) : expert_bytes_for_tensor(state.gate_up_tensor)));
+                    GGML_ASSERT(ggml_nbytes(bank.down_w) == (down_needs_f32 ? sizeof(float) * size_t(state.down_tensor->ne[0] * state.down_tensor->ne[1]) : expert_bytes_for_tensor(state.down_tensor)));
+                } else {
+                    bank.gate_w = ggml_new_tensor_2d(temp_ctx, gate_exec_type, state.gate_tensor->ne[0], state.gate_tensor->ne[1]);
+                    bank.up_w = ggml_new_tensor_2d(temp_ctx, up_exec_type, state.up_tensor->ne[0], state.up_tensor->ne[1]);
+                    bank.down_w = ggml_new_tensor_2d(temp_ctx, down_exec_type, state.down_tensor->ne[0], state.down_tensor->ne[1]);
+                    if (!gate_expert_scales.empty()) {
+                        bank.gate_scale_in = ggml_new_tensor_1d(temp_ctx, GGML_TYPE_F32, 1);
+                    }
+                    if (!up_expert_scales.empty()) {
+                        bank.up_scale_in = ggml_new_tensor_1d(temp_ctx, GGML_TYPE_F32, 1);
+                    }
+
+                    GGML_ASSERT(ggml_nbytes(bank.gate_w) == (gate_needs_f32 ? sizeof(float) * size_t(state.gate_tensor->ne[0] * state.gate_tensor->ne[1]) : expert_bytes_for_tensor(state.gate_tensor)));
+                    GGML_ASSERT(ggml_nbytes(bank.up_w) == (up_needs_f32 ? sizeof(float) * size_t(state.up_tensor->ne[0] * state.up_tensor->ne[1]) : expert_bytes_for_tensor(state.up_tensor)));
+                    GGML_ASSERT(ggml_nbytes(bank.down_w) == (down_needs_f32 ? sizeof(float) * size_t(state.down_tensor->ne[0] * state.down_tensor->ne[1]) : expert_bytes_for_tensor(state.down_tensor)));
+                }
+
+                bank.bucket_graphs.reserve(bucket_sizes.size());
+
+                auto build_bucket_graph = [&](int32_t bucket_tokens) {
+                prefill_bucket_graph bucket;
+                bucket.bucket_tokens = bucket_tokens;
+                bucket.cur_in = ggml_new_tensor_2d(temp_ctx, GGML_TYPE_F32, n_embd, bucket_tokens);
+                if (use_fp16_expert_mm_activations && bucket_tokens > 8) {
+                    bucket.cur_in_mm = ggml_new_tensor_2d(temp_ctx, GGML_TYPE_F16, n_embd, bucket_tokens);
+                    ggml_set_name(bucket.cur_in_mm, "flashmoe_prefill_expert_mm_cur_f16");
+                }
+
+                if (use_gate_up_merged) {
+                    ggml_tensor * gate_up = ggml_mul_mat(temp_ctx, bank.gate_up_w, bucket.cur_in);
+                    if (bank.gate_up_scale_in != nullptr) {
+                        ggml_tensor * scale = ggml_repeat(temp_ctx, bank.gate_up_scale_in, gate_up);
+                        gate_up = ggml_mul(temp_ctx, gate_up, scale);
+                    }
+                    const int64_t n_ff = gate_up->ne[0] / 2;
+                    ggml_tensor * gate = ggml_view_2d(temp_ctx, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], 0);
+                    ggml_tensor * up = ggml_view_2d(temp_ctx, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], n_ff * gate_up->nb[0]);
+                    ggml_tensor * act = ggml_geglu_split(temp_ctx, gate, up);
+                    bucket.out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, bank.down_w, act));
+
+#ifdef GGML_USE_METAL
+                    if (metal_expert_mm_capable && bucket_tokens > 8) {
+                        ggml_tensor * mm_cur_in = bucket.cur_in_mm != nullptr ? bucket.cur_in_mm : bucket.cur_in;
+                        ggml_tensor * gate_up_f16 = flash_moe_prefill_mul_mat_f16(temp_ctx, bank.gate_up_w, mm_cur_in);
+                        ggml_set_name(gate_up_f16, "flashmoe_prefill_expert_mm_gate_up");
+                        if (bank.gate_up_scale_in != nullptr) {
+                            ggml_tensor * scale = ggml_repeat(temp_ctx, bank.gate_up_scale_in, gate_up_f16);
+                            gate_up_f16 = ggml_mul(temp_ctx, gate_up_f16, scale);
+                        }
+                        const int64_t n_ff_f16 = gate_up_f16->ne[0] / 2;
+                        ggml_tensor * gate_f16 = ggml_view_2d(temp_ctx, gate_up_f16, n_ff_f16, gate_up_f16->ne[1], gate_up_f16->nb[1], 0);
+                        ggml_tensor * up_f16 = ggml_view_2d(temp_ctx, gate_up_f16, n_ff_f16, gate_up_f16->ne[1], gate_up_f16->nb[1], n_ff_f16 * gate_up_f16->nb[0]);
+                        ggml_tensor * act_f16 = ggml_geglu_split(temp_ctx, gate_f16, up_f16);
+                        ggml_set_name(act_f16, "flashmoe_prefill_expert_mm_act");
+                        ggml_tensor * down_mm = ggml_mul_mat(temp_ctx, bank.down_w, act_f16);
+                        ggml_set_name(down_mm, "flashmoe_prefill_expert_mm_down");
+                        bucket.out_mm = ggml_cont(temp_ctx, down_mm);
+                    }
+#endif
+                } else {
+                    ggml_tensor * gate = ggml_mul_mat(temp_ctx, bank.gate_w, bucket.cur_in);
+                    if (bank.gate_scale_in != nullptr) {
+                        ggml_tensor * scale = ggml_repeat(temp_ctx, bank.gate_scale_in, gate);
+                        gate = ggml_mul(temp_ctx, gate, scale);
+                    }
+                    ggml_tensor * up = ggml_mul_mat(temp_ctx, bank.up_w, bucket.cur_in);
+                    if (bank.up_scale_in != nullptr) {
+                        ggml_tensor * scale = ggml_repeat(temp_ctx, bank.up_scale_in, up);
+                        up = ggml_mul(temp_ctx, up, scale);
+                    }
+                    ggml_tensor * act = ggml_swiglu_split(temp_ctx, gate, up);
+                    bucket.out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, bank.down_w, act));
+
+#ifdef GGML_USE_METAL
+                    if (metal_expert_mm_capable && bucket_tokens > 8) {
+                        ggml_tensor * mm_cur_in = bucket.cur_in_mm != nullptr ? bucket.cur_in_mm : bucket.cur_in;
+                        ggml_tensor * gate_f16 = flash_moe_prefill_mul_mat_f16(temp_ctx, bank.gate_w, mm_cur_in);
+                        ggml_set_name(gate_f16, "flashmoe_prefill_expert_mm_gate");
+                        if (bank.gate_scale_in != nullptr) {
+                            ggml_tensor * scale = ggml_repeat(temp_ctx, bank.gate_scale_in, gate_f16);
+                            gate_f16 = ggml_mul(temp_ctx, gate_f16, scale);
+                        }
+                        ggml_tensor * up_f16 = flash_moe_prefill_mul_mat_f16(temp_ctx, bank.up_w, mm_cur_in);
+                        ggml_set_name(up_f16, "flashmoe_prefill_expert_mm_up");
+                        if (bank.up_scale_in != nullptr) {
+                            ggml_tensor * scale = ggml_repeat(temp_ctx, bank.up_scale_in, up_f16);
+                            up_f16 = ggml_mul(temp_ctx, up_f16, scale);
+                        }
+                        ggml_tensor * act_f16 = ggml_swiglu_split(temp_ctx, gate_f16, up_f16);
+                        ggml_set_name(act_f16, "flashmoe_prefill_expert_mm_act");
+                        ggml_tensor * down_mm = ggml_mul_mat(temp_ctx, bank.down_w, act_f16);
+                        ggml_set_name(down_mm, "flashmoe_prefill_expert_mm_down");
+                        bucket.out_mm = ggml_cont(temp_ctx, down_mm);
+                    }
+#endif
+                }
+
+                bucket.graph = ggml_new_graph_custom(temp_ctx, 32, false);
+                ggml_build_forward_expand(bucket.graph, bucket.out);
+                if (bucket.out_mm != nullptr) {
+                    bucket.graph_mm = ggml_new_graph_custom(temp_ctx, 32, false);
+                    ggml_build_forward_expand(bucket.graph_mm, bucket.out_mm);
+                }
+
+                return bucket;
+            };
+
+                for (const int32_t bucket_tokens : bucket_sizes) {
+                    bank.bucket_graphs.push_back(build_bucket_graph(bucket_tokens));
+                }
+
+                return bank;
+            };
+
+            std::vector<prefill_exec_bank> exec_banks;
+            exec_banks.reserve(exec_bank_count);
+            for (size_t bank_index = 0; bank_index < exec_bank_count; ++bank_index) {
+                exec_banks.push_back(build_exec_bank(bank_index));
+            }
+
+            temp_buffer = ggml_backend_alloc_ctx_tensors(temp_ctx, exec_backend);
+            if (temp_buffer == nullptr) {
+                throw std::runtime_error("Flash-MoE in-memory prefill failed to allocate temporary tensors");
+            }
+            local_stats.prefill_setup_us += ggml_time_us() - t_setup_start_us;
+            debug_log(format(
+                    "allocated_temp_graph layer=%d banks=%zu buckets=%zu max_bucket=%d out_type=%s out_bytes=%zu has_mm=%d",
+                    layer,
+                    exec_banks.size(),
+                    bucket_sizes.size(),
+                    max_bucket_tokens,
+                    ggml_type_name(exec_banks.front().bucket_graphs.front().out->type),
+                    ggml_nbytes(exec_banks.front().bucket_graphs.front().out),
+                    exec_banks.front().bucket_graphs.front().out_mm != nullptr ? 1 : 0));
+
+            ggml_backend_dev_t exec_dev = ggml_backend_get_device(exec_backend);
+            bool async_gpu_bank_uploads = false;
+            if (exec_banks.size() > 1 && exec_dev != nullptr) {
+                ggml_backend_dev_props props = {};
+                ggml_backend_dev_get_props(exec_dev, &props);
+                if (props.caps.async && props.caps.events) {
+                    upload_backend = ggml_backend_dev_init(exec_dev, nullptr);
+                    async_gpu_bank_uploads = upload_backend != nullptr;
+                }
+            }
+            if (async_gpu_bank_uploads) {
+                upload_events.reserve(exec_banks.size());
+                for (auto & bank : exec_banks) {
+                    bank.upload_event = ggml_backend_event_new(exec_dev);
+                    if (bank.upload_event == nullptr) {
+                        async_gpu_bank_uploads = false;
+                        break;
+                    }
+                    upload_events.push_back(bank.upload_event);
+                }
+            }
+            if (!async_gpu_bank_uploads) {
+                cleanup_upload_backend();
+                for (auto & bank : exec_banks) {
+                    bank.upload_event = nullptr;
+                    bank.upload_pending = false;
+                }
+            }
+            debug_log(format(
+                    "gpu_prefill_banks layer=%d banks=%zu async_upload=%d greedy_buckets=%d fp16_mm_act=%d",
+                    layer,
+                    exec_banks.size(),
+                    async_gpu_bank_uploads ? 1 : 0,
+                    llama_moe_prefill_greedy_buckets_enabled() ? 1 : 0,
+                    use_fp16_expert_mm_activations ? 1 : 0));
+
+            std::vector<float> gathered_inputs(size_t(n_embd * max_bucket_tokens), 0.0f);
+            std::vector<ggml_fp16_t> gathered_inputs_f16;
+            std::vector<float> expert_output(size_t(n_embd * max_bucket_tokens), 0.0f);
+            std::vector<ggml_fp16_t> expert_output_f16;
+            auto * dst_f32 = static_cast<float *>(dst->data);
+            std::memset(dst_f32, 0, ggml_nbytes(dst));
+
+#ifdef GGML_USE_METAL
+            struct flash_moe_m5_expert_mm_scope {
+                explicit flash_moe_m5_expert_mm_scope(bool active) : active(active) {
+                    if (active) {
+                        ggml_metal_op_mul_mat_set_experimental_m5_expert_active(true);
+                    }
+                }
+
+                ~flash_moe_m5_expert_mm_scope() {
+                    if (active) {
+                        ggml_metal_op_mul_mat_set_experimental_m5_expert_active(false);
+                    }
+                }
+
+                bool active;
+            };
+#endif
+
+            struct in_memory_ready_expert {
+                size_t expert_index = 0;
+                int32_t expert = -1;
+                int32_t ref_begin = 0;
+                int32_t ref_end = 0;
+                int32_t ref_count = 0;
+                int64_t source_us = 0;
+                std::vector<uint8_t> gate_up_bytes;
+                std::vector<uint8_t> gate_bytes;
+                std::vector<uint8_t> up_bytes;
+                std::vector<uint8_t> down_bytes;
+                std::vector<float> gate_up_f32;
+                std::vector<float> gate_f32;
+                std::vector<float> up_f32;
+                std::vector<float> down_f32;
+            };
+
+            struct in_memory_prefill_batch {
+                std::vector<in_memory_ready_expert> experts;
+                routed_metrics read_stats;
+            };
+
+            auto note_loaded_bytes = [&](routed_metrics & stats, const in_memory_ready_expert & loaded) {
+                size_t expert_bytes = 0;
+                if (use_gate_up_merged) {
+                    expert_bytes = loaded.gate_up_bytes.size() + loaded.down_bytes.size();
+                    stats.gate_up_bytes += loaded.gate_up_bytes.size();
+                    stats.down_bytes += loaded.down_bytes.size();
+                } else {
+                    expert_bytes = loaded.gate_bytes.size() + loaded.up_bytes.size() + loaded.down_bytes.size();
+                    stats.gate_bytes += loaded.gate_bytes.size();
+                    stats.up_bytes += loaded.up_bytes.size();
+                    stats.down_bytes += loaded.down_bytes.size();
+                }
+
+                stats.bytes_loaded += expert_bytes;
+            };
+
+            auto prepare_loaded_expert = [&](size_t expert_index) {
+                in_memory_ready_expert loaded;
+                loaded.expert_index = expert_index;
+                loaded.expert = plan.unique_experts[expert_index];
+                loaded.ref_begin = plan.expert_ref_offsets[expert_index];
+                loaded.ref_end = plan.expert_ref_offsets[expert_index + 1];
+                loaded.ref_count = loaded.ref_end - loaded.ref_begin;
+
+                const int64_t t_source_start_us = ggml_time_us();
+                if (use_gate_up_merged) {
+                    read_tensor_expert_bytes(state.gate_up_tensor, loaded.expert, loaded.gate_up_bytes);
+                    read_tensor_expert_bytes(state.down_tensor, loaded.expert, loaded.down_bytes);
+                    if (gate_up_needs_f32) {
+                        dequantize_expert_bytes_f32(state.gate_up_tensor, loaded.gate_up_bytes, loaded.gate_up_f32);
+                    }
+                    if (down_needs_f32) {
+                        dequantize_expert_bytes_f32(state.down_tensor, loaded.down_bytes, loaded.down_f32);
+                    }
+                } else {
+                    read_tensor_expert_bytes(state.gate_tensor, loaded.expert, loaded.gate_bytes);
+                    read_tensor_expert_bytes(state.up_tensor, loaded.expert, loaded.up_bytes);
+                    read_tensor_expert_bytes(state.down_tensor, loaded.expert, loaded.down_bytes);
+                    if (gate_needs_f32) {
+                        dequantize_expert_bytes_f32(state.gate_tensor, loaded.gate_bytes, loaded.gate_f32);
+                    }
+                    if (up_needs_f32) {
+                        dequantize_expert_bytes_f32(state.up_tensor, loaded.up_bytes, loaded.up_f32);
+                    }
+                    if (down_needs_f32) {
+                        dequantize_expert_bytes_f32(state.down_tensor, loaded.down_bytes, loaded.down_f32);
+                    }
+                }
+                loaded.source_us = ggml_time_us() - t_source_start_us;
+
+                return loaded;
+            };
+
+            auto load_in_memory_prefill_batch = [&](size_t start_index) {
+                in_memory_prefill_batch batch;
+                if (start_index >= plan.unique_experts.size()) {
+                    return batch;
+                }
+
+                const int64_t t_batch_start_us = ggml_time_us();
+                const size_t end_index = std::min(plan.unique_experts.size(), start_index + prefill_bank_depth);
+                batch.experts.reserve(end_index - start_index);
+                for (size_t expert_index = start_index; expert_index < end_index; ++expert_index) {
+                    auto loaded = prepare_loaded_expert(expert_index);
+                    batch.read_stats.source_us += loaded.source_us;
+                    note_loaded_bytes(batch.read_stats, loaded);
+                    debug_log(format(
+                            "expert_loaded layer=%d expert=%d bytes=%zu source_us=%lld batch=%zu..%zu",
+                            layer,
+                            loaded.expert,
+                            use_gate_up_merged ?
+                                    loaded.gate_up_bytes.size() + loaded.down_bytes.size() :
+                                    loaded.gate_bytes.size() + loaded.up_bytes.size() + loaded.down_bytes.size(),
+                            (long long) loaded.source_us,
+                            start_index,
+                            end_index));
+                    batch.experts.emplace_back(std::move(loaded));
+                }
+                batch.read_stats.source_wall_us += ggml_time_us() - t_batch_start_us;
+
+                return batch;
+            };
+
+            struct in_memory_stage_result {
+                int64_t stage_us = 0;
+                size_t stage_bytes = 0;
+            };
+
+            auto stage_tensor = [&](prefill_exec_bank & bank, ggml_tensor * tensor, const void * data, size_t size, bool async_upload) {
+                GGML_UNUSED(bank);
+                if (size == 0) {
+                    return;
+                }
+                if (async_upload && upload_backend != nullptr) {
+                    ggml_backend_tensor_set_async(upload_backend, tensor, data, 0, size);
+                } else {
+                    ggml_backend_tensor_set(tensor, data, 0, size);
+                }
+            };
+
+            auto stage_loaded_expert = [&](prefill_exec_bank & bank, const in_memory_ready_expert & loaded, bool async_upload) {
+                const int64_t t_stage_start_us = ggml_time_us();
+                size_t stage_bytes = 0;
+
+                if (use_gate_up_merged) {
+                    if (gate_up_needs_f32) {
+                        stage_tensor(bank, bank.gate_up_w, loaded.gate_up_f32.data(), loaded.gate_up_f32.size() * sizeof(float), async_upload);
+                        stage_bytes += loaded.gate_up_f32.size() * sizeof(float);
+                    } else {
+                        stage_tensor(bank, bank.gate_up_w, loaded.gate_up_bytes.data(), loaded.gate_up_bytes.size(), async_upload);
+                        stage_bytes += loaded.gate_up_bytes.size();
+                    }
+                    if (down_needs_f32) {
+                        stage_tensor(bank, bank.down_w, loaded.down_f32.data(), loaded.down_f32.size() * sizeof(float), async_upload);
+                        stage_bytes += loaded.down_f32.size() * sizeof(float);
+                    } else {
+                        stage_tensor(bank, bank.down_w, loaded.down_bytes.data(), loaded.down_bytes.size(), async_upload);
+                        stage_bytes += loaded.down_bytes.size();
+                    }
+                    if (bank.gate_up_scale_in != nullptr) {
+                        const float scale = gate_up_expert_scales[size_t(loaded.expert)];
+                        stage_tensor(bank, bank.gate_up_scale_in, &scale, sizeof(scale), async_upload);
+                    }
+                } else {
+                    if (gate_needs_f32) {
+                        stage_tensor(bank, bank.gate_w, loaded.gate_f32.data(), loaded.gate_f32.size() * sizeof(float), async_upload);
+                        stage_bytes += loaded.gate_f32.size() * sizeof(float);
+                    } else {
+                        stage_tensor(bank, bank.gate_w, loaded.gate_bytes.data(), loaded.gate_bytes.size(), async_upload);
+                        stage_bytes += loaded.gate_bytes.size();
+                    }
+                    if (up_needs_f32) {
+                        stage_tensor(bank, bank.up_w, loaded.up_f32.data(), loaded.up_f32.size() * sizeof(float), async_upload);
+                        stage_bytes += loaded.up_f32.size() * sizeof(float);
+                    } else {
+                        stage_tensor(bank, bank.up_w, loaded.up_bytes.data(), loaded.up_bytes.size(), async_upload);
+                        stage_bytes += loaded.up_bytes.size();
+                    }
+                    if (down_needs_f32) {
+                        stage_tensor(bank, bank.down_w, loaded.down_f32.data(), loaded.down_f32.size() * sizeof(float), async_upload);
+                        stage_bytes += loaded.down_f32.size() * sizeof(float);
+                    } else {
+                        stage_tensor(bank, bank.down_w, loaded.down_bytes.data(), loaded.down_bytes.size(), async_upload);
+                        stage_bytes += loaded.down_bytes.size();
+                    }
+                    if (bank.gate_scale_in != nullptr) {
+                        const float scale = gate_expert_scales[size_t(loaded.expert)];
+                        stage_tensor(bank, bank.gate_scale_in, &scale, sizeof(scale), async_upload);
+                    }
+                    if (bank.up_scale_in != nullptr) {
+                        const float scale = up_expert_scales[size_t(loaded.expert)];
+                        stage_tensor(bank, bank.up_scale_in, &scale, sizeof(scale), async_upload);
+                    }
+                }
+
+                if (async_upload && upload_backend != nullptr && bank.upload_event != nullptr) {
+                    ggml_backend_event_record(bank.upload_event, upload_backend);
+                    bank.upload_pending = true;
+                }
+
+                in_memory_stage_result result;
+                result.stage_us = ggml_time_us() - t_stage_start_us;
+                result.stage_bytes = stage_bytes;
+                debug_log(format(
+                        "expert_staged layer=%d expert=%d bank=%zu async=%d stage_bytes=%zu stage_us=%lld",
+                        layer,
+                        loaded.expert,
+                        bank.index,
+                        async_upload ? 1 : 0,
+                        stage_bytes,
+                        (long long) result.stage_us));
+                return result;
+            };
+
+            auto accumulate_stage_result = [&](const in_memory_stage_result & result) {
+                local_stats.prefill_stage_us += result.stage_us;
+                local_stats.prefill_stage_bytes += result.stage_bytes;
+            };
+
+            auto wait_bank_upload = [&](prefill_exec_bank & bank) {
+                if (bank.upload_pending && bank.upload_event != nullptr) {
+                    ggml_backend_event_wait(exec_backend, bank.upload_event);
+                    bank.upload_pending = false;
+                }
+            };
+
+            auto compute_loaded_expert = [&](prefill_exec_bank & bank, const in_memory_ready_expert & loaded) {
+                if (loaded.ref_count <= 0) {
+                    return;
+                }
+
+                debug_log(format(
+                        "expert_begin layer=%d expert=%d refs=%d index=%zu/%zu",
+                        layer,
+                        loaded.expert,
+                        loaded.ref_count,
+                        loaded.expert_index + 1,
+                        plan.unique_experts.size()));
+
+                int32_t distinct_tokens = 0;
+                int32_t last_token = -1;
+                for (int32_t i = loaded.ref_begin; i < loaded.ref_end; ++i) {
+                    const int32_t token = plan.expert_ref_tokens[size_t(i)];
+                    if (token != last_token) {
+                        last_token = token;
+                        distinct_tokens++;
+                    }
+                }
+
+                const bool use_metal_expert_mm_for_expert =
+                        metal_expert_mm_capable &&
+                        distinct_tokens >= m5_expert_mm_min_tokens;
+                const float expert_output_scale = down_expert_scales.empty() ? 1.0f : down_expert_scales[size_t(loaded.expert)];
+
+                for (int32_t ref_offset = 0; ref_offset < loaded.ref_count;) {
+                    const int32_t remaining_refs = loaded.ref_count - ref_offset;
+                    const int32_t selected_bucket_tokens =
+                            llama_moe_prefill_select_bucket_size(remaining_refs, bucket_sizes);
+                    prefill_bucket_graph * bucket_graph = find_bucket_graph(bank, selected_bucket_tokens);
+                    GGML_ASSERT(bucket_graph != nullptr);
+
+                    const int32_t ref_chunk = std::min<int32_t>(remaining_refs, bucket_graph->bucket_tokens);
+                    const bool use_metal_expert_mm_for_chunk =
+                            use_metal_expert_mm_for_expert &&
+                            ref_chunk > 8 &&
+                            bucket_graph->graph_mm != nullptr;
+                    const int64_t t_compute_start_us = ggml_time_us();
+                    debug_log(format(
+                            "chunk_begin layer=%d expert=%d bank=%zu ref_offset=%d ref_chunk=%d bucket=%d distinct_tokens=%d use_mm=%d",
+                            layer,
+                            loaded.expert,
+                            bank.index,
+                            ref_offset,
+                            ref_chunk,
+                            bucket_graph->bucket_tokens,
+                            distinct_tokens,
+                            use_metal_expert_mm_for_chunk ? 1 : 0));
+
+                    if (use_metal_expert_mm_for_chunk && bucket_graph->cur_in_mm != nullptr) {
+                        const size_t input_elems = size_t(bucket_graph->bucket_tokens) * size_t(n_embd);
+                        if (gathered_inputs_f16.size() < input_elems) {
+                            gathered_inputs_f16.resize(input_elems);
+                        }
+                        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+                        std::fill_n(gathered_inputs_f16.begin(), input_elems, zero_f16);
+                        for (int32_t j = 0; j < ref_chunk; ++j) {
+                            const int32_t token = plan.expert_ref_tokens[size_t(loaded.ref_begin + ref_offset + j)];
+                            ggml_fp32_to_fp16_row(
+                                    cur_host.data() + size_t(token) * size_t(n_embd),
+                                    gathered_inputs_f16.data() + size_t(j) * size_t(n_embd),
+                                    n_embd);
+                        }
+                        ggml_backend_tensor_set(bucket_graph->cur_in_mm, gathered_inputs_f16.data(), 0, ggml_nbytes(bucket_graph->cur_in_mm));
+                    } else {
+                        std::fill_n(gathered_inputs.begin(), size_t(bucket_graph->bucket_tokens) * size_t(n_embd), 0.0f);
+                        for (int32_t j = 0; j < ref_chunk; ++j) {
+                            const int32_t token = plan.expert_ref_tokens[size_t(loaded.ref_begin + ref_offset + j)];
+                            std::memcpy(
+                                    gathered_inputs.data() + size_t(j) * size_t(n_embd),
+                                    cur_host.data() + size_t(token) * size_t(n_embd),
+                                    size_t(n_embd) * sizeof(float));
+                        }
+                        ggml_backend_tensor_set(bucket_graph->cur_in, gathered_inputs.data(), 0, ggml_nbytes(bucket_graph->cur_in));
+                    }
+#ifdef GGML_USE_METAL
+                    flash_moe_m5_expert_mm_scope m5_expert_mm_scope(use_metal_expert_mm_for_chunk);
+#endif
+                    const ggml_status status_ref = ggml_backend_graph_compute(
+                            exec_backend,
+                            use_metal_expert_mm_for_chunk ? bucket_graph->graph_mm : bucket_graph->graph);
+                    if (status_ref != GGML_STATUS_SUCCESS) {
+                        throw std::runtime_error(format(
+                                "Flash-MoE in-memory prefill compute failed for layer %d with status %d",
+                                layer, int(status_ref)));
+                    }
+
+                    ggml_tensor * active_out = use_metal_expert_mm_for_chunk ? bucket_graph->out_mm : bucket_graph->out;
+                    debug_log(format(
+                            "chunk_computed layer=%d expert=%d ref_offset=%d active_out_type=%s active_out_bytes=%zu",
+                            layer,
+                            loaded.expert,
+                            ref_offset,
+                            ggml_type_name(active_out->type),
+                            ggml_nbytes(active_out)));
+                    const bool active_out_f16 = active_out->type == GGML_TYPE_F16;
+                    if (active_out_f16) {
+                        const size_t output_elems = size_t(ggml_nelements(active_out));
+                        if (expert_output_f16.size() < output_elems) {
+                            expert_output_f16.resize(output_elems);
+                        }
+                        ggml_backend_tensor_get(active_out, expert_output_f16.data(), 0, ggml_nbytes(active_out));
+                    } else if (active_out->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(active_out, expert_output.data(), 0, ggml_nbytes(active_out));
+                    } else {
+                        throw std::runtime_error(format(
+                                "Flash-MoE in-memory prefill produced unsupported output type %s for layer %d",
+                                ggml_type_name(active_out->type),
+                                layer));
+                    }
+                    debug_log(format(
+                            "chunk_got_output layer=%d expert=%d ref_offset=%d",
+                            layer,
+                            loaded.expert,
+                            ref_offset));
+                    for (int32_t j = 0; j < ref_chunk; ++j) {
+                        const int32_t token = plan.expert_ref_tokens[size_t(loaded.ref_begin + ref_offset + j)];
+                        const float weight = plan.expert_ref_weights[size_t(loaded.ref_begin + ref_offset + j)];
+                        float * dst_row = dst_f32 + size_t(token) * size_t(n_embd);
+                        const float row_scale = weight * expert_output_scale;
+                        if (active_out_f16) {
+                            const ggml_fp16_t * src_row = expert_output_f16.data() + size_t(j) * size_t(n_embd);
+                            for (int64_t col = 0; col < n_embd; ++col) {
+                                dst_row[col] += row_scale * ggml_fp16_to_fp32(src_row[col]);
+                            }
+                        } else {
+                            const float * src_row = expert_output.data() + size_t(j) * size_t(n_embd);
+                            for (int64_t col = 0; col < n_embd; ++col) {
+                                dst_row[col] += row_scale * src_row[col];
+                            }
+                        }
+                    }
+                    local_stats.prefill_compute_us += ggml_time_us() - t_compute_start_us;
+                    debug_log(format(
+                            "chunk_scattered layer=%d expert=%d ref_offset=%d compute_us=%lld",
+                            layer,
+                            loaded.expert,
+                            ref_offset,
+                            (long long) (ggml_time_us() - t_compute_start_us)));
+                    ref_offset += ref_chunk;
+                }
+            };
+
+            const bool async_prefill_source_safe =
+                    (use_gate_up_merged ?
+                            (tensor_cpu_visible_data(state.gate_up_tensor) != nullptr &&
+                             tensor_cpu_visible_data(state.down_tensor) != nullptr) :
+                            (tensor_cpu_visible_data(state.gate_tensor) != nullptr &&
+                             tensor_cpu_visible_data(state.up_tensor) != nullptr &&
+                             tensor_cpu_visible_data(state.down_tensor) != nullptr));
+            debug_log(format(
+                    "prefill_banks layer=%d depth=%zu async_source=%d experts=%zu",
+                    layer,
+                    prefill_bank_depth,
+                    async_prefill_source_safe ? 1 : 0,
+                    plan.unique_experts.size()));
+
+            size_t next_batch_start = 0;
+            in_memory_prefill_batch current_batch = load_in_memory_prefill_batch(next_batch_start);
+            next_batch_start += current_batch.experts.size();
+
+            while (!current_batch.experts.empty()) {
+                std::future<in_memory_prefill_batch> next_batch_future;
+                if (async_prefill_source_safe && next_batch_start < plan.unique_experts.size()) {
+                    const size_t async_start = next_batch_start;
+                    next_batch_future = std::async(std::launch::async, [&, async_start]() {
+                        return load_in_memory_prefill_batch(async_start);
+                    });
+                }
+
+                accumulate_metrics(local_stats, current_batch.read_stats);
+
+                in_memory_stage_result current_stage;
+                bool have_current_stage = false;
+
+                auto stage_batch_expert = [&](size_t batch_index, bool async_upload) {
+                    auto & bank = exec_banks[batch_index % exec_banks.size()];
+                    return stage_loaded_expert(bank, current_batch.experts[batch_index], async_upload);
+                };
+
+                for (size_t batch_index = 0; batch_index < current_batch.experts.size(); ++batch_index) {
+                    auto & bank = exec_banks[batch_index % exec_banks.size()];
+                    if (!have_current_stage) {
+                        current_stage = stage_batch_expert(batch_index, false);
+                        have_current_stage = true;
+                    }
+
+                    wait_bank_upload(bank);
+                    accumulate_stage_result(current_stage);
+
+                    std::future<in_memory_stage_result> next_stage_future;
+                    const size_t next_expert_index = batch_index + 1;
+                    const bool can_stage_next_on_gpu =
+                            async_gpu_bank_uploads &&
+                            next_expert_index < current_batch.experts.size() &&
+                            exec_banks.size() > 1;
+                    if (can_stage_next_on_gpu) {
+                        next_stage_future = std::async(std::launch::async, [&, next_expert_index]() {
+                            return stage_batch_expert(next_expert_index, true);
+                        });
+                    }
+
+                    compute_loaded_expert(bank, current_batch.experts[batch_index]);
+
+                    if (next_expert_index < current_batch.experts.size()) {
+                        if (next_stage_future.valid()) {
+                            current_stage = next_stage_future.get();
+                        } else {
+                            current_stage = stage_batch_expert(next_expert_index, false);
+                        }
+                        have_current_stage = true;
+                    } else {
+                        have_current_stage = false;
+                    }
+                }
+
+                if (next_batch_start >= plan.unique_experts.size()) {
+                    break;
+                }
+
+                if (next_batch_future.valid()) {
+                    current_batch = next_batch_future.get();
+                } else {
+                    current_batch = load_in_memory_prefill_batch(next_batch_start);
+                }
+                next_batch_start += current_batch.experts.size();
+            }
+        } catch (...) {
+            debug_log(format("exception layer=%d", layer));
+            prefill_inline_progress_finish();
+            cleanup_upload_backend();
+            if (temp_buffer != nullptr) {
+                ggml_backend_buffer_free(temp_buffer);
+            }
+            ggml_free(temp_ctx);
+            throw;
+        }
+
+        cleanup_upload_backend();
+        if (temp_buffer != nullptr) {
+            ggml_backend_buffer_free(temp_buffer);
+        }
+        ggml_free(temp_ctx);
+
+#ifdef GGML_USE_METAL
+        if (log_prefill_mul_mat_stats) {
+            LLAMA_LOG_INFO("%s: prefill_mul_mat layer=%d tokens=%" PRId64 " topk=%" PRId64
+                    " max_refs=%" PRIu64 " max_tokens=%" PRIu64 "\n",
+                    __func__, layer, n_tokens, topk, local_stats.max_refs_per_expert, local_stats.max_tokens_per_expert);
+            ggml_metal_op_mul_mat_log_stats();
+        }
+#endif
+
+        local_stats.total_us = ggml_time_us() - t_total_start_us;
+        prefill_inline_progress_accumulate_layer(local_stats);
+        prefill_inline_progress_advance();
+
+        accumulate_metrics(state.stats, local_stats);
+        debug_log(format(
+                "exit layer=%d total_us=%lld unique=%llu token_refs=%llu",
+                layer,
+                (long long) local_stats.total_us,
+                (unsigned long long) local_stats.unique_experts,
+                (unsigned long long) local_stats.token_refs));
+
+        if (perf_profile && overall_prompt_eval_us != nullptr && overall_prompt_eval_tokens != nullptr) {
+            const uint64_t dedup_saved = local_stats.token_refs > local_stats.unique_experts ?
+                    local_stats.token_refs - local_stats.unique_experts : 0;
+            LLAMA_LOG_INFO("%s: in-memory prefill layer=%d unique=%" PRIu64 "/%" PRIu64 " dedup_saved=%" PRIu64 " reuse=%.2fx max_tokens/expert=%" PRIu64 "\n",
+                    __func__,
+                    layer,
+                    local_stats.unique_experts,
+                    local_stats.token_refs,
+                    dedup_saved,
+                    local_stats.unique_experts > 0 ? double(local_stats.token_refs) / double(local_stats.unique_experts) : 0.0,
+                    local_stats.max_tokens_per_expert);
+        }
+    }
+
+    const llama_model & model;
+    int32_t expert_count = 0;
+    bool perf_profile = false;
+    int32_t prefill_micro_batch_tokens = 0;
+    const int64_t * overall_prompt_eval_us = nullptr;
+    const int32_t * overall_prompt_eval_tokens = nullptr;
+    bool activation_logged = false;
+    bool prefill_inline_progress_active = false;
+    int32_t prefill_inline_total_layers = 0;
+    int32_t prefill_inline_layers_done = 0;
+    int64_t prefill_inline_tokens = 0;
+    int64_t prefill_inline_micro_batch_tokens = 0;
+    bool prefill_inline_micro_batch_auto = false;
+    int64_t prefill_inline_start_us = 0;
+    uint32_t prefill_inline_batch_index = 0;
+    uint32_t prefill_inline_batch_total = 0;
+    int64_t prefill_inline_total_tokens = 0;
+    routed_metrics prefill_inline_chunk_stats;
+    std::vector<prefill_moe_userdata> prefill_moe_ud;
+    std::vector<layer_state> layers;
+    std::unordered_map<ggml_backend_dev_t, ggml_backend_t> prefill_exec_backends;
+    ggml_backend_t prefill_cpu_backend = nullptr;
+    std::vector<int32_t> topk_ids;
+};
+
 static bool llama_context_flash_moe_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * ctx = static_cast<llama_context *>(user_data);
     return ctx->flash_moe_eval_cb(t, ask);
@@ -6135,6 +8664,18 @@ llama_context::llama_context(
         cparams.cb_eval = llama_context_flash_moe_eval_cb;
         cparams.cb_eval_user_data = this;
         flash_moe_active_runtime = flash_moe_slot_runtime.get();
+    } else if (model.flash_moe_prefill_layer_major_enabled()) {
+        const int32_t resolved_prefill_micro_batch =
+                llama_moe_prefill_micro_batch_is_auto(cparams.moe_prefill_micro_batch) ?
+                        -1 :
+                        (int32_t) cparams.moe_prefill_micro_batch;
+        flash_moe_prefill_runtime = std::make_unique<llama_flash_moe_in_memory_prefill_runtime>(
+                model, !cparams.no_perf, resolved_prefill_micro_batch,
+                &flash_moe_prefill_eval_us, &flash_moe_prefill_eval_tokens);
+        flash_moe_cb_eval_downstream = cparams.cb_eval;
+        flash_moe_cb_eval_downstream_user_data = cparams.cb_eval_user_data;
+        cparams.cb_eval = llama_context_flash_moe_eval_cb;
+        cparams.cb_eval_user_data = this;
     }
 
     if (cparams.moe_shared_only) {
@@ -7891,10 +10432,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
+    const auto prefill_progress_override = flash_moe_prefill_progress_override;
+    flash_moe_prefill_progress_clear();
+
     int64_t n_outputs_prev = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (flash_moe_prefill_runtime && ubatch.n_tokens > 1) {
+            const uint32_t current_batch =
+                    prefill_progress_override.active && prefill_progress_override.current_batch > 0 ?
+                            prefill_progress_override.current_batch :
+                            (mctx->get_ubatch_index() + 1);
+            const uint32_t total_batches =
+                    prefill_progress_override.active && prefill_progress_override.total_batches > 0 ?
+                            prefill_progress_override.total_batches :
+                            mctx->get_ubatch_count();
+            const uint32_t total_tokens =
+                    prefill_progress_override.active && prefill_progress_override.total_tokens > 0 ?
+                            prefill_progress_override.total_tokens :
+                            n_tokens_all;
+            flash_moe_prefill_runtime->set_prefill_batch_progress(
+                    current_batch,
+                    total_batches,
+                    ubatch.n_tokens,
+                    total_tokens);
+        }
 
         // count the outputs in this ubatch
         {
@@ -8926,6 +11490,22 @@ bool llama_context::flash_moe_progress_get(bool prefill, llama_flash_moe_progres
     return runtime->progress_get_data(out);
 }
 
+void llama_context::flash_moe_prefill_progress_set(uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens) {
+    if (current_batch == 0 || total_batches == 0 || total_tokens == 0) {
+        flash_moe_prefill_progress_clear();
+        return;
+    }
+
+    flash_moe_prefill_progress_override.active = true;
+    flash_moe_prefill_progress_override.current_batch = current_batch;
+    flash_moe_prefill_progress_override.total_batches = total_batches;
+    flash_moe_prefill_progress_override.total_tokens = total_tokens;
+}
+
+void llama_context::flash_moe_prefill_progress_clear() {
+    flash_moe_prefill_progress_override = {};
+}
+
 std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -9789,6 +12369,14 @@ bool llama_flash_moe_progress_get(const llama_context * ctx, bool prefill, llama
     }
 
     return ctx->flash_moe_progress_get(prefill, *out);
+}
+
+void llama_flash_moe_prefill_progress_set(llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    ctx->flash_moe_prefill_progress_set(current_batch, total_batches, total_tokens);
 }
 
 void llama_memory_breakdown_print(const struct llama_context * ctx) {

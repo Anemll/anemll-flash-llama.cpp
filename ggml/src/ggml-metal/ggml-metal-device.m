@@ -1590,7 +1590,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    has_simdgroup_mm &&
                    op->type == GGML_TYPE_F16 &&
                    op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_F32 ||
+                    (op->src[1]->type == GGML_TYPE_F16 &&
+                     ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_IN_MEMORY_FP16_ACTIVATIONS"))) &&
                    op->src[1]->ne[1] > 8;
         case GGML_OP_FLASHMOE_SPLIT_GLU: {
             if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT")) {

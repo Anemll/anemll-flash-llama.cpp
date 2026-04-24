@@ -317,6 +317,16 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+uint32_t llama_kv_cache_iswa_context::get_ubatch_index() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return uint32_t(i_next);
+}
+
+uint32_t llama_kv_cache_iswa_context::get_ubatch_count() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return uint32_t(ubatches.size());
+}
+
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

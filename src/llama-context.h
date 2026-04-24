@@ -175,6 +175,8 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
     bool flash_moe_progress_get(bool prefill, llama_flash_moe_progress_stats & out) const;
+    void flash_moe_prefill_progress_set(uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens);
+    void flash_moe_prefill_progress_clear();
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 
@@ -335,10 +337,16 @@ private:
     ggml_threadpool_t threadpool_batch = nullptr;
 
     std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_slot_runtime;
-    std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_prefill_runtime;
+    std::unique_ptr<llm_flash_moe_slot_runtime_i> flash_moe_prefill_runtime;
     mutable llm_flash_moe_slot_runtime_i * flash_moe_active_runtime = nullptr;
     ggml_backend_sched_eval_callback flash_moe_cb_eval_downstream = nullptr;
     void * flash_moe_cb_eval_downstream_user_data = nullptr;
+    struct flash_moe_prefill_progress_override_data {
+        bool active = false;
+        uint32_t current_batch = 0;
+        uint32_t total_batches = 0;
+        uint32_t total_tokens = 0;
+    } flash_moe_prefill_progress_override;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

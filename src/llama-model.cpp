@@ -525,6 +525,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    buft_list_t cpu_buft_list_no_extra;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -3068,9 +3069,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     pimpl->flash_moe_slot_bank_size = flash_moe_slot_bank ? (int32_t) flash_moe_slot_count : 0;
 
     if (pimpl->flash_moe_prefill_layer_major_enabled && !flash_moe_slot_bank) {
-        LLAMA_LOG_WARN("%s: disabling Flash-MoE layer-major prefill scratch path because it currently depends on slot-bank routed tensor virtualization\n",
+        LLAMA_LOG_INFO("%s: enabling Flash-MoE layer-major prefill for in-memory routed tensors; no slot-bank scratch tensors will be created in this mode\n",
                 __func__);
-        pimpl->flash_moe_prefill_layer_major_enabled = false;
     }
 
     if (flash_moe_slot_bank && n_gpu_layers != 0) {
@@ -3412,6 +3412,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list_no_extra = make_cpu_buft_list(devices, false, params.no_host);
     for (auto * dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -3521,6 +3522,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         auto create_routed_expert_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             if (!flash_moe_slot_bank) {
+                if (pimpl->flash_moe_prefill_layer_major_enabled) {
+                    // The in-memory layer-major runtime slices routed experts out of the
+                    // model tensor byte-for-byte, so these weights must stay in canonical
+                    // GGUF layout instead of CPU_REPACK.
+                    return ml.create_tensor(
+                        hparams,
+                        &pimpl->cpu_buft_list_no_extra,
+                        &pimpl->cpu_buft_list_no_extra,
+                        &pimpl->cpu_buft_list_no_extra,
+                        &pimpl->cpu_buft_list_no_extra,
+                        tn,
+                        ne,
+                        flags);
+                }
+
                 return create_tensor(tn, ne, flags);
             }
 

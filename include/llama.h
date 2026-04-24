@@ -1620,6 +1620,7 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
     LLAMA_API bool                           llama_flash_moe_progress_get(const struct llama_context * ctx, bool prefill, struct llama_flash_moe_progress_stats * out);
+    LLAMA_API void                           llama_flash_moe_prefill_progress_set(struct llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

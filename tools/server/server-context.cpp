@@ -180,9 +180,10 @@ struct server_slot {
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
 
-    int32_t n_prompt_tokens_cache     = 0;
-    int32_t n_prompt_tokens_processed = 0;
-    int32_t n_prompt_tokens_logged    = 0;
+    int32_t n_prompt_tokens_cache      = 0;
+    int32_t n_prompt_tokens_cache_base = 0;
+    int32_t n_prompt_tokens_processed  = 0;
+    int32_t n_prompt_tokens_logged     = 0;
     bool prompt_prefill_started_logged = false;
 
     size_t last_nl_pos = 0;
@@ -295,8 +296,9 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_decoded = 0;
-        n_prompt_tokens_cache  = 0;
-        n_prompt_tokens_logged = 0;
+        n_prompt_tokens_cache      = 0;
+        n_prompt_tokens_cache_base = 0;
+        n_prompt_tokens_logged     = 0;
         prompt_prefill_started_logged = false;
 
         last_nl_pos    = 0;
@@ -653,10 +655,11 @@ struct server_slot {
         other.i_batch     = i_batch;
 
         other.t_start_process_prompt    = t_start_process_prompt;
-        other.t_prompt_processing       = t_prompt_processing;
-        other.t_prompt_eval             = t_prompt_eval;
-        other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
-        other.n_prompt_tokens_processed = n_prompt_tokens_processed;
+        other.t_prompt_processing        = t_prompt_processing;
+        other.t_prompt_eval              = t_prompt_eval;
+        other.n_prompt_tokens_cache      = n_prompt_tokens_cache;
+        other.n_prompt_tokens_cache_base = n_prompt_tokens_cache_base;
+        other.n_prompt_tokens_processed  = n_prompt_tokens_processed;
 
         other.prompt = prompt.clone();
         other.init_sampler();
@@ -2670,6 +2673,7 @@ private:
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
+                        slot.n_prompt_tokens_cache_base = n_past;
                         slot.n_prompt_tokens_processed = 0;
                         slot.prompt_prefill_started_logged = false;
 
@@ -2702,6 +2706,7 @@ private:
 
                         // there is no common part left
                         slot.n_prompt_tokens_cache = 0;
+                        slot.n_prompt_tokens_cache_base = 0;
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
@@ -2952,6 +2957,60 @@ private:
                 batch.seq_id   + i,
                 batch.logits   + i,
             };
+
+            if (use_layer_major_prefill_batch) {
+                server_slot * progress_slot = nullptr;
+                bool single_prompt_slot = n_tokens > 1;
+
+                for (int32_t j = 0; j < n_tokens && single_prompt_slot; ++j) {
+                    if (batch_view.n_seq_id == nullptr || batch_view.seq_id == nullptr || batch_view.n_seq_id[j] <= 0 || batch_view.seq_id[j] == nullptr) {
+                        single_prompt_slot = false;
+                        break;
+                    }
+
+                    const llama_seq_id slot_id = batch_view.seq_id[j][0];
+                    if (slot_id < 0 || slot_id >= (llama_seq_id) slots.size()) {
+                        single_prompt_slot = false;
+                        break;
+                    }
+
+                    auto & slot = slots[size_t(slot_id)];
+                    if ((slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                         slot.state != SLOT_STATE_STARTED &&
+                         slot.state != SLOT_STATE_DONE_PROMPT) || slot.task == nullptr) {
+                        single_prompt_slot = false;
+                        break;
+                    }
+
+                    if (progress_slot == nullptr) {
+                        progress_slot = &slot;
+                    } else if (progress_slot != &slot) {
+                        single_prompt_slot = false;
+                        break;
+                    }
+                }
+
+                if (single_prompt_slot && progress_slot != nullptr) {
+                    const int32_t total_tokens = progress_slot->task->n_tokens();
+                    const int32_t prompt_base_tokens = std::max<int32_t>(0, progress_slot->n_prompt_tokens_cache_base);
+                    const int32_t batch_size_progress = std::max<int32_t>(1, n_batch);
+                    const int32_t prompt_tokens_before_batch = std::max<int32_t>(
+                            prompt_base_tokens,
+                            progress_slot->prompt.n_tokens() - n_tokens);
+                    const int32_t prompt_tokens_remaining = std::max<int32_t>(0, total_tokens - prompt_base_tokens);
+                    const int32_t prompt_tokens_done_before_batch = std::max<int32_t>(0, prompt_tokens_before_batch - prompt_base_tokens);
+                    const uint32_t total_batches = uint32_t(std::max<int32_t>(1, (prompt_tokens_remaining + batch_size_progress - 1) / batch_size_progress));
+                    const uint32_t current_batch = std::min<uint32_t>(
+                            total_batches,
+                            uint32_t(prompt_tokens_done_before_batch / batch_size_progress + 1));
+
+                    llama_flash_moe_prefill_progress_set(ctx, current_batch, total_batches, uint32_t(total_tokens));
+                } else {
+                    llama_flash_moe_prefill_progress_set(ctx, 0, 0, 0);
+                }
+            } else {
+                llama_flash_moe_prefill_progress_set(ctx, 0, 0, 0);
+            }
 
             const int64_t t_before_decode = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
