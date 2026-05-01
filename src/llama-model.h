@@ -260,6 +260,15 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    struct ggml_tensor * attn_kv   = nullptr;
+    struct ggml_tensor * attn_wo_a = nullptr;
+    struct ggml_tensor * attn_wo_b = nullptr;
+
+    // DeepSeek V4 compressed attention
+    struct ggml_tensor * attn_compressor_ape  = nullptr;
+    struct ggml_tensor * attn_compressor_kv   = nullptr;
+    struct ggml_tensor * attn_compressor_gate = nullptr;
+    struct ggml_tensor * attn_compressor_norm = nullptr;
 
     // attention bias
     struct ggml_tensor * bq   = nullptr;
@@ -332,6 +341,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -473,6 +483,18 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // DeepSeek V4 compressed indexer + hyper-connections
+    struct ggml_tensor * indexer_compressor_ape  = nullptr;
+    struct ggml_tensor * indexer_compressor_kv   = nullptr;
+    struct ggml_tensor * indexer_compressor_gate = nullptr;
+    struct ggml_tensor * indexer_compressor_norm = nullptr;
+    struct ggml_tensor * hc_attn_base            = nullptr;
+    struct ggml_tensor * hc_attn_fn              = nullptr;
+    struct ggml_tensor * hc_attn_scale           = nullptr;
+    struct ggml_tensor * hc_ffn_base             = nullptr;
+    struct ggml_tensor * hc_ffn_fn               = nullptr;
+    struct ggml_tensor * hc_ffn_scale            = nullptr;
+
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -508,6 +530,9 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+    struct ggml_tensor * output_hc_base  = nullptr;
+    struct ggml_tensor * output_hc_fn    = nullptr;
+    struct ggml_tensor * output_hc_scale = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;

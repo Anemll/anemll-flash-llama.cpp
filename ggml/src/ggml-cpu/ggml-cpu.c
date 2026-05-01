@@ -276,6 +276,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8_E4M3_B128] = {
+        .from_float               = quantize_row_f8_e4m3_b128,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_b128_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
@@ -2048,6 +2054,30 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            {
+                ggml_compute_forward_dsv4_hc_split_sinkhorn(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            {
+                ggml_compute_forward_dsv4_hc_weighted_sum(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_EXPAND:
+            {
+                ggml_compute_forward_dsv4_hc_expand(params, tensor);
+            } break;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            {
+                ggml_compute_forward_dsv4_fp8_kv_quantize(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
+            {
+                ggml_compute_forward_dsv4_hadamard_fp4_quantize(params, tensor);
+            } break;
+        case GGML_OP_DSV4_ROPE_TAIL:
+            {
+                ggml_compute_forward_dsv4_rope_tail(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2228,6 +2258,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+        case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2328,6 +2363,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
+        case GGML_OP_DSV4_ROPE_TAIL:
         case GGML_OP_ADD_REL_POS:
             {
                 n_tasks = n_threads;
@@ -2855,6 +2891,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
+                case GGML_OP_DSV4_ROPE_TAIL:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;

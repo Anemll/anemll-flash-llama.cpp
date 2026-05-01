@@ -22,6 +22,8 @@ if [[ -n "${MODEL_PATH:-}" ]]; then
     model_path=$MODEL_PATH
 elif [[ -f "$target" ]]; then
     model_path=$target
+elif [[ -f "$target/dense/model-dense.gguf" ]]; then
+    model_path="$target/dense/model-dense.gguf"
 else
     model_path="$target/model-dense.gguf"
 fi
@@ -46,13 +48,14 @@ package_slot_bank=64
 package_cache_io_split=4
 package_prefetch_temporal=1
 package_expert_count=0
+package_arch=unknown
 sidecar_manifest_path=${SIDECAR_MANIFEST_PATH:-}
 if [[ -z "$sidecar_manifest_path" && -n "$sidecar_path" && -d "$sidecar_path" ]]; then
     sidecar_manifest_path="$sidecar_path/manifest.json"
 fi
 
 if [[ -n "$package_json" && -f "$package_json" ]]; then
-    read -r package_topk package_slot_bank package_cache_io_split package_prefetch_temporal package_expert_count < <(
+    read -r package_topk package_slot_bank package_cache_io_split package_prefetch_temporal package_expert_count package_arch < <(
         python3 - "$package_json" <<'PY'
 import json
 import sys
@@ -68,6 +71,7 @@ print(
     hint.get("moe_cache_io_split", 4),
     1 if hint.get("moe_prefetch_temporal", True) else 0,
     model.get("expert_count", 0),
+    package.get("arch") or model.get("arch") or "unknown",
 )
 PY
     )
@@ -115,7 +119,14 @@ export LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES="${LLAMA_FLASH_MOE_E
 export LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS="${LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS:-1}"
 export LLAMA_FLASH_MOE_PERF_PREFILL_LAYER_STATS="${LLAMA_FLASH_MOE_PERF_PREFILL_LAYER_STATS:-0}"
 
-requested_topk=${MOE_TOPK:-$package_topk}
+server_default_topk=${FLASHMOE_SERVER_DEFAULT_TOPK:-}
+if [[ -z "$server_default_topk" ]]; then
+    server_default_topk=$package_topk
+    if [[ "$package_arch" == "deepseek4" ]]; then
+        server_default_topk=4
+    fi
+fi
+requested_topk=${MOE_TOPK:-$server_default_topk}
 requested_ubatch=${UBATCH:-32}
 server_profile=${FLASHMOE_SERVER_PROFILE:-default}
 server_perf=${FLASHMOE_SERVER_PERF:-0}

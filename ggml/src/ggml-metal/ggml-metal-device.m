@@ -1561,11 +1561,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 192 &&
                 op->src[0]->ne[0] != 256 &&
                 op->src[0]->ne[0] != 320 &&
+                op->src[0]->ne[0] != 512 &&
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
+            }
+            if (op->src[0]->ne[0] == 512) {
+                return op->src[1]->type == GGML_TYPE_F16 &&
+                       op->src[1]->ne[0] == 512 &&
+                       op->src[2]->ne[0] == 512 &&
+                       has_simdgroup_mm;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
@@ -1576,12 +1583,62 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[2] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   ggml_get_op_params_i32(op, 0) > 0 &&
+                   ggml_get_op_params_i32(op, 0) <= 16;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_EXPAND:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[2] != NULL &&
+                   op->src[3] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] > 0 &&
+                   (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0 &&
+                   op->src[0]->ne[0] % 32 == 0 &&
+                   op->src[0]->ne[0] <= 256;
+        case GGML_OP_DSV4_ROPE_TAIL: {
+            if (op->src[0] == NULL || op->src[1] == NULL) {
+                return false;
+            }
+
+            const int mode = ggml_get_op_params_i32(op, 1);
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
+                   (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
+        }
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
             if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT")) {
                 return false;
             }
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return has_simdgroup_reduction &&
+                   op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_MUL_MAT_F16:
             if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT")) {
                 return false;
@@ -1632,7 +1689,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT_ID")) {
                 return false;
             }
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return has_simdgroup_reduction &&
+                   op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:

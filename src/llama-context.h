@@ -49,7 +49,7 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(uint32_t n_tokens_hint = 0);
 
     void synchronize();
 
@@ -175,7 +175,7 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
     bool flash_moe_progress_get(bool prefill, llama_flash_moe_progress_stats & out) const;
-    void flash_moe_prefill_progress_set(uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens);
+    void flash_moe_prefill_progress_set(uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens, uint32_t tokens_before_batch = 0);
     void flash_moe_prefill_progress_clear();
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
@@ -326,6 +326,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    uint32_t sched_reserved_n_tokens = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -346,6 +347,7 @@ private:
         uint32_t current_batch = 0;
         uint32_t total_batches = 0;
         uint32_t total_tokens = 0;
+        uint32_t tokens_before_batch = 0;
     } flash_moe_prefill_progress_override;
 
     ggml_abort_callback abort_callback      = nullptr;
@@ -384,6 +386,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
     mutable int32_t flash_moe_prefill_eval_tokens = 0;
     mutable int32_t flash_moe_decode_eval_tokens  = 0;
+    int flash_moe_queued_eval_kind = 0;
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };

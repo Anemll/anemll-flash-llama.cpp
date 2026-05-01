@@ -45,6 +45,110 @@ static bool llama_flash_moe_is_routed_tensor_name(const char * name) {
            strstr(name, ".ffn_down_exps.")    != nullptr;
 }
 
+static std::string llama_deepseek4_flash_tensor_alias(const char * name) {
+    if (name == nullptr) {
+        return {};
+    }
+
+    const std::string s(name);
+
+    if (s == "output_norm.weight")     return "norm.weight";
+    if (s == "output.weight")          return "head.weight";
+    if (s == "output_hc_base.weight")  return "hc_head_base";
+    if (s == "output_hc_fn.weight")    return "hc_head_fn";
+    if (s == "output_hc_scale.weight") return "hc_head_scale";
+
+    int il = -1;
+    char suffix[128] = {};
+    if (sscanf(s.c_str(), "blk.%d.%127s", &il, suffix) != 2 || il < 0) {
+        return {};
+    }
+
+    const std::string tail(suffix);
+    const auto layer = [&](const char * fmt) {
+        return format(fmt, il);
+    };
+
+    if (tail == "attn_sinks.weight")                  return layer("blk.%d.attn.attn_sink");
+    if (tail == "attn_q_a_norm.weight")               return layer("blk.%d.attn.q_norm.weight");
+    if (tail == "attn_kv_a_norm.weight")              return layer("blk.%d.attn.kv_norm.weight");
+    if (tail == "attn_q_a.weight")                    return layer("blk.%d.attn.wq_a.weight");
+    if (tail == "attn_q_b.weight")                    return layer("blk.%d.attn.wq_b.weight");
+    if (tail == "attn_kv.weight")                     return layer("blk.%d.attn.wkv.weight");
+    if (tail == "attn_wo_a.weight")                   return layer("blk.%d.attn.wo_a.weight");
+    if (tail == "attn_wo_b.weight")                   return layer("blk.%d.attn.wo_b.weight");
+    if (tail == "attn_compressor_ape.weight")         return layer("blk.%d.attn.compressor.ape");
+    if (tail == "attn_compressor_kv.weight")          return layer("blk.%d.attn.compressor.wkv.weight");
+    if (tail == "attn_compressor_gate.weight")        return layer("blk.%d.attn.compressor.wgate.weight");
+    if (tail == "attn_compressor_norm.weight")        return layer("blk.%d.attn.compressor.norm.weight");
+    if (tail == "indexer.proj.weight")                return layer("blk.%d.attn.indexer.weights_proj.weight");
+    if (tail == "indexer.attn_q_b.weight")            return layer("blk.%d.attn.indexer.wq_b.weight");
+    if (tail == "indexer_compressor_ape.weight")      return layer("blk.%d.attn.indexer.compressor.ape");
+    if (tail == "indexer_compressor_kv.weight")       return layer("blk.%d.attn.indexer.compressor.wkv.weight");
+    if (tail == "indexer_compressor_gate.weight")     return layer("blk.%d.attn.indexer.compressor.wgate.weight");
+    if (tail == "indexer_compressor_norm.weight")     return layer("blk.%d.attn.indexer.compressor.norm.weight");
+    if (tail == "ffn_gate_inp.weight")                return layer("blk.%d.ffn.gate.weight");
+    if (tail == "ffn_exp_probs_b.bias")               return layer("blk.%d.ffn.gate.bias");
+    if (tail == "ffn_gate_tid2eid.weight")            return layer("blk.%d.ffn.gate.tid2eid");
+    if (tail == "ffn_gate_shexp.weight")              return layer("blk.%d.ffn.shared_experts.w1.weight");
+    if (tail == "ffn_down_shexp.weight")              return layer("blk.%d.ffn.shared_experts.w2.weight");
+    if (tail == "ffn_up_shexp.weight")                return layer("blk.%d.ffn.shared_experts.w3.weight");
+    if (tail == "hc_attn_base.weight")                return layer("blk.%d.hc_attn_base");
+    if (tail == "hc_attn_fn.weight")                  return layer("blk.%d.hc_attn_fn");
+    if (tail == "hc_attn_scale.weight")               return layer("blk.%d.hc_attn_scale");
+    if (tail == "hc_ffn_base.weight")                 return layer("blk.%d.hc_ffn_base");
+    if (tail == "hc_ffn_fn.weight")                   return layer("blk.%d.hc_ffn_fn");
+    if (tail == "hc_ffn_scale.weight")                return layer("blk.%d.hc_ffn_scale");
+
+    return {};
+}
+
+static std::string llama_deepseek4_flash_native_tensor_alias(const char * name) {
+    if (name == nullptr) {
+        return {};
+    }
+
+    const std::string s(name);
+
+    if (s == "output_hc_base.weight")  return "hc_head_base";
+    if (s == "output_hc_fn.weight")    return "hc_head_fn";
+    if (s == "output_hc_scale.weight") return "hc_head_scale";
+
+    int il = -1;
+    char suffix[128] = {};
+    if (sscanf(s.c_str(), "blk.%d.%127s", &il, suffix) != 2 || il < 0) {
+        return {};
+    }
+
+    const std::string tail(suffix);
+    const auto layer = [&](const char * fmt) {
+        return format(fmt, il);
+    };
+
+    if (tail == "attn_sinks.weight")       return layer("blk.%d.attn_sinks");
+    if (tail == "attn_kv.weight")          return layer("blk.%d.attn_kv_latent.weight");
+    if (tail == "attn_wo_a.weight")        return layer("blk.%d.attn_output_a.weight");
+    if (tail == "attn_wo_b.weight")        return layer("blk.%d.attn_output_b.weight");
+    if (tail == "attn_compressor_ape.weight")      return layer("blk.%d.attn_compress_ape");
+    if (tail == "attn_compressor_kv.weight")       return layer("blk.%d.attn_compress_kv.weight");
+    if (tail == "attn_compressor_gate.weight")     return layer("blk.%d.attn_compress_gate.weight");
+    if (tail == "attn_compressor_norm.weight")     return layer("blk.%d.attn_compress_norm.weight");
+    if (tail == "indexer_compressor_ape.weight")   return layer("blk.%d.indexer.compress_ape");
+    if (tail == "indexer_compressor_kv.weight")    return layer("blk.%d.indexer.compress_kv.weight");
+    if (tail == "indexer_compressor_gate.weight")  return layer("blk.%d.indexer.compress_gate.weight");
+    if (tail == "indexer_compressor_norm.weight")  return layer("blk.%d.indexer.compress_norm.weight");
+    if (tail == "ffn_gate_tid2eid.weight") return layer("blk.%d.ffn_gate_tid2eid");
+    if (tail == "exp_probs_b.bias")        return layer("blk.%d.exp_probs_b");
+    if (tail == "hc_attn_base.weight")     return layer("blk.%d.hc_attn_base");
+    if (tail == "hc_attn_fn.weight")       return layer("blk.%d.hc_attn_fn");
+    if (tail == "hc_attn_scale.weight")    return layer("blk.%d.hc_attn_scale");
+    if (tail == "hc_ffn_base.weight")      return layer("blk.%d.hc_ffn_base");
+    if (tail == "hc_ffn_fn.weight")        return layer("blk.%d.hc_ffn_fn");
+    if (tail == "hc_ffn_scale.weight")     return layer("blk.%d.hc_ffn_scale");
+
+    return {};
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -71,6 +175,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:     return "Q8_0";
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return "MXFP4 MoE";
         case LLAMA_FTYPE_MOSTLY_NVFP4:    return "NVFP4";
+        case LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4: return "F8_E4M3 + MXFP4";
         case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K - Medium";
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K - Small";
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K - Small";
@@ -760,6 +865,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_F8_E4M3_B128: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -939,6 +1045,22 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
     auto pos = weights_map.find(name);
     if (pos != weights_map.end()) {
         return &pos->second;
+    }
+
+    const std::string native_alias = llama_deepseek4_flash_native_tensor_alias(name);
+    if (!native_alias.empty()) {
+        pos = weights_map.find(native_alias);
+        if (pos != weights_map.end()) {
+            return &pos->second;
+        }
+    }
+
+    const std::string alias = llama_deepseek4_flash_tensor_alias(name);
+    if (!alias.empty()) {
+        pos = weights_map.find(alias);
+        if (pos != weights_map.end()) {
+            return &pos->second;
+        }
     }
 
     return nullptr;

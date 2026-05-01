@@ -48,11 +48,17 @@ struct llm_flash_moe_slot_runtime_i {
             uint32_t current_batch,
             uint32_t total_batches,
             uint32_t batch_tokens,
-            uint32_t total_tokens) {
+            uint32_t total_tokens,
+            uint32_t sub_batch_index = 0,
+            uint32_t sub_batch_total = 0,
+            uint32_t tokens_before_batch = 0) {
         (void) current_batch;
         (void) total_batches;
         (void) batch_tokens;
         (void) total_tokens;
+        (void) sub_batch_index;
+        (void) sub_batch_total;
+        (void) tokens_before_batch;
     }
 };
 
@@ -870,7 +876,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -895,7 +902,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     //
     // inputs

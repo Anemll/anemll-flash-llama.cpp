@@ -1064,7 +1064,7 @@ common_init_result::common_init_result(common_params & params) :
 
     if (flash_moe_sidecar_runtime &&
         flash_moe_slot_bank_runtime &&
-        flash_moe_gpu_offload_requested &&
+        !params.moe_prefill_layer_major &&
         params.n_ubatch > 1 &&
         params.moe_slot_bank > 0 &&
         params.moe_topk_override > 0) {

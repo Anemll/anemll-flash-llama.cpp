@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <cstring>
@@ -48,6 +49,83 @@ static bool server_log_colors_enabled() {
     }
 
     return isatty(fileno(stderr)) != 0;
+}
+
+static bool server_env_flag_enabled(const char * name, bool default_value = false) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "off") == 0) {
+        return false;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "on") == 0) {
+        return true;
+    }
+    return default_value;
+}
+
+static int32_t server_dsv4_adaptive_prefill_batch_size(
+        int32_t requested_batch,
+        int32_t tokens_done) {
+    if (!server_env_flag_enabled("LLAMA_FLASH_MOE_DSV4_ADAPTIVE_PREFILL", false)) {
+        return requested_batch;
+    }
+
+    const int32_t t0 = 16*1024;
+    const int32_t t1 = 40*1024;
+    const int32_t slab =
+            tokens_done < t0 ? 8192 :
+            tokens_done < t1 ? 4096 :
+            2048;
+    const int32_t next_boundary =
+            tokens_done < t0 ? t0 :
+            tokens_done < t1 ? t1 :
+            std::numeric_limits<int32_t>::max();
+    const int32_t to_boundary = std::max<int32_t>(1, next_boundary - tokens_done);
+
+    return std::max<int32_t>(1, std::min<int32_t>({ requested_batch, slab, to_boundary }));
+}
+
+static void server_dsv4_adaptive_prefill_progress(
+        int32_t  requested_batch,
+        int32_t  total_tokens,
+        int32_t  prompt_base_tokens,
+        int32_t  tokens_done_before_batch,
+        uint32_t & current_batch,
+        uint32_t & total_batches) {
+    if (!server_env_flag_enabled("LLAMA_FLASH_MOE_DSV4_ADAPTIVE_PREFILL", false)) {
+        return;
+    }
+
+    const int32_t prompt_tokens_remaining = std::max<int32_t>(0, total_tokens - prompt_base_tokens);
+    const int32_t tokens_done_clamped = std::min<int32_t>(
+            prompt_tokens_remaining,
+            std::max<int32_t>(0, tokens_done_before_batch));
+
+    auto next_chunk = [&](int32_t done) {
+        const int32_t absolute_done = prompt_base_tokens + done;
+        const int32_t remaining = std::max<int32_t>(0, prompt_tokens_remaining - done);
+        return std::max<int32_t>(
+                1,
+                std::min<int32_t>(
+                        remaining,
+                        server_dsv4_adaptive_prefill_batch_size(requested_batch, absolute_done)));
+    };
+
+    uint32_t computed_total = 0;
+    uint32_t computed_current = 1;
+    for (int32_t done = 0; done < prompt_tokens_remaining; ) {
+        const int32_t chunk = next_chunk(done);
+        computed_total++;
+        if (done < tokens_done_clamped) {
+            computed_current = computed_total + 1;
+        }
+        done += chunk;
+    }
+
+    total_batches = std::max<uint32_t>(1, computed_total);
+    current_batch = std::min<uint32_t>(total_batches, computed_current);
 }
 
 static std::string server_highlight_tps(double tps, int precision = 2) {
@@ -2355,14 +2433,17 @@ private:
         if (use_layer_major_prefill_batch) {
             for (const auto & slot : slots) {
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    n_batch = std::min<int32_t>(n_batch_ctx, params_base.moe_prefill_batch);
+                    const int32_t adaptive_prefill_batch = server_dsv4_adaptive_prefill_batch_size(
+                            params_base.moe_prefill_batch,
+                            std::max<int32_t>(0, slot.prompt.n_tokens()));
+                    n_batch = std::min<int32_t>(n_batch_ctx, adaptive_prefill_batch);
                     const int32_t configured_micro =
                             params_base.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO ?
                                     common_moe_prefill_micro_batch_auto_for_tokens(slot.task ? slot.task->n_tokens() : n_batch) :
                             params_base.moe_prefill_micro_batch > 0 ?
                                     params_base.moe_prefill_micro_batch :
                                     n_batch;
-                    n_ubatch = std::min<int32_t>(n_ubatch_ctx, configured_micro);
+                    n_ubatch = std::max<int32_t>(1, std::min<int32_t>(n_batch, configured_micro));
                     break;
                 }
             }
@@ -2999,12 +3080,24 @@ private:
                             progress_slot->prompt.n_tokens() - n_tokens);
                     const int32_t prompt_tokens_remaining = std::max<int32_t>(0, total_tokens - prompt_base_tokens);
                     const int32_t prompt_tokens_done_before_batch = std::max<int32_t>(0, prompt_tokens_before_batch - prompt_base_tokens);
-                    const uint32_t total_batches = uint32_t(std::max<int32_t>(1, (prompt_tokens_remaining + batch_size_progress - 1) / batch_size_progress));
-                    const uint32_t current_batch = std::min<uint32_t>(
+                    uint32_t total_batches = uint32_t(std::max<int32_t>(1, (prompt_tokens_remaining + batch_size_progress - 1) / batch_size_progress));
+                    uint32_t current_batch = std::min<uint32_t>(
                             total_batches,
                             uint32_t(prompt_tokens_done_before_batch / batch_size_progress + 1));
+                    server_dsv4_adaptive_prefill_progress(
+                            params_base.moe_prefill_batch,
+                            total_tokens,
+                            prompt_base_tokens,
+                            prompt_tokens_done_before_batch,
+                            current_batch,
+                            total_batches);
 
-                    llama_flash_moe_prefill_progress_set(ctx, current_batch, total_batches, uint32_t(total_tokens));
+                    llama_flash_moe_prefill_progress_set_ext(
+                            ctx,
+                            current_batch,
+                            total_batches,
+                            uint32_t(total_tokens),
+                            uint32_t(prompt_tokens_before_batch));
                 } else {
                     llama_flash_moe_prefill_progress_set(ctx, 0, 0, 0);
                 }

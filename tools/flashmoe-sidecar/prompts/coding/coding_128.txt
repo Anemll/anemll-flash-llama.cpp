@@ -1,0 +1,17 @@
+You are debugging a coding assistant backend. A streamed patch sometimes leaves search results stale after a websocket reconnect.
+
+Ticket:
+- tenant: tenant-01
+- workspace: 1001
+- request: q-90001
+- route: /api/workspaces/1001/apply
+
+Trace:
+1. request_store begins q-90001.
+2. ws_transport reports a duplicate ack.
+3. build_queue accepts the patch job.
+4. git_indexer skips refresh because an active lease is still present.
+5. editor diagnostics remain stale.
+
+Task:
+Identify the most likely race, name the files to inspect, and propose a concise fix plus one regression test.

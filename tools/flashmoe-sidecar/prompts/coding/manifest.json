@@ -5,9 +5,25 @@
   "notes": [
     "Prompt files are exact token prefixes under the selected tokenizer.",
     "The 22k sample uses 22528 tokens (22 * 1024).",
-    "Counts do not include any BOS or chat-template tokens that a runtime may inject separately."
+    "Counts do not include any BOS or chat-template tokens that a runtime may inject separately.",
+    "coding_6k/8k/10k/12k are exact MiniMax tokenizer prefixes derived by repeating training2.txt.",
+    "coding_128 and coding_256 are short DeepSeek V4 Flash smoke prompts for fast single-token and short-output divergence checks; their labels describe approximate DeepSeek-token scale, not MiniMax exact-prefix generation."
   ],
   "prompts": [
+    {
+      "label": "128",
+      "target_tokens": 128,
+      "actual_tokens": 140,
+      "bytes_utf8": 576,
+      "path": "prompts/coding/coding_128.txt"
+    },
+    {
+      "label": "256",
+      "target_tokens": 256,
+      "actual_tokens": 251,
+      "bytes_utf8": 1144,
+      "path": "prompts/coding/coding_256.txt"
+    },
     {
       "label": "1k",
       "target_tokens": 1024,
@@ -21,6 +37,34 @@
       "actual_tokens": 4096,
       "bytes_utf8": 17018,
       "path": "prompts/coding/coding_4k.txt"
+    },
+    {
+      "label": "6k",
+      "target_tokens": 6144,
+      "actual_tokens": 6144,
+      "bytes_utf8": 26957,
+      "path": "prompts/coding/coding_6k.txt"
+    },
+    {
+      "label": "8k",
+      "target_tokens": 8192,
+      "actual_tokens": 8192,
+      "bytes_utf8": 35912,
+      "path": "prompts/coding/coding_8k.txt"
+    },
+    {
+      "label": "10k",
+      "target_tokens": 10240,
+      "actual_tokens": 10240,
+      "bytes_utf8": 44930,
+      "path": "prompts/coding/coding_10k.txt"
+    },
+    {
+      "label": "12k",
+      "target_tokens": 12288,
+      "actual_tokens": 12288,
+      "bytes_utf8": 54001,
+      "path": "prompts/coding/coding_12k.txt"
     },
     {
       "label": "16k",

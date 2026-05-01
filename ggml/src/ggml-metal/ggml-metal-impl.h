@@ -26,6 +26,9 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
+#define N_R0_F8_E4M3_B128 2
+#define N_SG_F8_E4M3_B128 2
+
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
@@ -315,6 +318,111 @@ typedef struct {
     int32_t  sect_3;
     bool     src2;
 } ggml_metal_kargs_rope;
+
+typedef struct {
+    int32_t  n_hc;
+    int32_t  sinkhorn_iters;
+    float    eps;
+    int64_t  n_rows;
+    uint64_t mixes_nb1;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_dsv4_hc_split_sinkhorn;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  n_elem;
+    uint64_t x_nb0;
+    uint64_t x_nb1;
+    uint64_t x_nb2;
+    uint64_t w_nb0;
+    uint64_t w_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_dsv4_hc_weighted_sum;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  n_elem;
+    uint64_t block_nb0;
+    uint64_t block_nb1;
+    uint64_t res_nb0;
+    uint64_t res_nb1;
+    uint64_t res_nb2;
+    uint64_t post_nb0;
+    uint64_t post_nb1;
+    uint64_t comb_nb0;
+    uint64_t comb_nb1;
+    uint64_t comb_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_dsv4_hc_expand;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  n_nope;
+    int64_t  n_rows;
+    int64_t  n_blocks;
+    int64_t  ne1;
+    int64_t  ne2;
+    uint64_t src_nb0;
+    uint64_t src_nb1;
+    uint64_t src_nb2;
+    uint64_t src_nb3;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_dsv4_fp8_kv_quantize;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  n_rows;
+    int64_t  ne1;
+    int64_t  ne2;
+    uint64_t src_nb0;
+    uint64_t src_nb1;
+    uint64_t src_nb2;
+    uint64_t src_nb3;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_dsv4_hadamard_fp4_quantize;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  n_dims;
+    int32_t  n_nope;
+    int32_t  n_ctx_orig;
+    int32_t  inverse;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    bool     src2;
+} ggml_metal_kargs_dsv4_rope_tail;
 
 typedef struct {
     int32_t  ne11;

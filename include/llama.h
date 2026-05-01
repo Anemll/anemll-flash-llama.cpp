@@ -154,6 +154,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -1621,6 +1622,7 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
     LLAMA_API bool                           llama_flash_moe_progress_get(const struct llama_context * ctx, bool prefill, struct llama_flash_moe_progress_stats * out);
     LLAMA_API void                           llama_flash_moe_prefill_progress_set(struct llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens);
+    LLAMA_API void                           llama_flash_moe_prefill_progress_set_ext(struct llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens, uint32_t tokens_before_batch);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

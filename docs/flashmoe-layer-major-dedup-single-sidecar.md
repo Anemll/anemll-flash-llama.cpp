@@ -3,9 +3,9 @@
 This note describes the current `--moe-prefill-layer-major` path in this fork.
 
 It focuses on the SSD-streamed prompt-prefill MoE path used by routed MoE
-layers (MiniMax-M2, GLM-5.1, Kimi K2.5, Qwen 3.5, Gemma4) when the full routed
-expert weights do not fit in memory and have to be loaded on demand from the
-Flash-MoE sidecar instead of staying resident:
+layers (MiniMax-M2, GLM-5.1, Kimi K2.5, Qwen 3.5, Gemma4, DeepSeek V4) when
+the full routed expert weights do not fit in memory and have to be loaded on
+demand from the Flash-MoE sidecar instead of staying resident:
 
 - `src/llama-context.cpp`
 - `common/arg.cpp`
@@ -33,6 +33,14 @@ Flash-MoE sidecar instead of staying resident:
 - [Decode Read Locality (`--moe-sort-decode-expert-ids`)](#decode-read-locality---moe-sort-decode-expert-ids)
 - [GLM-5.1 Default Test](#glm-51-default-test)
 - [Additional Model Smoke Tests](#additional-model-smoke-tests) (Kimi K2.5, Qwen 3.5, Gemma4)
+- [DeepSeek V4 and DeepSeek V4 Flash](#deepseek-v4-native-hf-export-and-inference)
+- [DeepSeek V4 / Flash Variants](#supported-deepseek-v4-variants)
+- [DeepSeek V4 / Flash Conversion](#convert-original-hf-weights)
+- [DeepSeek V4 / Flash Quantization Preservation](#quantization-preservation)
+- [DeepSeek V4 / Flash Inference Smoke Test](#simple-inference-smoke-test)
+- [DeepSeek V4 / Flash Decode Probe](#decode-performance-probe)
+- [DeepSeek V4 / Flash Top-K Prompt Sweep](#layer-major-prefill-and-top-k-sweep)
+- [DeepSeek V4 / Flash Server Mode](#deepseek-v4-server-mode)
 - [Server Mode](#server-mode)
 - [Largest Verified Safe Q8 Server Context](#largest-verified-safe-q8-server-context)
 - [Testing the Server with MiniMax-M2.7 and DroidAI (M5 Max 128)](#testing-the-server-with-minimax-m27-and-droidai-m5-max-128)
@@ -59,6 +67,7 @@ Tested with `--moe-prefill-layer-major` on M5 Max:
 - GLM-5.1 — `glm-dsa`
 - Qwen 3.5 35B-A3B — `qwen3moe`
 - Kimi K2.5 — `deepseek2`
+- DeepSeek V4 — `deepseek4` through the native HF-to-SSD exporter
 
 ## Example Results
 
@@ -685,6 +694,428 @@ bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
   -n 1024 -st
 ```
 
+## DeepSeek V4 Native HF Export and Inference
+
+DeepSeek V4 can be exported directly from the original Hugging Face
+checkpoint into the Flash-MoE SSD package layout:
+
+- dense GGUF: `dense/model-dense.gguf`
+- routed expert sidecar: `sidecar/manifest.json` plus layer bank files
+- local DS4 prompt encoder: `encoding/encoding_dsv4.py`
+
+This path does not require a native full-model GGUF input. It reads the
+original HF `safetensors` package and writes the dense model plus routed expert
+sidecar that the slot-bank runtime expects. Quantization is preserved as in the
+checkpoint: native **FP8** for the dense stack and native **FP4** for routed MoE
+experts, repacked into GGUF / sidecar formats **without requantization**.
+
+### Supported DeepSeek V4 Variants
+
+The native HF exporter supports both full DeepSeek V4 and DeepSeek V4 Flash.
+The exporter reads geometry from the HF tensors, so it can tolerate stale local
+`config.json` values as long as the tensor set is complete and internally
+consistent.
+
+| Variant | Expected tensor geometry | Native top-k | Example output |
+| --- | --- | --- | --- |
+| DeepSeek V4 | 61 layers, 384 routed experts, hidden size 7168 | 6 | `$HOME/Models/DeepSeek-V4-SSD` |
+| DeepSeek V4 Flash | 43 layers, 256 routed experts, hidden size 4096 | 6 | `$HOME/Models/DeepSeek-V4-Flash-SSD` |
+
+If a local DeepSeek V4 Flash checkout has an old full-model-looking config
+(`hidden_size=7168`, `num_hidden_layers=61`, `n_routed_experts=384`), refresh
+`config.json` from Hugging Face or rely on the exporter warning and
+tensor-derived overrides. The official Flash config is `4096 / 43 / 256`.
+
+### Convert Original HF Weights
+
+Example source and output paths:
+
+- source HF checkpoint: `$HOME/Models/DeepSeek-V4`
+- output Flash-MoE SSD package: `$HOME/Models/DeepSeek-V4-SSD`
+
+```bash
+python3 ./tools/flashmoe-sidecar/export_dsv4_hf_flashssd.py \
+  --hf "$HOME/Models/DeepSeek-V4" \
+  --out "$HOME/Models/DeepSeek-V4-SSD" \
+  --preserve-quant \
+  --experts fp4 \
+  --dense fp8 \
+  --allow-low-space
+```
+
+Use `--force` only when intentionally replacing an existing dense/sidecar
+export under the same output directory:
+
+```bash
+python3 ./tools/flashmoe-sidecar/export_dsv4_hf_flashssd.py \
+  --hf "$HOME/Models/DeepSeek-V4" \
+  --out "$HOME/Models/DeepSeek-V4-SSD" \
+  --preserve-quant \
+  --experts fp4 \
+  --dense fp8 \
+  --allow-low-space \
+  --force
+```
+
+For DeepSeek V4 Flash from original HF files:
+
+```bash
+python3 ./tools/flashmoe-sidecar/export_dsv4_hf_flashssd.py \
+  --hf "$HOME/Models/DeepSeek-V4-Flash" \
+  --out "$HOME/Models/DeepSeek-V4-Flash-SSD" \
+  --preserve-quant \
+  --experts fp4 \
+  --dense fp8 \
+  --allow-low-space
+```
+
+If a previous Flash export used stale geometry, re-export dense and refresh the
+manifest while reusing the large existing `sidecar/layer_*.bin` files:
+
+```bash
+python3 ./tools/flashmoe-sidecar/export_dsv4_hf_flashssd.py \
+  --hf "$HOME/Models/DeepSeek-V4-Flash" \
+  --out "$HOME/Models/DeepSeek-V4-Flash-SSD" \
+  --preserve-quant \
+  --experts fp4 \
+  --dense fp8 \
+  --skip-sidecar \
+  --allow-low-space \
+  --force
+```
+
+After export, the package should be self-contained for prompt formatting:
+
+```bash
+ls "$HOME/Models/DeepSeek-V4-SSD/encoding/encoding_dsv4.py"
+ls "$HOME/Models/DeepSeek-V4-Flash-SSD/encoding/encoding_dsv4.py"
+```
+
+### Quantization Preservation
+
+The exporter is intentionally a native-quantization preserving path, not a
+requantizer:
+
+- Dense FP8 tensors from HF use `F8_E4M3` weights plus UE8M0-style scale
+tensors. The exporter packs these into GGUF `F8_E4M3_B128`, preserving the
+original FP8 payload and per-128-element scale structure.
+- Routed experts are stored in HF as native FP4: `I8` packed weights plus
+`F8_E8M0` scales. The exporter packs them into sidecar `MXFP4` expert blocks
+with one scale byte plus 16 data bytes per 32 values.
+- Existing HF `BF16` and `F32` dense tensors remain `BF16` and `F32`.
+- `attn.wo_a.weight` is the current exception: HF stores it as FP8, but the
+DeepSeek V4 reference conversion materializes this low-rank output projection
+as `BF16`, and this exporter follows that layout for runtime compatibility.
+- MTP tensors are not exported into this dense+sidecar runtime package.
+
+The resulting package metadata records this as:
+
+- dense quantization: `native_fp8_e4m3_ue8m0`
+- expert quantization: `native_fp4_mxfp4`
+
+### Simple Inference Smoke Test
+
+Build the DS4 chat prompt from the exported package, not from the original HF
+checkout. Avoid naming the shell variable `PROMPT` in zsh because `PROMPT` is
+also the interactive prompt/PS1 variable.
+
+```bash
+DSV4_PACKAGE="$HOME/Models/DeepSeek-V4-SSD"
+# For DeepSeek V4 Flash:
+# DSV4_PACKAGE="$HOME/Models/DeepSeek-V4-Flash-SSD"
+
+DSV4_INPUT=$(PYTHONPATH="$DSV4_PACKAGE/encoding" python3 - <<'PY'
+from encoding_dsv4 import encode_messages
+
+print(encode_messages(
+    [{"role": "user", "content": "What is Apple Neural Engine?"}],
+    thinking_mode="chat",
+), end="")
+PY
+)
+```
+
+Small correctness smoke test:
+
+```bash
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SLOT_DECODE=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
+./build/bin/llama-cli \
+  -m "$DSV4_PACKAGE/dense/model-dense.gguf" \
+  --moe-mode slot-bank \
+  --moe-sidecar "$DSV4_PACKAGE/sidecar" \
+  --moe-slot-bank 16 \
+  --moe-topk 6 \
+  -ngl 999 \
+  --moe-cache-io-split 8 \
+  -c 1024 -b 32 -ub 1 \
+  --no-warmup \
+  --temp 0.0 \
+  --no-display-prompt \
+  --simple-io \
+  --moe-trace-harness \
+  -p "$DSV4_INPUT" \
+  -n 128 --perf -st \
+  --moe-prefetch-temporal
+```
+
+This checks output quality but is not a speed benchmark. `--moe-slot-bank 16`
+is too small for full DeepSeek V4 and will thrash the routed expert cache.
+
+### Decode Performance Probe
+
+For a decode-side performance probe on M5 Max, start with a larger slot bank,
+parallel sidecar reads, batched install reads, and top-k reduced to isolate the
+runtime bottleneck:
+
+```bash
+DSV4_PACKAGE="$HOME/Models/DeepSeek-V4-SSD"
+# For DeepSeek V4 Flash:
+# DSV4_PACKAGE="$HOME/Models/DeepSeek-V4-Flash-SSD"
+
+DSV4_INPUT=$(PYTHONPATH="$DSV4_PACKAGE/encoding" python3 - <<'PY'
+from encoding_dsv4 import encode_messages
+
+print(encode_messages(
+    [{"role": "user", "content": "What is Apple Neural Engine?"}],
+    thinking_mode="chat",
+), end="")
+PY
+)
+
+LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_BATCHED_INSTALL_READS=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SLOT_DECODE=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_REPLAY=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
+./build/bin/llama-cli \
+  -m "$DSV4_PACKAGE/dense/model-dense.gguf" \
+  --moe-mode slot-bank \
+  --moe-sidecar "$DSV4_PACKAGE/sidecar" \
+  --moe-slot-bank 36 \
+  --moe-topk 2 \
+  -ngl 999 \
+  --moe-cache-io-split 8 \
+  -c 1024 -b 32 -ub 1 \
+  --no-warmup \
+  --temp 0.0 \
+  --no-display-prompt \
+  --simple-io \
+  --moe-trace-harness \
+  -p "$DSV4_INPUT" \
+  -n 500 --perf -st \
+  --moe-prefetch-temporal \
+  --moe-predict-prev-token
+```
+
+What to watch in `--perf` output:
+
+- `gpu-bank = on (compiled=on, env-disable=off)`
+- `preads=on batchrd=on`
+- `slot-bank cached expert hit rate`
+- early-layer summaries such as `layer=0`, `layer=1`, `layer=2`
+- `Expert I/O source` versus dense time
+
+If `MTL0 free` is only a few GiB, do not increase `--moe-slot-bank` further.
+If `layer=0/1/2` hit rates remain low, the run is limited by the DeepSeek V4
+early-layer expert working set versus available slot-bank memory rather than
+by broad CPU graph fallback.
+
+### Layer-Major Prefill and Top-K Sweep
+
+Use `run_dsv4_flash_profile.sh` for a single layer-major prefill run. The
+wrapper is manifest-driven, so the same script works for full DeepSeek V4 and
+DeepSeek V4 Flash:
+
+```bash
+DISPLAY_PROMPT=0 \
+SIMPLE_IO=1 \
+RAW_COMPLETION=1 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=1 \
+CTX=90000 \
+SEED=123 \
+TEMP=0 \
+MOE_SLOT_BANK=32 \
+LLAMA_FLASH_MOE_PERF_PREFILL_INLINE_PROGRESS=1 \
+bash ./tools/flashmoe-sidecar/run_dsv4_flash_profile.sh \
+  "$HOME/Models/DeepSeek-V4-Flash-SSD" \
+  --temp 1.0 --top-p 1.0 \
+  -f ./tools/flashmoe-sidecar/prompts/coding/coding_4k.txt \
+  --moe-predict-top1-prev \
+  --moe-topk 4 \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch auto \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  -n 500 -st
+```
+
+For a small benchmark matrix across routed top-k and prompt size, use:
+
+```bash
+tools/flashmoe-sidecar/run_dsv4_topk_prompt_sweep.sh \
+  "$HOME/Models/DeepSeek-V4-Flash-SSD"
+```
+
+Defaults are:
+
+- `TOPKS="6 4 2"`
+- `PROMPT_LABELS="128 1k 4k"`
+- `MOE_SLOT_BANK=32`
+- `CTX=90000`
+- `N_PREDICT=500`
+
+Each variation writes a log and a row in
+`flashmoe-results/dsv4-topk-prompt-sweep/<timestamp>/summary.csv`. The script
+also prints a final table containing prefill t/s and decode t/s for every
+top-k / prompt combination.
+
+#### M5 Max sweep summaries (`run_dsv4_topk_prompt_sweep.sh`)
+
+Same script and default matrix (`TOPKS="6 4 2"`, `PROMPT_LABELS="128 1k 4k"`,
+`MOE_SLOT_BANK=32`, `N_PREDICT=500` unless overridden). Layer-major prefill
+and sidecar dedup are on for these runs.
+
+**DeepSeek V4 Flash** — package: `$HOME/Models/DeepSeek-V4-Flash-SSD`
+
+| status | topk | prompt | prefill tok/s | decode tok/s | prefill tok | decode tok | prefill uniq | dedup % | decode hit % | decode GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ok | 6 | 128 | 25.5 | 5.5 | 140 | 499 | 5754 | 84.3 | 62.1 | 606.73 |
+| ok | 6 | 1k | 90.0 | 5.2 | 1089 | 499 | 9854 | 96.5 | 62.6 | 600.11 |
+| ok | 6 | 4k | 156.8 | 3.7 | 4335 | 499 | 10815 | 99.0 | 41.7 | 934.36 |
+| ok | 4 | 128 | 31.8 | 7.1 | 140 | 499 | 4503 | 81.6 | 65.5 | 368.83 |
+| ok | 4 | 1k | 98.2 | 7.5 | 1089 | 499 | 8868 | 95.3 | 67.4 | 348.28 |
+| ok | 4 | 4k | 179.5 | 4.8 | 4335 | 499 | 10538 | 98.6 | 43.1 | 608.20 |
+| ok | 2 | 128 | 46.9 | 10.8 | 140 | 499 | 2968 | 75.7 | 72.0 | 149.68 |
+| ok | 2 | 1k | 121.5 | 10.6 | 1089 | 499 | 6919 | 92.6 | 68.3 | 169.17 |
+| ok | 2 | 4k | 192.5 | 7.5 | 4335 | 499 | 10002 | 97.3 | 46.4 | 286.43 |
+
+**DeepSeek V4 (full)** — package: `$HOME/Models/DeepSeek-V4-SSD`
+
+| status | topk | prompt | prefill tok/s | decode tok/s | prefill tok | decode tok | prefill uniq | dedup % | decode hit % | decode GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ok | 6 | 128 | 4.5 | 1.3 | 140 | 499 | 10208 | 80.4 | 54.8 | 2698.19 |
+| ok | 6 | 1k | 16.7 | 1.2 | 1089 | 499 | 19471 | 95.1 | 48.3 | 3083.96 |
+| ok | 6 | 4k | 39.7 | 1.3 | 4335 | 499 | 21571 | 98.6 | 54.5 | 2716.36 |
+| ok | 4 | 128 | 6.1 | 2.3 | 140 | 499 | 7594 | 78.1 | 70.1 | 1189.71 |
+| ok | 4 | 1k | 19.5 | 1.9 | 1089 | 499 | 17105 | 93.6 | 59.8 | 1599.93 |
+| ok | 4 | 4k | 44.3 | 1.7 | 4335 | 499 | 20734 | 98.0 | 54.3 | 1817.58 |
+| ok | 2 | 128 | 9.5 | 3.1 | 140 | 499 | 4752 | 72.6 | 63.1 | 733.93 |
+| ok | 2 | 1k | 25.3 | 3.2 | 1089 | 499 | 12693 | 90.5 | 64.6 | 703.92 |
+| ok | 2 | 4k | 49.6 | 2.4 | 4335 | 499 | 18689 | 96.5 | 44.8 | 1097.61 |
+
+On this matrix, Flash runs about **4–6×** faster prefill tok/s and **3–4×**
+faster decode tok/s than full V4 at the same top-k and prompt class, with
+decode-phase expert traffic (`decode GiB`) often **~4× lower** for Flash. On
+both variants, prefill dedup % tightens toward **99%** on the 4k prompt; decode
+hit % peaks around **topk 4** for Flash and **topk 4** on the 128/1k prompts for
+full V4, while 4k decode hit % drops on both models as the working set grows
+versus `MOE_SLOT_BANK=32`.
+
+### DeepSeek V4 Server Mode
+
+`run_flashmoe_server.sh` can serve the native HF-to-SSD DeepSeek V4 packages
+through the OpenAI-compatible `/v1` API. For `deepseek4` packages, the server
+wrapper defaults to routed **top-k 4** unless `MOE_TOPK` is set explicitly.
+The model's native routing top-k is 6, but top-k 4 is the current practical
+server default on M5 Max because it reduces SSD traffic and improves decode
+cache residency. Use `MOE_TOPK=6` when you want native routing fidelity, and
+`MOE_TOPK=2` only for low-I/O diagnostics.
+
+Full DeepSeek V4 server, matching a client model id of `deepseek-v4-ssd` and a
+base URL of `http://127.0.0.1:8092/v1`:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8092 \
+MODEL_ALIAS=deepseek-v4-ssd \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=32 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=1 \
+CTX=90000 \
+SEED=123 \
+TEMP=0 \
+FLASHMOE_SERVER_PERF=1 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  "$HOME/Models/DeepSeek-V4-SSD" \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch auto \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  --jinja \
+  --chat-template-file "$PWD/models/templates/deepseek-ai-DeepSeek-V3.1.jinja"
+```
+
+For DeepSeek V4 Flash, use the Flash package and a distinct alias if it will
+run alongside the full model:
+
+```bash
+HOST=127.0.0.1 \
+PORT=8093 \
+MODEL_ALIAS=deepseek-v4-flash-ssd \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=32 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=1 \
+CTX=90000 \
+SEED=123 \
+TEMP=0 \
+FLASHMOE_SERVER_PERF=1 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  "$HOME/Models/DeepSeek-V4-Flash-SSD" \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch auto \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  --jinja \
+  --chat-template-file "$PWD/models/templates/deepseek-ai-DeepSeek-V3.1.jinja"
+```
+
+The `MODEL_ALIAS` string is what `/v1/models` advertises, and clients must send
+the same string in the JSON request's `model` field. For the full V4 command
+above, a generic chat-completions client should use:
+
+```json
+{
+  "model": "deepseek-v4-ssd",
+  "baseUrl": "http://127.0.0.1:8092/v1",
+  "apiKey": "not-needed",
+  "provider": "generic-chat-completion-api"
+}
+```
+
+Quick endpoint checks:
+
+```bash
+curl -s http://127.0.0.1:8092/v1/models | jq
+
+curl -s http://127.0.0.1:8092/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4-ssd",
+    "messages": [{"role": "user", "content": "What is Apple Neural Engine?"}],
+    "temperature": 0,
+    "max_tokens": 128
+  }' | jq
+```
+
+The `/v1/chat/completions` route needs a chat template because the server is
+formatting messages internally. The local `DeepSeek-V3.1` Jinja template uses
+the same DeepSeek special tokens and is the current closest built-in template.
+For exact DSv4 prompt parity with `encoding/encoding_dsv4.py`, add a dedicated
+DSv4 Jinja template or embed one in the exported GGUF.
+
 ## Server Mode
 
 `llama-server` on this branch can use the same dedicated
@@ -965,12 +1396,75 @@ Related knobs not set above but useful to know:
   flash-attn shape/path combination encountered. Use for verifying the Metal4
   path is actually being taken.
 
-### Adding the server to `~/.factory/settings.json`
+### Adding the server to `~/.factory/settings.json` or `config.json`
 
-Factory AI / DroidAI reads custom OpenAI-compatible models from
-`~/.factory/settings.json`. Add one `customModels` entry that points at the
-local server. The server and client must agree on two things: the `model`
-field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
+The **Droid CLI** stores BYOK custom models in **`~/.factory/settings.json`**
+(camelCase `customModels`); see [Factory: Settings](https://docs.factory.ai/cli/configuration/settings).
+Some **desktop** installs or older docs use **`~/.factory/config.json`**
+instead—edit whichever path your Factory / Droid build actually updates (both
+may exist; do not duplicate conflicting `customModels` across files without
+knowing how your version merges them). If the JSON shape differs from below,
+follow [Factory BYOK](https://docs.factory.ai/cli/byok/overview) for your file.
+
+Append a `customModels` object (in `settings.json` when using the CLI layout)
+for each local server. The server and client must agree on two things: the
+`model` field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
+
+**DeepSeek V4 (full, native HF → SSD package):** set
+`MODEL_ALIAS=deepseek-v4-ssd` on `run_flashmoe_server.sh` and use
+`"model": "deepseek-v4-ssd"` in Factory / Droid (same string, no spaces). If
+you omit `MODEL_ALIAS`, `/v1/models` will advertise the GGUF name
+`DeepSeek-V4-SSD` instead; you can use that as `"model"` instead, but the
+hyphenated alias avoids case/spacing surprises in clients.
+
+Example fragment—merge the new object into your **existing** `customModels`
+array (pick an unused `index` and a unique `id`):
+
+```json
+    {
+      "model": "deepseek-v4-ssd",
+      "id": "custom:DeepSeek-V4-(m5m-local)-0",
+      "index": 2,
+      "baseUrl": "http://127.0.0.1:8092/v1",
+      "apiKey": "not-needed",
+      "displayName": "DeepSeek V4 (m5m local)",
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    }
+```
+
+Use port **8092** only if that is where you run the DeepSeek server; it must
+match `PORT` on `llama-server`. MiniMax can stay on **8080**.
+
+Minimal second-server launch (loopback, layer-major prefill; tune `MOE_*` /
+`CTX` like your benchmarks):
+
+```bash
+HOST=127.0.0.1 \
+PORT=8092 \
+MODEL_ALIAS=deepseek-v4-ssd \
+MOE_TOPK=4 \
+MOE_SLOT_BANK=32 \
+MOE_CACHE_IO_SPLIT=8 \
+BATCH=2048 \
+UBATCH=1 \
+CTX=90000 \
+SEED=123 \
+TEMP=0 \
+FLASHMOE_SERVER_PERF=1 \
+bash ./tools/flashmoe-sidecar/run_flashmoe_server.sh \
+  "$HOME/Models/DeepSeek-V4-SSD" \
+  --moe-predict-top1-prev \
+  --moe-prefill-layer-major \
+  --moe-prefill-batch 8192 \
+  --moe-prefill-micro-batch auto \
+  --moe-prefill-io-split 8 \
+  --moe-prefill-banks 4 \
+  --jinja \
+  --chat-template-file "$PWD/models/templates/deepseek-ai-DeepSeek-V3.1.jinja"
+```
+
+Full-file shape (MiniMax + DeepSeek) for a fresh `customModels` block:
 
 ```json
 {
@@ -988,6 +1482,16 @@ field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
       "displayName": "MiniMax-M2.7 (m5m local)",
       "noImageSupport": true,
       "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "deepseek-v4-ssd",
+      "id": "custom:DeepSeek-V4-(m5m-local)-0",
+      "index": 2,
+      "baseUrl": "http://127.0.0.1:8092/v1",
+      "apiKey": "not-needed",
+      "displayName": "DeepSeek V4 (m5m local)",
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
     }
   ]
 }
@@ -995,27 +1499,28 @@ field must match `MODEL_ALIAS`, and `baseUrl` must match `HOST:PORT/v1`.
 
 Field-by-field:
 
-- `"model": "minimax-m2"` must equal `MODEL_ALIAS` on the server. If the
+- `"model": "minimax-m2"` must equal `MODEL_ALIAS` on the MiniMax server. If the
 alias changes, this string must change with it.
-- `"id": "custom:MiniMax-M2.7-(m5m-local)-0"` is the internal DroidAI handle.
-The `custom:` prefix plus a unique suffix per entry are the hard
-requirements. The `(m5m-local)` tag is a naming convention we use to mark
-this as the local M5 Max server and to distinguish it from a separate
-`(m3u-local)` entry on another host or from a hosted MiniMax endpoint.
-- `"index"` controls display order in the DroidAI model picker; pick any
-free integer.
-- `"baseUrl": "http://127.0.0.1:8080/v1"` points at the loopback server
-started above. For LAN access or a different port, match `HOST` and
-`PORT` exactly. Keep the trailing `/v1`.
+- `"model": "deepseek-v4-ssd"` must equal `MODEL_ALIAS=deepseek-v4-ssd` on the
+DeepSeek V4 SSD server (or match the unaliased GGUF id if you choose not to set
+`MODEL_ALIAS`).
+- `"id"` is the internal Droid handle: `custom:` prefix plus a unique suffix
+per entry (for example `custom:DeepSeek-V4-(m5m-local)-0`). The `(m5m-local)`
+tag is a naming convention for this machine versus `(m3u-local)` or hosted
+endpoints.
+- `"index"` controls display order in the Droid model picker; pick any unused
+integer per entry.
+- `"baseUrl"` must match the server (`http://127.0.0.1:8080/v1` for MiniMax in
+the example above, `http://127.0.0.1:8092/v1` for DeepSeek if `PORT=8092`).
+Keep the trailing `/v1`.
 - `"apiKey": "not-needed"` — the local server does not validate the key,
 but the field must be present for the provider plugin.
 - `"provider": "generic-chat-completion-api"` selects the OpenAI-compatible
 transport, which our `/v1/chat/completions` endpoint implements.
-- `"noImageSupport": true` is required: MiniMax-M2.7 is text-only.
+- `"noImageSupport": true` is required for these text-only local models.
 
-To register additional local servers (for example a second machine on the
-LAN), copy the object, bump `index`, give it a new unique `id` like
-`custom:MiniMax-M2.7-(m3u-local)-0`, and point `baseUrl` at that host.
+To register additional hosts, copy an object, bump `index`, give a new unique
+`id`, and point `baseUrl` at that host's `HOST:PORT`.
 
 ## Testing Flash-MoE with `@badlogicgames` pi-agent (badlogic)
 
@@ -1080,8 +1585,10 @@ Before opening DroidAI or `pi`, confirm the alias and endpoint are reachable:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/models | jq
+curl -s http://127.0.0.1:8092/v1/models | jq   # DeepSeek on 8092
 ```
 
-The response must include `"id": "minimax-m2"`. If it does not, the server
-`MODEL_ALIAS` and the DroidAI `model` field are out of sync and the client
-will fail to route requests.
+The response must include the model id you configured (`"id": "minimax-m2"` or
+`"id": "deepseek-v4-ssd"` when using the recommended alias). If it does not,
+the server `MODEL_ALIAS` and the Droid `model` field are out of sync and the
+client will fail to route requests.

@@ -11,6 +11,7 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_ubatch_prefill; // internal layer-major prefill capacity; does not change the user decode ubatch
     uint32_t moe_prefill_batch;
     uint32_t moe_prefill_micro_batch;
     uint32_t n_expert_used;   // effective routed experts per token during inference
