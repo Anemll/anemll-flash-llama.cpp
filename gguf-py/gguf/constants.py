@@ -485,6 +485,7 @@ class MODEL_ARCH(IntEnum):
     LLAMA_EMBED      = auto()
     MAINCODER        = auto()
     KIMI_LINEAR      = auto()
+    DEEPSEEK4        = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -806,6 +807,27 @@ class MODEL_TENSOR(IntEnum):
     A_ENC_CONV_NORM        = auto() # SSM conv
     A_ENC_CONV_PW1         = auto()
     A_ENC_CONV_PW2         = auto()
+    OUTPUT_HC_BASE         = auto()
+    OUTPUT_HC_FN           = auto()
+    OUTPUT_HC_SCALE        = auto()
+    ATTN_KV                = auto()
+    ATTN_OUT_A             = auto()
+    ATTN_OUT_B             = auto()
+    ATTN_COMPRESSOR_APE    = auto()
+    ATTN_COMPRESSOR_KV     = auto()
+    ATTN_COMPRESSOR_GATE   = auto()
+    ATTN_COMPRESSOR_NORM   = auto()
+    INDEXER_COMPRESSOR_APE = auto()
+    INDEXER_COMPRESSOR_KV  = auto()
+    INDEXER_COMPRESSOR_GATE = auto()
+    INDEXER_COMPRESSOR_NORM = auto()
+    HC_ATTN_BASE           = auto()
+    HC_ATTN_FN             = auto()
+    HC_ATTN_SCALE          = auto()
+    HC_FFN_BASE            = auto()
+    HC_FFN_FN              = auto()
+    HC_FFN_SCALE           = auto()
+    FFN_GATE_TID2EID       = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -878,6 +900,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.ARCTIC:           "arctic",
     MODEL_ARCH.DEEPSEEK:         "deepseek",
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -951,6 +974,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.POS_EMBD:                  "position_embd",
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
+    MODEL_TENSOR.OUTPUT_HC_BASE:            "output_hc_base",
+    MODEL_TENSOR.OUTPUT_HC_FN:              "output_hc_fn",
+    MODEL_TENSOR.OUTPUT_HC_SCALE:           "output_hc_scale",
     MODEL_TENSOR.DENSE_2_OUT:                "dense_2", # embeddinggemma 2_Dense
     MODEL_TENSOR.DENSE_3_OUT:                "dense_3", # embeddinggemma 2_Dense
     MODEL_TENSOR.ROPE_FREQS:                "rope_freqs",
@@ -991,6 +1017,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
+    MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
@@ -1069,8 +1096,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.CHANNEL_MIX_VALUE:         "blk.{bid}.channel_mix_value",
     MODEL_TENSOR.ATTN_Q_A:                  "blk.{bid}.attn_q_a",
     MODEL_TENSOR.ATTN_Q_B:                  "blk.{bid}.attn_q_b",
+    MODEL_TENSOR.ATTN_KV:                   "blk.{bid}.attn_kv",
     MODEL_TENSOR.ATTN_KV_A_MQA:             "blk.{bid}.attn_kv_a_mqa",
     MODEL_TENSOR.ATTN_KV_B:                 "blk.{bid}.attn_kv_b",
+    MODEL_TENSOR.ATTN_OUT_A:                "blk.{bid}.attn_wo_a",
+    MODEL_TENSOR.ATTN_OUT_B:                "blk.{bid}.attn_wo_b",
+    MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
+    MODEL_TENSOR.ATTN_COMPRESSOR_KV:        "blk.{bid}.attn_compressor_kv",
+    MODEL_TENSOR.ATTN_COMPRESSOR_GATE:      "blk.{bid}.attn_compressor_gate",
+    MODEL_TENSOR.ATTN_COMPRESSOR_NORM:      "blk.{bid}.attn_compressor_norm",
     MODEL_TENSOR.ATTN_K_B:                  "blk.{bid}.attn_k_b",
     MODEL_TENSOR.ATTN_V_B:                  "blk.{bid}.attn_v_b",
     MODEL_TENSOR.ATTN_Q_A_NORM:             "blk.{bid}.attn_q_a_norm",
@@ -1136,6 +1170,16 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_APE:    "blk.{bid}.indexer_compressor_ape",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_KV:     "blk.{bid}.indexer_compressor_kv",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_GATE:   "blk.{bid}.indexer_compressor_gate",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_NORM:   "blk.{bid}.indexer_compressor_norm",
+    MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_MMPROJ_FC:               "mm.model.fc",
@@ -2629,6 +2673,49 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_HC_BASE,
+        MODEL_TENSOR.OUTPUT_HC_FN,
+        MODEL_TENSOR.OUTPUT_HC_SCALE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV,
+        MODEL_TENSOR.ATTN_OUT_A,
+        MODEL_TENSOR.ATTN_OUT_B,
+        MODEL_TENSOR.ATTN_COMPRESSOR_APE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_KV,
+        MODEL_TENSOR.ATTN_COMPRESSOR_GATE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_TID2EID,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_APE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_KV,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_GATE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_NORM,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_SCALE,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

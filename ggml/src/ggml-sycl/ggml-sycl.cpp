@@ -4907,6 +4907,13 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+        case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
+        case GGML_OP_DSV4_ROPE_TAIL:
+            return false;
         default:
             return false;
     }

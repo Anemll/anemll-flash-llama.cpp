@@ -2512,6 +2512,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             }
         case GGML_OP_SSM_CONV:
             return true;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+        case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
+        case GGML_OP_DSV4_ROPE_TAIL:
+            return false;
         default:
             return false;
     }

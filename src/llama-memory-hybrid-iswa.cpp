@@ -204,7 +204,11 @@ static void dsv4_zero_cache_rows(ggml_tensor * t, llama_seq_id seq_id, uint32_t 
     const size_t n_bytes  = (size_t) n_rows*row_size;
     const size_t offset   = dsv4_cache_offset(t, seq_id, row_start);
 
-    std::vector<uint8_t> zeros(n_bytes, 0);
+    thread_local std::vector<uint8_t> zeros;
+    if (zeros.size() < n_bytes) {
+        zeros.resize(n_bytes);
+    }
+    std::fill(zeros.begin(), zeros.begin() + n_bytes, 0);
     ggml_backend_tensor_set(t, zeros.data(), offset, n_bytes);
 }
 
@@ -218,7 +222,10 @@ static void dsv4_copy_cache_rows(ggml_tensor * t, llama_seq_id seq_id_src, llama
     const size_t src_offset = dsv4_cache_offset(t, seq_id_src, row_start);
     const size_t dst_offset = dsv4_cache_offset(t, seq_id_dst, row_start);
 
-    std::vector<uint8_t> tmp(n_bytes);
+    thread_local std::vector<uint8_t> tmp;
+    if (tmp.size() < n_bytes) {
+        tmp.resize(n_bytes);
+    }
     ggml_backend_tensor_get(t, tmp.data(), src_offset, n_bytes);
     ggml_backend_tensor_set(t, tmp.data(), dst_offset, n_bytes);
 }

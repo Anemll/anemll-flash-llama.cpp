@@ -777,9 +777,12 @@ void llama_model::load_arch(llama_model_loader & ml) {
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
+    const bool has_dsv4_kv =
+            ml.get_tensor_meta("blk.0.attn_kv.weight") != nullptr ||
+            ml.get_tensor_meta("blk.0.attn.wkv.weight") != nullptr;
     if (arch == LLM_ARCH_DEEPSEEK2 &&
             ml.get_tensor_meta("hc_head_base") != nullptr &&
-            ml.get_tensor_meta("blk.0.attn.wkv.weight") != nullptr) {
+            has_dsv4_kv) {
         arch = LLM_ARCH_DEEPSEEK4;
         LLAMA_LOG_WARN("%s: DeepSeek V4 Flash tensors detected in GGUF tagged as deepseek2; using deepseek4 loader\n", __func__);
     }
@@ -2148,8 +2151,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.n_lora_o = 1024;
                 }
 
-                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE ||
-                    hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX) {
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
                     hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS;
                 }
 

@@ -428,6 +428,7 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_RESERVED_41 = 41,
         GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
         GGML_TYPE_COUNT   = 43,
     };
@@ -561,12 +562,6 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
-        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
-        GGML_OP_DSV4_HC_WEIGHTED_SUM,
-        GGML_OP_DSV4_HC_EXPAND,
-        GGML_OP_DSV4_FP8_KV_QUANTIZE,
-        GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE,
-        GGML_OP_DSV4_ROPE_TAIL,
 
         GGML_OP_UNARY,
 
@@ -584,6 +579,12 @@ extern "C" {
         GGML_OP_MUL_MAT_F16,
         GGML_OP_FLASHMOE_SPLIT_GLU,
         GGML_OP_GLU,
+        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
+        GGML_OP_DSV4_HC_WEIGHTED_SUM,
+        GGML_OP_DSV4_HC_EXPAND,
+        GGML_OP_DSV4_FP8_KV_QUANTIZE,
+        GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE,
+        GGML_OP_DSV4_ROPE_TAIL,
 
         GGML_OP_COUNT,
     };

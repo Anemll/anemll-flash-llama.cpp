@@ -3955,6 +3955,7 @@ template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_3")]]  kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_mxfp4,  32, dequantize_mxfp4_t4>;
 template [[host_name("kernel_mul_mv_ext_mxfp4_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_mxfp4,  32, dequantize_mxfp4_t4>;
 
+// The dispatcher divides epb by four for t4 dequantizers, so B128 is consumed as 32 float4 lanes.
 template [[host_name("kernel_mul_mv_ext_f8_e4m3_b128_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_f8_e4m3_b128, 128, dequantize_f8_e4m3_b128_t4>;
 template [[host_name("kernel_mul_mv_ext_f8_e4m3_b128_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_f8_e4m3_b128, 128, dequantize_f8_e4m3_b128_t4>;
 template [[host_name("kernel_mul_mv_ext_f8_e4m3_b128_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_f8_e4m3_b128, 128, dequantize_f8_e4m3_b128_t4>;

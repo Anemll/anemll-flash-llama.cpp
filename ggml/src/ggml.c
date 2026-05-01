@@ -726,6 +726,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_RESERVED_41] = {
+        .type_name                = "reserved",
+        .blck_size                = 1,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
     [GGML_TYPE_F8_E4M3_B128] = {
         .type_name                = "f8_e4m3_b128",
         .blck_size                = QK_F8_E4M3_B128,
@@ -1048,12 +1054,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
-    "DSV4_HC_SPLIT_SINKHORN",
-    "DSV4_HC_WEIGHTED_SUM",
-    "DSV4_HC_EXPAND",
-    "DSV4_FP8_KV_QUANTIZE",
-    "DSV4_HADAMARD_FP4_QUANTIZE",
-    "DSV4_ROPE_TAIL",
 
     "UNARY",
 
@@ -1071,6 +1071,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_F16",
     "FLASHMOE_SPLIT_GLU",
     "GLU",
+    "DSV4_HC_SPLIT_SINKHORN",
+    "DSV4_HC_WEIGHTED_SUM",
+    "DSV4_HC_EXPAND",
+    "DSV4_FP8_KV_QUANTIZE",
+    "DSV4_HADAMARD_FP4_QUANTIZE",
+    "DSV4_ROPE_TAIL",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
@@ -1166,12 +1172,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
-    "dsv4_hc_split_sinkhorn(x)",
-    "dsv4_hc_weighted_sum(x)",
-    "dsv4_hc_expand(x)",
-    "dsv4_fp8_kv_quantize(x)",
-    "dsv4_hadamard_fp4_quantize(x)",
-    "dsv4_rope_tail(x)",
 
     "unary(x)",
 
@@ -1189,6 +1189,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mul_mat_f16(x,y)",
     "flashmoe_split_glu(g,u,x)",
     "glu(x)",
+    "dsv4_hc_split_sinkhorn(x)",
+    "dsv4_hc_weighted_sum(x)",
+    "dsv4_hc_expand(x)",
+    "dsv4_fp8_kv_quantize(x)",
+    "dsv4_hadamard_fp4_quantize(x)",
+    "dsv4_rope_tail(x)",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");

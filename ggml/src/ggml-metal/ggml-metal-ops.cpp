@@ -6474,6 +6474,10 @@ int ggml_metal_op_dsv4_rope_tail(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+    GGML_ASSERT(op->type == op->src[0]->type);
+    GGML_ASSERT(nb00 == ggml_type_size(op->src[0]->type));
+    GGML_ASSERT(nb0  == ggml_type_size(op->type));
     GGML_ASSERT(ne10 >= ne02);
 
     const int n_dims     = ((const int32_t *) op->op_params)[0];
