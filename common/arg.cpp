@@ -427,6 +427,33 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+static int parse_nonnegative_k_value(const std::string & value) {
+    if (value.empty()) {
+        throw std::invalid_argument("invalid value");
+    }
+
+    std::string digits = value;
+    int multiplier = 1;
+    const char last = value.back();
+    if (last == 'k' || last == 'K') {
+        multiplier = 1024;
+        digits.pop_back();
+    }
+
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](char ch) {
+        return ch >= '0' && ch <= '9';
+    })) {
+        throw std::invalid_argument("invalid value");
+    }
+
+    const long long parsed = std::stoll(digits);
+    if (parsed > INT_MAX / multiplier) {
+        throw std::invalid_argument("value out of range");
+    }
+
+    return (int) parsed * multiplier;
+}
+
 //
 // CLI argument parsing functions
 //
@@ -1271,14 +1298,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"--moe-prefill-batch"}, "N",
-        "prefill-only logical batch size for --moe-prefill-layer-major (0 = default 8192)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        "prefill-only logical batch size for --moe-prefill-layer-major (0 = default 8192, suffix K/k = *1024)",
+        [](common_params & params, const std::string & value) {
+            const int parsed = parse_nonnegative_k_value(value);
+            if (parsed < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_prefill_batch = value;
+            params.moe_prefill_batch = parsed;
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_BATCH"));
+    add_opt(common_arg(
+        {"--force-moe-prefill-batch"},
+        {"--no-force-moe-prefill-batch"},
+        string_format("accept architecture-specific large public --moe-prefill-batch values; DeepSeek V4 may still split internally, while explicit true-slab envs control experimental internal slab sizing (values above the validated cap require LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1) (default: %s)", params.moe_force_prefill_batch ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_force_prefill_batch = value;
+        }
+    ).set_env("LLAMA_ARG_FORCE_MOE_PREFILL_BATCH"));
     add_opt(common_arg(
         {"--moe-prefill-micro-batch"}, "N|auto",
         "prefill-only expert compute micro-batch for --moe-prefill-layer-major (0 = follow prefill batch, auto = adapt by prompt length)",

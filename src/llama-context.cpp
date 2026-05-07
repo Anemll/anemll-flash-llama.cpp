@@ -330,7 +330,71 @@ static bool flash_moe_prefill_profile_m5_chunks_enabled() {
     return enabled == 1;
 }
 
-static bool llama_moe_deepseek4_allow_unsafe_prefill_batch() {
+static bool llama_moe_deepseek4_allow_true_prefill_slab() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled =
+                flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB", false) ||
+                flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB", false) ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
+static constexpr uint32_t LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX = 32u*1024u;
+
+static bool llama_moe_deepseek4_allow_broken_true_prefill_slab() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB", false) ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
+static uint32_t llama_moe_deepseek4_true_prefill_slab_max_requested() {
+    static uint32_t value = 0;
+    static bool initialized = false;
+    if (!initialized) {
+        // A single 64K DeepSeek4 prefill graph exceeds Metal command-buffer
+        // memory on M5 Max. Keep the experimental true-slab path at the largest
+        // validated graph size by default. Values above that cap, including 0
+        // for "uncapped", require the explicit BROKEN env.
+        value = LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX;
+
+        const char * env = std::getenv("LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX");
+        if (env != nullptr && env[0] != '\0') {
+            char * end = nullptr;
+            unsigned long parsed = std::strtoul(env, &end, 10);
+            if (end != env) {
+                if ((*end == 'k' || *end == 'K') && end[1] == '\0') {
+                    parsed *= 1024ul;
+                }
+                if ((*end == '\0' || ((*end == 'k' || *end == 'K') && end[1] == '\0')) &&
+                    parsed <= std::numeric_limits<uint32_t>::max()) {
+                    value = (uint32_t) parsed;
+                }
+            }
+        }
+
+        initialized = true;
+    }
+
+    return value;
+}
+
+static uint32_t llama_moe_deepseek4_true_prefill_slab_max() {
+    const uint32_t requested = llama_moe_deepseek4_true_prefill_slab_max_requested();
+
+    if ((requested == 0 || requested > LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX) &&
+        !llama_moe_deepseek4_allow_broken_true_prefill_slab()) {
+        return LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX;
+    }
+
+    return requested;
+}
+
+static bool llama_moe_deepseek4_legacy_unsafe_prefill_requested() {
     static int enabled = -1;
     if (enabled == -1) {
         enabled =
@@ -374,6 +438,10 @@ static void flash_moe_debug_log_break_progress_line_if_needed() {
 
 static void flash_moe_prefill_inline_progress_mark_line_open() {
     g_flash_moe_prefill_inline_progress_line_open.store(1);
+}
+
+static void flash_moe_prefill_inline_progress_mark_line_closed() {
+    g_flash_moe_prefill_inline_progress_line_open.store(0);
 }
 
 static void flash_moe_prefill_inline_progress_close_line_if_needed() {
@@ -2063,11 +2131,20 @@ private:
         const int64_t token_last  = std::max<int64_t>(token_first, prefill_inline_tokens_before_batch + prefill_inline_tokens);
         char sub_batch_label[32] = "";
         if (sub_batch_total > 1) {
-            std::snprintf(sub_batch_label, sizeof(sub_batch_label), ".%u/%u", sub_batch_index, sub_batch_total);
+            std::snprintf(sub_batch_label, sizeof(sub_batch_label), ", internal split %u/%u", sub_batch_index, sub_batch_total);
         }
+        const bool split_progress = sub_batch_total > 1;
+        const bool progress_done = prefill_inline_layers_done >= prefill_inline_total_layers;
+        const bool interactive_progress = isatty(fileno(stderr));
+        if (split_progress && !progress_done && !interactive_progress) {
+            return;
+        }
+        const bool redraw_progress = !split_progress || !progress_done || interactive_progress;
+        const bool close_progress_line = split_progress && progress_done;
 
         std::fprintf(stderr,
-                "\r\033[KFlash-MoE prefill layer-major progress: batch %u/%u%s, tok %" PRId64 "-%" PRId64 "/%" PRId64 " (chunk %" PRId64 "), micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)",
+                "%sFlash-MoE prefill layer-major progress: public batch %u/%u%s, tok %" PRId64 "-%" PRId64 "/%" PRId64 " (chunk %" PRId64 "), micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)%s",
+                redraw_progress ? "\r\033[K" : "",
                 batch_index,
                 batch_total,
                 sub_batch_label,
@@ -2082,12 +2159,19 @@ private:
                 progress_pct,
                 tps_color,
                 est_tps,
-                tps_reset);
+                tps_reset,
+                close_progress_line ? "\n" : "");
         std::fflush(stderr);
-        flash_moe_prefill_inline_progress_mark_line_open();
+        if (close_progress_line) {
+            flash_moe_prefill_inline_progress_mark_line_closed();
+        } else {
+            flash_moe_prefill_inline_progress_mark_line_open();
+        }
 
-        if (prefill_inline_layers_done >= prefill_inline_total_layers) {
-            flash_moe_prefill_inline_progress_close_line_if_needed();
+        if (progress_done) {
+            if (!close_progress_line) {
+                flash_moe_prefill_inline_progress_close_line_if_needed();
+            }
             prefill_inline_progress_active = false;
             prefill_inline_total_layers = 0;
             prefill_inline_layers_done = 0;
@@ -7703,11 +7787,20 @@ private:
         const int64_t token_last  = std::max<int64_t>(token_first, prefill_inline_tokens_before_batch + prefill_inline_tokens);
         char sub_batch_label[32] = "";
         if (sub_batch_total > 1) {
-            std::snprintf(sub_batch_label, sizeof(sub_batch_label), ".%u/%u", sub_batch_index, sub_batch_total);
+            std::snprintf(sub_batch_label, sizeof(sub_batch_label), ", internal split %u/%u", sub_batch_index, sub_batch_total);
         }
+        const bool split_progress = sub_batch_total > 1;
+        const bool progress_done = prefill_inline_layers_done >= prefill_inline_total_layers;
+        const bool interactive_progress = isatty(fileno(stderr));
+        if (split_progress && !progress_done && !interactive_progress) {
+            return;
+        }
+        const bool redraw_progress = !split_progress || !progress_done || interactive_progress;
+        const bool close_progress_line = split_progress && progress_done;
 
         std::fprintf(stderr,
-                "\r\033[KFlash-MoE prefill layer-major progress: batch %u/%u%s, tok %" PRId64 "-%" PRId64 "/%" PRId64 " (chunk %" PRId64 "), micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)",
+                "%sFlash-MoE prefill layer-major progress: public batch %u/%u%s, tok %" PRId64 "-%" PRId64 "/%" PRId64 " (chunk %" PRId64 "), micro=%" PRId64 "%s, %d/%d layers (%.1f%%, ~%s%.0f%s tps)%s",
+                redraw_progress ? "\r\033[K" : "",
                 batch_index,
                 batch_total,
                 sub_batch_label,
@@ -7722,12 +7815,19 @@ private:
                 progress_pct,
                 tps_color,
                 est_tps,
-                tps_reset);
+                tps_reset,
+                close_progress_line ? "\n" : "");
         std::fflush(stderr);
-        flash_moe_prefill_inline_progress_mark_line_open();
+        if (close_progress_line) {
+            flash_moe_prefill_inline_progress_mark_line_closed();
+        } else {
+            flash_moe_prefill_inline_progress_mark_line_open();
+        }
 
-        if (prefill_inline_layers_done >= prefill_inline_total_layers) {
-            flash_moe_prefill_inline_progress_close_line_if_needed();
+        if (progress_done) {
+            if (!close_progress_line) {
+                flash_moe_prefill_inline_progress_close_line_if_needed();
+            }
             print_prefill_inline_chunk_stats(batch_index, batch_total, total_tokens, elapsed_s, est_tps);
             std::fflush(stderr);
             prefill_inline_progress_reset();
@@ -10107,6 +10207,7 @@ llama_context::llama_context(
 
     cparams.moe_prefill_batch = params.moe_prefill_batch;
     cparams.moe_prefill_micro_batch = params.moe_prefill_micro_batch;
+    cparams.moe_force_prefill_batch = params.moe_force_prefill_batch;
     if (!model.flash_moe_prefill_layer_major_enabled()) {
         cparams.moe_prefill_batch = 0;
         cparams.moe_prefill_micro_batch = 0;
@@ -10118,16 +10219,83 @@ llama_context::llama_context(
                 model.arch == LLM_ARCH_DEEPSEEK4 ?
                         llama_moe_deepseek4_safe_prefill_batch_for_ctx(cparams.n_ctx) :
                         LLAMA_MOE_DEEPSEEK4_PREFILL_BATCH_SAFE_MAX;
+        const bool dsv4_true_prefill_slab =
+                model.arch == LLM_ARCH_DEEPSEEK4 &&
+                llama_moe_deepseek4_allow_true_prefill_slab();
+        const bool dsv4_broken_true_prefill_slab =
+                model.arch == LLM_ARCH_DEEPSEEK4 &&
+                llama_moe_deepseek4_allow_broken_true_prefill_slab();
+        const uint32_t dsv4_true_prefill_slab_max_requested =
+                dsv4_true_prefill_slab ?
+                        llama_moe_deepseek4_true_prefill_slab_max_requested() :
+                        0;
+        const uint32_t dsv4_true_prefill_slab_max =
+                dsv4_true_prefill_slab ?
+                        llama_moe_deepseek4_true_prefill_slab_max() :
+                        0;
+        const bool dsv4_legacy_unsafe_prefill_requested =
+                model.arch == LLM_ARCH_DEEPSEEK4 &&
+                llama_moe_deepseek4_legacy_unsafe_prefill_requested();
         if (model.arch == LLM_ARCH_DEEPSEEK4 &&
             cparams.moe_prefill_batch > dsv4_safe_prefill_batch &&
-            !llama_moe_deepseek4_allow_unsafe_prefill_batch() &&
+            !cparams.moe_force_prefill_batch &&
+            !dsv4_true_prefill_slab &&
             !llama_moe_deepseek4_adaptive_prefill_enabled()) {
             std::fprintf(stderr,
-                    "warning: %s: clamping DeepSeek V4 Flash --moe-prefill-batch from %u to %u for ctx=%u; larger slabs currently diverge or page-fault on layer-major prefill. Set LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH=1 to override for debugging\n",
+                    "warning: %s: clamping DeepSeek V4 Flash --moe-prefill-batch from %u to %u for ctx=%u; pass --force-moe-prefill-batch to accept the larger public batch while keeping DeepSeek4 compressed-KV internal splits safe\n",
                     __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
-            LLAMA_LOG_WARN("%s: clamping DeepSeek V4 Flash --moe-prefill-batch from %u to %u for ctx=%u; larger slabs currently diverge or page-fault on layer-major prefill. Set LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH=1 to override for debugging\n",
+            LLAMA_LOG_WARN("%s: clamping DeepSeek V4 Flash --moe-prefill-batch from %u to %u for ctx=%u; pass --force-moe-prefill-batch to accept the larger public batch while keeping DeepSeek4 compressed-KV internal splits safe\n",
                     __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
             cparams.moe_prefill_batch = dsv4_safe_prefill_batch;
+        } else if (model.arch == LLM_ARCH_DEEPSEEK4 &&
+                   cparams.moe_prefill_batch > dsv4_safe_prefill_batch &&
+                   cparams.moe_force_prefill_batch) {
+            if (dsv4_true_prefill_slab) {
+                if (!dsv4_broken_true_prefill_slab &&
+                    dsv4_true_prefill_slab_max_requested == 0) {
+                    std::fprintf(stderr,
+                            "warning: %s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX=0 keeps the validated internal slab cap at %u (set LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1 to allow uncapped slabs)\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx, LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX);
+                    LLAMA_LOG_WARN("%s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX=0 keeps the validated internal slab cap at %u (set LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1 to allow uncapped slabs)\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx, LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX);
+                } else if (!dsv4_broken_true_prefill_slab &&
+                           dsv4_true_prefill_slab_max_requested > LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX) {
+                    std::fprintf(stderr,
+                            "warning: %s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; requested true internal slab %u is capped at validated max %u (set LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1 to allow larger slabs)\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx,
+                            dsv4_true_prefill_slab_max_requested, LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX);
+                    LLAMA_LOG_WARN("%s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; requested true internal slab %u is capped at validated max %u (set LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1 to allow larger slabs)\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx,
+                            dsv4_true_prefill_slab_max_requested, LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX);
+                } else if (dsv4_true_prefill_slab_max == 0) {
+                    std::fprintf(stderr,
+                            "warning: %s: accepting experimental DeepSeek V4 true --moe-prefill-batch=%u above public safety limit %u for ctx=%u; LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX=0 leaves internal slabs uncapped\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
+                    LLAMA_LOG_WARN("%s: accepting experimental DeepSeek V4 true --moe-prefill-batch=%u above public safety limit %u for ctx=%u; LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX=0 leaves internal slabs uncapped\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
+                } else if (dsv4_true_prefill_slab_max > 0 &&
+                           cparams.moe_prefill_batch > dsv4_true_prefill_slab_max) {
+                    std::fprintf(stderr,
+                            "warning: %s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; true internal Metal graph slabs are capped at %u to avoid 64K command-buffer OOM\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx, dsv4_true_prefill_slab_max);
+                    LLAMA_LOG_WARN("%s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; true internal Metal graph slabs are capped at %u to avoid 64K command-buffer OOM\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx, dsv4_true_prefill_slab_max);
+                } else {
+                    std::fprintf(stderr,
+                            "warning: %s: accepting experimental DeepSeek V4 true --moe-prefill-batch=%u internal slab above public safety limit %u for ctx=%u\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
+                    LLAMA_LOG_WARN("%s: accepting experimental DeepSeek V4 true --moe-prefill-batch=%u internal slab above public safety limit %u for ctx=%u\n",
+                            __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx);
+                }
+            } else {
+                std::fprintf(stderr,
+                        "warning: %s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; internal slabs stay capped for correctness%s\n",
+                        __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx,
+                        dsv4_legacy_unsafe_prefill_requested ? " (legacy UNSAFE env ignored for true slabs; use LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB=1)" : "");
+                LLAMA_LOG_WARN("%s: accepting DeepSeek V4 --moe-prefill-batch=%u above public safety limit %u for ctx=%u; internal slabs stay capped for correctness%s\n",
+                        __func__, cparams.moe_prefill_batch, dsv4_safe_prefill_batch, cparams.n_ctx,
+                        dsv4_legacy_unsafe_prefill_requested ? " (legacy UNSAFE env ignored for true slabs; use LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB=1)" : "");
+            }
         }
         if (cparams.moe_prefill_micro_batch == 0) {
             cparams.moe_prefill_micro_batch = cparams.moe_prefill_batch;
@@ -10334,6 +10502,14 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+    if (getenv("LLAMA_DISABLE_FUSED_GDN_AR")) {
+        cparams.fused_gdn_ar = false;
+        LLAMA_LOG_WARN("%s: fused Gated Delta Net (autoregressive) disabled by LLAMA_DISABLE_FUSED_GDN_AR\n", __func__);
+    }
+    if (getenv("LLAMA_DISABLE_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = false;
+        LLAMA_LOG_WARN("%s: fused Gated Delta Net (chunked) disabled by LLAMA_DISABLE_FUSED_GDN_CH\n", __func__);
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -10343,8 +10519,21 @@ llama_context::llama_context(
 
     if (cparams.moe_prefill_batch > 0) {
         const uint32_t prefill_batch_limit = cparams.causal_attn ? std::min(cparams.n_ctx, cparams.moe_prefill_batch) : cparams.moe_prefill_batch;
+        uint32_t prefill_ubatch_limit = prefill_batch_limit;
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llama_moe_deepseek4_allow_true_prefill_slab()) {
+                const uint32_t true_slab_max = llama_moe_deepseek4_true_prefill_slab_max();
+                if (true_slab_max > 0) {
+                    prefill_ubatch_limit = std::min<uint32_t>(prefill_ubatch_limit, true_slab_max);
+                }
+            } else {
+                prefill_ubatch_limit = std::min<uint32_t>(
+                        prefill_ubatch_limit,
+                        llama_moe_deepseek4_safe_prefill_batch_for_ctx(cparams.n_ctx));
+            }
+        }
         cparams.n_batch = std::max(cparams.n_batch, prefill_batch_limit);
-        cparams.n_ubatch_prefill = std::max(cparams.n_ubatch_prefill, prefill_batch_limit);
+        cparams.n_ubatch_prefill = std::max(cparams.n_ubatch_prefill, prefill_ubatch_limit);
     }
 
     cparams.op_offload = params.op_offload;
@@ -11989,11 +12178,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
-    const uint32_t eval_n_ubatch = use_prefill_eval ?
+    uint32_t eval_n_ubatch = use_prefill_eval ?
             std::min<uint32_t>(
                     n_tokens_all,
                     std::min(cparams.n_batch, std::max(cparams.n_ubatch, cparams.n_ubatch_prefill))) :
             cparams.n_ubatch;
+    if (use_prefill_eval &&
+        model.arch == LLM_ARCH_DEEPSEEK4 &&
+        llama_moe_deepseek4_allow_true_prefill_slab()) {
+        const uint32_t true_slab_max = llama_moe_deepseek4_true_prefill_slab_max();
+        if (true_slab_max > 0) {
+            eval_n_ubatch = std::min<uint32_t>(eval_n_ubatch, true_slab_max);
+        }
+    }
 
     sched_reserve(eval_n_ubatch);
 
@@ -13481,6 +13678,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_shared_only             =*/ false,
         /*.moe_router_only             =*/ false,
         /*.moe_sort_decode_expert_ids  =*/ false,
+        /*.moe_force_prefill_batch     =*/ false,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
     };

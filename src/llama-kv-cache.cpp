@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1267,8 +1269,18 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
-template<bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<typename mask_t>
+static void set_kq_mask_value(mask_t * data, uint64_t idx, float value) {
+    data[idx] = value;
+}
+
+template<>
+void set_kq_mask_value<ggml_fp16_t>(ggml_fp16_t * data, uint64_t idx, float value) {
+    data[idx] = ggml_fp32_to_fp16(value);
+}
+
+template<bool causal, bool swa, bool is_2d, bool alibi, typename mask_t>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -1400,21 +1412,21 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 }
 
                 if (alibi) {
-                    data[idst + j] = -std::abs(p0 - p1);
+                    set_kq_mask_value(data, idst + j, -std::abs(p0 - p1));
                 } else {
-                    data[idst + j] = 0.0f;
+                    set_kq_mask_value(data, idst + j, 0.0f);
                 }
 
                 continue;
 skip:
-                data[idst + j] = -INFINITY;
+                set_kq_mask_value(data, idst + j, -INFINITY);
             }
         }
     }
 }
 
-template<bool causal, bool swa, bool is_2d>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<bool causal, bool swa, bool is_2d, typename mask_t>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool alibi = args.hparams.use_alibi;
     if (alibi) {
         set_input_kq_mask_impl<causal, swa, is_2d, true> (args, data);
@@ -1423,8 +1435,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-template<bool causal, bool swa>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<bool causal, bool swa, typename mask_t>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool is_2d = args.ubatch->is_pos_2d();
     if (is_2d) {
         set_input_kq_mask_impl<causal, swa, true> (args, data);
@@ -1433,8 +1445,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-template<bool causal>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
+template<bool causal, typename mask_t>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, mask_t * data) {
     const bool swa = args.swa_type != LLAMA_SWA_TYPE_NONE;
     if (swa) {
         set_input_kq_mask_impl<causal, true> (args, data);
@@ -1443,11 +1455,32 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
+static bool kq_mask_summary_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_KQ_MASK_SUMMARY");
+        enabled = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
+static uint64_t kq_mask_summary_hash_row(const float * row, int64_t n_kv) {
+    uint64_t h = 1469598103934665603ULL;
+    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(row);
+    const size_t n_bytes = size_t(n_kv) * sizeof(float);
+    for (size_t i = 0; i < n_bytes; ++i) {
+        h ^= bytes[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    float * data = (float *) dst->data;
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -1471,10 +1504,112 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
-    if (causal_attn) {
-        set_input_kq_mask_impl<true> (args, data);
+    if (dst->type == GGML_TYPE_F32) {
+        float * data = (float *) dst->data;
+        if (causal_attn) {
+            set_input_kq_mask_impl<true> (args, data);
+        } else {
+            set_input_kq_mask_impl<false>(args, data);
+        }
     } else {
-        set_input_kq_mask_impl<false>(args, data);
+        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+        if (causal_attn) {
+            set_input_kq_mask_impl<true> (args, data);
+        } else {
+            set_input_kq_mask_impl<false>(args, data);
+        }
+    }
+
+    if (kq_mask_summary_enabled()) {
+        static int call = 0;
+        const int cur_call = call++;
+        if (cur_call < 12) {
+            const char * name = ggml_get_name(dst);
+            const int64_t interesting[] = {
+                0,
+                1,
+                63,
+                64,
+                127,
+                128,
+                8191,
+                8192,
+                n_tps - 1,
+            };
+
+            LLAMA_LOG_WARN("%s: summary call=%d name=%s n_tokens=%u n_kv=%lld n_tps=%lld n_stream=%lld n_swa=%u swa_type=%d causal=%d\n",
+                    __func__, cur_call, name != nullptr ? name : "(unnamed)", n_tokens,
+                    (long long) n_kv, (long long) n_tps, (long long) n_stream,
+                    n_swa, (int) swa_type, causal_attn ? 1 : 0);
+
+            for (int64_t row_rel : interesting) {
+                if (row_rel < 0 || row_rel >= n_tps) {
+                    continue;
+                }
+
+                const uint32_t i = (uint32_t) row_rel;
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+                const llama_pos p1 = ubatch->pos[i];
+                const float * row_f32 = dst->type == GGML_TYPE_F32 ? (const float *) dst->data + n_kv*i : nullptr;
+                const ggml_fp16_t * row_f16 = dst->type == GGML_TYPE_F16 ? (const ggml_fp16_t *) dst->data + n_kv*i : nullptr;
+
+                int64_t unmasked = 0;
+                int64_t empty_unmasked = 0;
+                int64_t other_seq_unmasked = 0;
+                int64_t future_unmasked = 0;
+                int64_t swa_masked_unmasked = 0;
+                int64_t first_j = -1;
+                int64_t last_j = -1;
+                llama_pos first_p = -1;
+                llama_pos last_p = -1;
+
+                for (int64_t j64 = 0; j64 < n_kv; ++j64) {
+                    const uint32_t j = (uint32_t) j64;
+                    const float mask_value = dst->type == GGML_TYPE_F32 ? row_f32[j] : ggml_fp16_to_fp32(row_f16[j]);
+                    if (!std::isfinite(mask_value)) {
+                        continue;
+                    }
+
+                    ++unmasked;
+                    if (cells.is_empty(j)) {
+                        ++empty_unmasked;
+                        continue;
+                    }
+                    if (!cells.seq_has(j, seq_id)) {
+                        ++other_seq_unmasked;
+                        continue;
+                    }
+
+                    const llama_pos p0 = cells.pos_get(j);
+                    if (first_j < 0) {
+                        first_j = j64;
+                        first_p = p0;
+                    }
+                    last_j = j64;
+                    last_p = p0;
+
+                    if (p0 > p1) {
+                        ++future_unmasked;
+                    }
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                        ++swa_masked_unmasked;
+                    }
+                }
+
+                LLAMA_LOG_WARN("%s: row call=%d row=%lld pos=%d unmasked=%lld first=%lld/%d last=%lld/%d future=%lld swa_bad=%lld empty=%lld other_seq=%lld hash=%016" PRIx64 "\n",
+                        __func__, cur_call, (long long) row_rel, (int) p1,
+                        (long long) unmasked, (long long) first_j, (int) first_p,
+                        (long long) last_j, (int) last_p,
+                        (long long) future_unmasked,
+                        (long long) swa_masked_unmasked,
+                        (long long) empty_unmasked,
+                        (long long) other_seq_unmasked,
+                        dst->type == GGML_TYPE_F32 ?
+                            kq_mask_summary_hash_row(row_f32, n_kv) :
+                            kq_mask_summary_hash_row((const float *) row_f16, (n_kv + 1)/2));
+            }
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

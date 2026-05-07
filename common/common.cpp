@@ -1489,6 +1489,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_prefill_micro_batch = params.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO ?
             uint32_t(-1) :
             uint32_t(params.moe_prefill_micro_batch);
+    cparams.moe_force_prefill_batch = params.moe_force_prefill_batch;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

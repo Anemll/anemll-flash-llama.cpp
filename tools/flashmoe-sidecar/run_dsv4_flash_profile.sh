@@ -28,6 +28,21 @@ env_truthy() {
     return 1
 }
 
+parse_k_count() {
+    local value=$1
+    if [[ "$value" =~ ^([0-9]+)([kK])?$ ]]; then
+        local n=${BASH_REMATCH[1]}
+        local suffix=${BASH_REMATCH[2]:-}
+        if [[ -n "$suffix" ]]; then
+            printf "%s\n" "$(( 10#$n * 1024 ))"
+        else
+            printf "%s\n" "$(( 10#$n ))"
+        fi
+        return 0
+    fi
+    return 1
+}
+
 usage() {
     cat >&2 <<EOF
 usage: $0 [PACKAGE_DIR] [llama-cli args...]
@@ -50,6 +65,16 @@ Override dense and sidecar either with env vars:
 
 or with llama-cli args:
   $0 -m /path/model-dense.gguf --moe-sidecar /path/sidecar ...
+
+Use --force-moe-prefill-batch to bypass the DeepSeek V4 wrapper and runtime
+prefill-batch safety clamps for correctness/performance probes. This wrapper
+also accepts "--force-moe-prefill-batch N" as shorthand for
+"--moe-prefill-batch N --force-moe-prefill-batch".
+For --moe-prefill-batch, K/k suffix means *1024, e.g. 32K = 32768.
+
+When this wrapper is used by a comparison harness, DSV4_COMPARISON_LABEL and
+DSV4_COMPARISON_ROLE are emitted into the log so a pasted run identifies which
+case it belongs to.
 EOF
 }
 
@@ -189,6 +214,7 @@ saw_raw_completion_arg=0
 saw_conversation_mode_arg=0
 saw_prefill_layer_major_arg=0
 selected_builtin_coding_prompt=0
+force_prefill_batch=0
 prefill_batch_arg_index=-1
 prefill_batch_eq_arg_index=-1
 requested_prefill_batch_arg=""
@@ -340,16 +366,38 @@ while [[ $# -gt 0 ]]; do
             ;;
         --moe-prefill-batch)
             [[ $# -ge 2 ]] || die "missing argument for $1"
-            forwarded_args+=("$1" "$2")
+            normalized_prefill_batch=$(parse_k_count "$2") || die "invalid --moe-prefill-batch value: $2"
+            forwarded_args+=("$1" "$normalized_prefill_batch")
             prefill_batch_arg_index=$((${#forwarded_args[@]} - 1))
-            requested_prefill_batch_arg=$2
+            requested_prefill_batch_arg=$normalized_prefill_batch
             had_forwarded_args=1
             shift 2
             ;;
         --moe-prefill-batch=*)
-            forwarded_args+=("$1")
+            raw_prefill_batch=${1#*=}
+            normalized_prefill_batch=$(parse_k_count "$raw_prefill_batch") || die "invalid --moe-prefill-batch value: $raw_prefill_batch"
+            forwarded_args+=("--moe-prefill-batch=$normalized_prefill_batch")
             prefill_batch_eq_arg_index=$((${#forwarded_args[@]} - 1))
-            requested_prefill_batch_arg=${1#*=}
+            requested_prefill_batch_arg=$normalized_prefill_batch
+            had_forwarded_args=1
+            shift
+            ;;
+        --force-moe-prefill-batch)
+            force_prefill_batch=1
+            had_forwarded_args=1
+            if [[ $# -ge 2 ]] && normalized_prefill_batch=$(parse_k_count "$2"); then
+                forwarded_args+=("--moe-prefill-batch" "$normalized_prefill_batch" "$1")
+                prefill_batch_arg_index=$((${#forwarded_args[@]} - 2))
+                requested_prefill_batch_arg=$normalized_prefill_batch
+                shift 2
+            else
+                forwarded_args+=("$1")
+                shift
+            fi
+            ;;
+        --no-force-moe-prefill-batch)
+            forwarded_args+=("$1")
+            force_prefill_batch=0
             had_forwarded_args=1
             shift
             ;;
@@ -395,6 +443,23 @@ max_estimated_model_gib=${MAX_ESTIMATED_MODEL_GIB:-112}
 dsv4_long_ctx_threshold=${DSV4_PREFILL_BATCH_LONG_CTX_THRESHOLD:-65536}
 dsv4_safe_prefill_batch=${DSV4_PREFILL_BATCH_SAFE_MAX:-8192}
 dsv4_adaptive_prefill=0
+dsv4_true_prefill_slab=0
+dsv4_legacy_broken_true_prefill_slab=0
+dsv4_true_prefill_slab_max=$(parse_k_count "${LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX:-32768}") ||
+    die "LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX must be an integer or K-suffixed integer"
+if env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB:-0}"; then
+    dsv4_true_prefill_slab=1
+elif env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB:-0}"; then
+    dsv4_true_prefill_slab=1
+    dsv4_legacy_broken_true_prefill_slab=1
+fi
+dsv4_legacy_unsafe_prefill=0
+if env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH:-0}" ||
+   env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_PREFILL_BATCH_GT_8K:-0}"; then
+    dsv4_legacy_unsafe_prefill=1
+fi
+comparison_label=${DSV4_COMPARISON_LABEL:-${COMPARISON_LABEL:-}}
+comparison_role=${DSV4_COMPARISON_ROLE:-${COMPARISON_ROLE:-}}
 if [[ "$requested_ctx" =~ ^[0-9]+$ &&
       "$dsv4_long_ctx_threshold" =~ ^[0-9]+$ &&
       "$requested_ctx" -ge "$dsv4_long_ctx_threshold" ]]; then
@@ -417,8 +482,8 @@ if [[ "$manifest_arch" == "deepseek4" &&
       "$requested_ctx" =~ ^[0-9]+$ &&
       "$requested_ctx" -ge "$dsv4_long_ctx_threshold" ]] &&
       env_truthy "${DSV4_PREFILL_ADAPTIVE:-1}" &&
-      ! env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH:-0}" &&
-      ! env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_PREFILL_BATCH_GT_8K:-0}"; then
+      (( force_prefill_batch == 0 )) &&
+      (( dsv4_true_prefill_slab == 0 )); then
     dsv4_adaptive_prefill=1
     dsv4_safe_prefill_batch=${DSV4_PREFILL_BATCH_ADAPTIVE_MAX:-8192}
     export LLAMA_FLASH_MOE_DSV4_ADAPTIVE_PREFILL="${LLAMA_FLASH_MOE_DSV4_ADAPTIVE_PREFILL:-1}"
@@ -430,13 +495,32 @@ fi
 if [[ "$manifest_arch" == "deepseek4" &&
       "$requested_prefill_batch_arg" =~ ^[0-9]+$ &&
       "$requested_prefill_batch_arg" -gt "$dsv4_safe_prefill_batch" ]] &&
-      ! env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH:-0}" &&
-      ! env_truthy "${LLAMA_FLASH_MOE_DSV4_ALLOW_PREFILL_BATCH_GT_8K:-0}"; then
-    warn "DeepSeek V4 Flash layer-major prefill above ${dsv4_safe_prefill_batch} is unsafe for ctx=${requested_ctx}; clamping requested --moe-prefill-batch=${requested_prefill_batch_arg}. Set LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH=1 to debug the unsafe path."
+      (( force_prefill_batch == 0 )) &&
+      (( dsv4_true_prefill_slab == 0 )); then
+    warn "DeepSeek V4 Flash layer-major public prefill above ${dsv4_safe_prefill_batch} is guarded for ctx=${requested_ctx}; clamping requested --moe-prefill-batch=${requested_prefill_batch_arg}. Pass --force-moe-prefill-batch to accept the larger public batch while keeping compressed-KV internal splits safe."
     if (( prefill_batch_arg_index >= 0 )); then
         forwarded_args[$prefill_batch_arg_index]=$dsv4_safe_prefill_batch
     elif (( prefill_batch_eq_arg_index >= 0 )); then
         forwarded_args[$prefill_batch_eq_arg_index]="--moe-prefill-batch=${dsv4_safe_prefill_batch}"
+    fi
+elif [[ "$manifest_arch" == "deepseek4" &&
+        "$requested_prefill_batch_arg" =~ ^[0-9]+$ &&
+	        "$requested_prefill_batch_arg" -gt "$dsv4_safe_prefill_batch" ]] &&
+	        (( force_prefill_batch )); then
+    if (( dsv4_true_prefill_slab )); then
+        if (( dsv4_true_prefill_slab_max > 0 && requested_prefill_batch_arg > dsv4_true_prefill_slab_max )); then
+            warn "accepting DeepSeek V4 layer-major --moe-prefill-batch=${requested_prefill_batch_arg} above public safety limit ${dsv4_safe_prefill_batch} for ctx=${requested_ctx}; true internal Metal graph slabs are capped at ${dsv4_true_prefill_slab_max} to avoid 64K command-buffer OOM"
+        else
+            warn "accepting experimental DeepSeek V4 layer-major true internal slab --moe-prefill-batch=${requested_prefill_batch_arg} above public safety limit ${dsv4_safe_prefill_batch} for ctx=${requested_ctx}"
+        fi
+        if (( dsv4_legacy_broken_true_prefill_slab )); then
+            warn "LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB is a legacy alias; prefer LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB=1"
+        fi
+    else
+        warn "accepting DeepSeek V4 layer-major --moe-prefill-batch=${requested_prefill_batch_arg} above public safety limit ${dsv4_safe_prefill_batch} for ctx=${requested_ctx}; internal slabs remain capped for correctness"
+        if (( dsv4_legacy_unsafe_prefill )); then
+            warn "legacy LLAMA_FLASH_MOE_DSV4_ALLOW_UNSAFE_PREFILL_BATCH / ALLOW_PREFILL_BATCH_GT_8K is ignored for true slabs; use LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB=1"
+        fi
     fi
 fi
 
@@ -576,12 +660,27 @@ fi
 cmd+=("${forwarded_args[@]}")
 
 note "DeepSeek V4 Flash profile"
+if [[ -n "$comparison_label" || -n "$comparison_role" ]]; then
+    note "comparison=${comparison_label:-unnamed} role=${comparison_role:-case}"
+fi
 note "arch=${manifest_arch} entries=${manifest_entries} families=${manifest_families} expert_used=${manifest_topk} experts=${manifest_expert_count}"
 note "dense=$model_path"
 note "sidecar=$sidecar_path"
 note "slot_bank=${effective_slot_bank} topk=${requested_topk} cache_io_split=${cache_io_split} ctx=${requested_ctx} batch=${requested_batch} ubatch=${requested_ubatch}"
 if (( dsv4_adaptive_prefill )); then
     note "dsv4 adaptive prefill=on schedule=0-16k:8192,16k-40k:4096,40k+:2048 max_arg=${dsv4_safe_prefill_batch}"
+fi
+if (( force_prefill_batch )); then
+    if (( dsv4_true_prefill_slab )); then
+        if [[ "${requested_prefill_batch_arg:-}" =~ ^[0-9]+$ ]] &&
+           (( dsv4_true_prefill_slab_max > 0 && requested_prefill_batch_arg > dsv4_true_prefill_slab_max )); then
+            note "dsv4 force public prefill batch=on requested=${requested_prefill_batch_arg:-default} internal-slab=true-capped max=${dsv4_true_prefill_slab_max}"
+        else
+            note "dsv4 force public prefill batch=on requested=${requested_prefill_batch_arg:-default} internal-slab=true-experimental max=${dsv4_true_prefill_slab_max}"
+        fi
+    else
+        note "dsv4 force public prefill batch=on requested=${requested_prefill_batch_arg:-default} internal-slab=safe-split"
+    fi
 fi
 note "estimated dense+slot-bank model memory=${estimated_model_gib} GiB (limit=${max_estimated_model_gib} GiB, override with ALLOW_HIGH_MEMORY=1)"
 

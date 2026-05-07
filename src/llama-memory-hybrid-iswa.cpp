@@ -85,6 +85,73 @@ static bool dsv4_align_long_prefill_enabled() {
     return enabled == 1;
 }
 
+static bool dsv4_allow_true_long_prefill_slab_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_DSV4_ALLOW_TRUE_PREFILL_SLAB");
+        const char * legacy_value = std::getenv("LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB");
+        enabled =
+                (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ||
+                (legacy_value != nullptr && legacy_value[0] != '\0' && std::strcmp(legacy_value, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
+static constexpr uint32_t DSV4_TRUE_LONG_PREFILL_SLAB_VALIDATED_MAX = 32u*1024u;
+
+static bool dsv4_allow_broken_true_long_prefill_slab_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB");
+        enabled = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
+static uint32_t dsv4_true_long_prefill_slab_max_requested() {
+    static uint32_t value = 0;
+    static bool initialized = false;
+    if (!initialized) {
+        // A single 64K DeepSeek4 graph exceeds Metal command-buffer memory on
+        // M5 Max. Keep "true" experimental slabs at the largest validated graph
+        // size by default. Values above that cap, including 0 for "uncapped",
+        // require the explicit BROKEN env.
+        value = DSV4_TRUE_LONG_PREFILL_SLAB_VALIDATED_MAX;
+
+        const char * env = std::getenv("LLAMA_FLASH_MOE_DSV4_TRUE_PREFILL_SLAB_MAX");
+        if (env != nullptr && env[0] != '\0') {
+            char * end = nullptr;
+            unsigned long parsed = std::strtoul(env, &end, 10);
+            if (end != env) {
+                if ((*end == 'k' || *end == 'K') && end[1] == '\0') {
+                    parsed *= 1024ul;
+                }
+                if ((*end == '\0' || ((*end == 'k' || *end == 'K') && end[1] == '\0')) &&
+                    parsed <= std::numeric_limits<uint32_t>::max()) {
+                    value = (uint32_t) parsed;
+                }
+            }
+        }
+
+        initialized = true;
+    }
+
+    return value;
+}
+
+static uint32_t dsv4_true_long_prefill_slab_max() {
+    const uint32_t requested = dsv4_true_long_prefill_slab_max_requested();
+
+    if ((requested == 0 || requested > DSV4_TRUE_LONG_PREFILL_SLAB_VALIDATED_MAX) &&
+        !dsv4_allow_broken_true_long_prefill_slab_enabled()) {
+        return DSV4_TRUE_LONG_PREFILL_SLAB_VALIDATED_MAX;
+    }
+
+    return requested;
+}
+
 static uint32_t dsv4_cont_prefill_adaptive_ubatch_max(
         llama_pos split_pos,
         uint32_t  n_ubatch,
@@ -420,10 +487,17 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 if (long_single_seq_prefill && dsv4_prefill_alignment > 1 && split_pos % dsv4_prefill_alignment != 0) {
                     const uint32_t align_tokens = dsv4_prefill_alignment - uint32_t(split_pos % dsv4_prefill_alignment);
                     n_ubatch_dsv4 = std::min<uint32_t>(n_ubatch_dsv4, std::min<uint32_t>(align_tokens, DSV4_COMPRESSED_DECODE_UBATCH_MAX));
-                } else if (long_single_seq_prefill && split_pos > 0) {
-                    // Continuation prefill attends over already-visible compressed
-                    // cache rows, so cap the slice by both token count and the
-                    // token*visible-compressed-row work area used by DSV4 masks.
+                } else if (long_single_seq_prefill && dsv4_allow_true_long_prefill_slab_enabled()) {
+                    const uint32_t true_slab_max = dsv4_true_long_prefill_slab_max();
+                    if (true_slab_max > 0) {
+                        n_ubatch_dsv4 = std::min<uint32_t>(n_ubatch_dsv4, true_slab_max);
+                    }
+                } else if (long_single_seq_prefill) {
+                    // DeepSeek V4 compressed prefill builds large token by
+                    // compressed-row work areas. Keep internal compressed-KV
+                    // ubatches under the same safe cap even when the public
+                    // prefill batch is forced larger. True slabs are still gated
+                    // behind an explicit env while validation continues.
                     n_ubatch_dsv4 = dsv4_cont_prefill_adaptive_ubatch_max(
                             split_pos,
                             n_ubatch_dsv4,

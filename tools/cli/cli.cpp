@@ -904,6 +904,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  prefill-batch    = %d%s\n",
                 params.moe_prefill_batch > 0 ? params.moe_prefill_batch : 8192,
                 params.moe_prefill_batch > 0 ? "" : " (default)");
+        fprintf(stderr, "  force-prefill-batch = %s\n", params.moe_force_prefill_batch ? "on" : "off");
         if (params.moe_prefill_micro_batch == COMMON_MOE_PREFILL_MICRO_BATCH_AUTO) {
             fprintf(stderr, "  prefill-micro-batch = auto (adaptive by prompt length)\n");
         } else {

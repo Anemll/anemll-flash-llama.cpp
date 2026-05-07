@@ -53,6 +53,8 @@ struct dsv4_mask_entry {
     int64_t         n_comp = 0;
     int64_t         window = 0;
     int64_t         ratio = 0;
+    int64_t         q_offset = 0;
+    int64_t         k_offset = 0;
 };
 
 class dsv4_graph_inputs : public llm_graph_input_i {
@@ -66,11 +68,13 @@ public:
             int64_t        n_comp,
             int64_t        window,
             int64_t        ratio,
-            const char   * name) {
+            const char   * name,
+            int64_t        q_offset = 0,
+            int64_t        k_offset = 0) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n0, n1, 1, 1);
         ggml_set_input(t);
         ggml_set_name(t, name);
-        masks.push_back({ t, kind, n_raw, n_comp, window, ratio });
+        masks.push_back({ t, kind, n_raw, n_comp, window, ratio, q_offset, k_offset });
         return t;
     }
 
@@ -88,14 +92,14 @@ public:
 
             switch (mask.kind) {
                 case dsv4_mask_kind::RAW_WINDOW:
-                    fill_raw_window(data, n0, n1, mask.window, ubatch);
+                    fill_raw_window(data, n0, n1, mask.window, mask.q_offset, mask.k_offset, ubatch);
                     break;
                 case dsv4_mask_kind::COMPRESS_CAUSAL:
-                    fill_compress_causal(data, n0, n1, mask.ratio, 0, ubatch);
+                    fill_compress_causal(data, n0, n1, mask.ratio, 0, mask.q_offset, ubatch);
                     break;
                 case dsv4_mask_kind::ATTN_STATIC:
-                    fill_raw_window(data, n0, n1, mask.window, ubatch);
-                    fill_compress_causal(data, n0, n1, mask.ratio, mask.n_raw, ubatch);
+                    fill_raw_window(data, n0, n1, mask.window, mask.q_offset, mask.k_offset, ubatch);
+                    fill_compress_causal(data, n0, n1, mask.ratio, mask.n_raw, mask.q_offset, ubatch);
                     break;
             }
 
@@ -109,14 +113,23 @@ private:
             int64_t              n0,
             int64_t              n1,
             int64_t              window,
+            int64_t              q_offset,
+            int64_t              k_offset,
             const llama_ubatch * ubatch) {
-        GGML_ASSERT((int64_t) ubatch->n_tokens == n1);
+        GGML_ASSERT(q_offset >= 0);
+        GGML_ASSERT(k_offset >= 0);
+        GGML_ASSERT(q_offset + n1 <= (int64_t) ubatch->n_tokens);
 
         for (int64_t iq = 0; iq < n1; ++iq) {
-            const llama_pos p1 = ubatch->pos ? ubatch->pos[iq] : (llama_pos) iq;
+            const int64_t iq_abs = q_offset + iq;
+            const llama_pos p1 = ubatch->pos ? ubatch->pos[iq_abs] : (llama_pos) iq_abs;
 
-            for (int64_t ik = 0; ik < std::min<int64_t>(n0, ubatch->n_tokens); ++ik) {
-                const llama_pos p0 = ubatch->pos ? ubatch->pos[ik] : (llama_pos) ik;
+            for (int64_t ik = 0; ik < n0; ++ik) {
+                const int64_t ik_abs = k_offset + ik;
+                if (ik_abs >= (int64_t) ubatch->n_tokens) {
+                    break;
+                }
+                const llama_pos p0 = ubatch->pos ? ubatch->pos[ik_abs] : (llama_pos) ik_abs;
 
                 if (p0 > p1) {
                     continue;
@@ -137,12 +150,16 @@ private:
             int64_t              n1,
             int64_t              ratio,
             int64_t              offset,
+            int64_t              q_offset,
             const llama_ubatch * ubatch) {
         GGML_ASSERT(ratio > 0);
+        GGML_ASSERT(q_offset >= 0);
+        GGML_ASSERT(q_offset + n1 <= (int64_t) ubatch->n_tokens);
 
         const int64_t n_comp = n0 - offset;
         for (int64_t iq = 0; iq < n1; ++iq) {
-            const llama_pos p1 = ubatch->pos ? ubatch->pos[iq] : (llama_pos) iq;
+            const int64_t iq_abs = q_offset + iq;
+            const llama_pos p1 = ubatch->pos ? ubatch->pos[iq_abs] : (llama_pos) iq_abs;
             const int64_t n_visible = (p1 + 1) / ratio;
 
             for (int64_t ic = 0; ic < std::min<int64_t>(n_comp, n_visible); ++ic) {
@@ -648,9 +665,6 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
 
     const int64_t cutoff    = (n_tokens / compress_ratio) * compress_ratio;
     const int64_t remainder = n_tokens - cutoff;
-
-    ggml_tensor * kv    = ggml_mul_mat(ctx, wkv,    x); // [width, n_tokens]
-    ggml_tensor * score = ggml_mul_mat(ctx, wgate,  x);
     ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
 
     if (compress_ratio == 4) {
@@ -658,8 +672,12 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
         ggml_tensor * score_prev = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
 
         if (cutoff >= compress_ratio) {
-            kv_prev = ggml_view_2d(ctx, kv, layout.width, compress_ratio, kv->nb[1], (cutoff - compress_ratio)*kv->nb[1]);
-            score_prev = ggml_view_2d(ctx, score, layout.width, compress_ratio, score->nb[1], (cutoff - compress_ratio)*score->nb[1]);
+            ggml_tensor * x_prev = ggml_view_2d(ctx, x,
+                    x->ne[0], compress_ratio,
+                    x->nb[1],
+                    (cutoff - compress_ratio)*x->nb[1]);
+            kv_prev    = ggml_mul_mat(ctx, wkv,   x_prev);
+            score_prev = ggml_mul_mat(ctx, wgate, x_prev);
             score_prev = ggml_add(ctx, score_prev, ape_f);
         }
 
@@ -667,8 +685,12 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
         ggml_tensor * score_curr = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
 
         if (remainder > 0) {
-            ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, layout.width, remainder, kv->nb[1], cutoff*kv->nb[1]);
-            ggml_tensor * sc_rem = ggml_view_2d(ctx, score, layout.width, remainder, score->nb[1], cutoff*score->nb[1]);
+            ggml_tensor * x_rem = ggml_view_2d(ctx, x,
+                    x->ne[0], remainder,
+                    x->nb[1],
+                    cutoff*x->nb[1]);
+            ggml_tensor * kv_rem = ggml_mul_mat(ctx, wkv,   x_rem);
+            ggml_tensor * sc_rem = ggml_mul_mat(ctx, wgate, x_rem);
             sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
 
             if (remainder == compress_ratio) {
@@ -692,8 +714,12 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
     ggml_tensor * score_state = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
 
     if (remainder > 0) {
-        ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, layout.width, remainder, kv->nb[1], cutoff*kv->nb[1]);
-        ggml_tensor * sc_rem = ggml_view_2d(ctx, score, layout.width, remainder, score->nb[1], cutoff*score->nb[1]);
+        ggml_tensor * x_rem = ggml_view_2d(ctx, x,
+                x->ne[0], remainder,
+                x->nb[1],
+                cutoff*x->nb[1]);
+        ggml_tensor * kv_rem = ggml_mul_mat(ctx, wkv,   x_rem);
+        ggml_tensor * sc_rem = ggml_mul_mat(ctx, wgate, x_rem);
         sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
 
         if (remainder == compress_ratio) {
@@ -1099,17 +1125,54 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
         ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
+        bool cur_is_attn_projected = false;
 
         if (compress_ratio == 0) {
             ggml_tensor * k_cache = mctx_swa->get_k(ctx0, il);
             k_cache = ggml_reshape_3d(ctx0, k_cache, n_embd_head_k, 1, k_cache->ne[2]);
-            cur = build_attn_mha(q, k_cache, k_cache, nullptr, inp_attn->get_kq_mask_swa(),
-                    layer.attn_sinks, nullptr, kq_scale, il);
+            const int64_t dsv4_swa_fa_q_limit = 8192;
+            if (is_prefill && cparams.flash_attn && n_tokens > dsv4_swa_fa_q_limit) {
+                ggml_tensor * attn_all = nullptr;
+                ggml_tensor * k_source = kv;
+                for (int64_t row_start = 0; row_start < n_tokens; row_start += dsv4_swa_fa_q_limit) {
+                    const int64_t n_rows = std::min<int64_t>(dsv4_swa_fa_q_limit, n_tokens - row_start);
+                    const int64_t key_start = std::max<int64_t>(0, row_start + 1 - hparams.n_swa);
+                    const int64_t key_end = row_start + n_rows;
+                    const int64_t n_keys = key_end - key_start;
+                    GGML_ASSERT(n_keys > 0);
+                    ggml_tensor * q_part = ggml_view_3d(ctx0, q,
+                            q->ne[0], q->ne[1], n_rows,
+                            q->nb[1], q->nb[2], row_start*q->nb[2]);
+                    ggml_tensor * k_part = ggml_view_3d(ctx0, k_source,
+                            k_source->ne[0], k_source->ne[1], n_keys,
+                            k_source->nb[1], k_source->nb[2], key_start*k_source->nb[2]);
+                    ggml_tensor * mask_part = get_dsv4_inputs()->add_mask(ctx0,
+                            dsv4_mask_kind::RAW_WINDOW,
+                            n_keys, n_rows,
+                            n_keys, 0, hparams.n_swa, 0,
+                            "dsv4_swa_split_raw_window_mask",
+                            row_start, key_start);
+                    mask_part = ggml_cast(ctx0, mask_part, GGML_TYPE_F16);
+                    ggml_tensor * cur_part = build_attn_mha(q_part, k_part, k_part, nullptr, mask_part,
+                            layer.attn_sinks, nullptr, kq_scale, il);
+                    attn_all = attn_all == nullptr ? cur_part : ggml_concat(ctx0, attn_all, cur_part, 1);
+                }
+                cur = attn_all;
+            } else {
+                cur = build_attn_mha(q, k_cache, k_cache, nullptr, inp_attn->get_kq_mask_swa(),
+                        layer.attn_sinks, nullptr, kq_scale, il);
+            }
             cb(cur, "kqv_out", il);
         } else {
             ggml_tensor * k_all = kv;
             ggml_tensor * v_all = kv;
+            ggml_tensor * kv_comp_all = nullptr;
+            ggml_tensor * index_kv_all = nullptr;
+            ggml_tensor * kv_comp_cache_all = nullptr;
+            ggml_tensor * k_raw_cache_all = nullptr;
+            ggml_tensor * raw_attn_mask = nullptr;
             ggml_tensor * attn_mask = nullptr;
+            bool segment_compress_attention = false;
             const llama_seq_id seq_id = ubatch.seq_id[0][0];
             auto store_attn_cache_rows = [&](ggml_tensor * src, int64_t row_start, int64_t n_rows) {
                 for (int32_t is = 0; is < ubatch.n_seq_id[0]; ++is) {
@@ -1125,6 +1188,42 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             };
             const int64_t state_size = hparams.n_embd_r();
             const dsv4_state_layout attn_state_layout = dsv4_make_state_layout(compress_ratio, n_embd_head_k);
+            const int64_t dsv4_compress_fa_q_limit = 8192;
+            const int64_t dsv4_compress_fa_work_limit = 16ll*1024ll*1024ll;
+            auto should_segment_compress_attention = [&](int64_t n_q, int64_t n_comp_keys) {
+                if (!cparams.flash_attn || n_q <= 1 || n_comp_keys <= 0) {
+                    return false;
+                }
+
+                return n_q > dsv4_compress_fa_q_limit ||
+                        uint64_t(n_q)*uint64_t(n_comp_keys) >= uint64_t(dsv4_compress_fa_work_limit);
+            };
+            auto choose_compress_attention_q_limit = [&](int64_t n_comp_keys) {
+                int64_t limit = dsv4_compress_fa_q_limit;
+                if (n_comp_keys > 0) {
+                    limit = std::min<int64_t>(limit, std::max<int64_t>(128, dsv4_compress_fa_work_limit/n_comp_keys));
+                }
+                if (limit > 128) {
+                    limit -= limit % 128;
+                }
+                return std::max<int64_t>(128, limit);
+            };
+            auto choose_compress_prefill_q_limit = [&](int64_t n_comp_keys) {
+                int64_t limit = dsv4_compress_fa_q_limit;
+                const int64_t raw_overlap = std::max<int64_t>(0, hparams.n_swa > 0 ? int64_t(hparams.n_swa) - 1 : 0);
+                const int64_t max_fa_keys = 16*1024;
+                limit = std::min<int64_t>(limit, std::max<int64_t>(128, max_fa_keys - raw_overlap - std::max<int64_t>(0, n_comp_keys)));
+                if (compress_ratio == 4 && n_comp_keys > 6144) {
+                    limit = std::min<int64_t>(limit, 4096);
+                }
+                const int64_t align = compress_ratio == 4 ? 2048 : 128;
+                if (limit > align) {
+                    limit -= limit % align;
+                } else if (limit > 128) {
+                    limit -= limit % 128;
+                }
+                return std::max<int64_t>(128, limit);
+            };
 
             ggml_tensor * prev_kv_state_all = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), state_size, ubatch.n_seqs);
             ggml_tensor * prev_sc_state_all = build_rs(inp_rs, inp_rs->mctx->get_s_l(il), state_size, ubatch.n_seqs);
@@ -1132,6 +1231,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * prev_attn_sc_state = dsv4_view_state_segment(ctx0, prev_sc_state_all, 0, attn_state_layout.width, attn_state_layout.rows);
 
             const int64_t n_comp = n_tokens / compress_ratio;
+            int64_t n_comp_visible = n_comp;
             if (is_prefill) {
                 dsv4_state_pair state = dsv4_build_compressor_prefill_state(ctx0, cur,
                         layer.attn_compressor_kv,
@@ -1159,96 +1259,242 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
 
             if (is_prefill && n_comp > 0) {
-                ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
-                comp_pos = ggml_cast(ctx0, comp_pos, GGML_TYPE_I32);
+                const int64_t dsv4_compress_prefill_segment = 8192;
+                const bool segment_compress_prefill =
+                        cparams.flash_attn &&
+                        compress_ratio == 4 &&
+                        n_tokens > dsv4_compress_prefill_segment;
 
-                ggml_tensor * kv_comp = dsv4_build_compressor_prefill(ctx0, cur,
-                        layer.attn_compressor_kv,
-                        layer.attn_compressor_gate,
-                        layer.attn_compressor_ape,
-                        layer.attn_compressor_norm,
-                        comp_pos,
-                        n_embd_head_k, n_rot, n_tokens, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
-                kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
+                ggml_tensor * kv_comp = nullptr;
+                if (segment_compress_prefill) {
+                    dsv4_state_pair prev_state = {};
+                    bool have_prev_state = false;
+                    for (int64_t row_start = 0; row_start < n_tokens; row_start += dsv4_compress_prefill_segment) {
+                        const int64_t n_rows = std::min<int64_t>(dsv4_compress_prefill_segment, n_tokens - row_start);
+                        const int64_t n_comp_part = n_rows / compress_ratio;
+                        if (n_comp_part <= 0) {
+                            continue;
+                        }
+
+                        ggml_tensor * cur_part = ggml_view_2d(ctx0, cur,
+                                cur->ne[0], n_rows,
+                                cur->nb[1],
+                                row_start*cur->nb[1]);
+                        ggml_tensor * comp_pos_part = ggml_arange(ctx0,
+                                float(row_start),
+                                float(row_start + n_comp_part*compress_ratio),
+                                float(compress_ratio));
+                        comp_pos_part = ggml_cast(ctx0, comp_pos_part, GGML_TYPE_I32);
+
+                        ggml_tensor * kv_comp_part = have_prev_state
+                            ? dsv4_build_compressor_prefill_with_overlap(ctx0, cur_part,
+                                    prev_state.kv,
+                                    prev_state.score,
+                                    layer.attn_compressor_kv,
+                                    layer.attn_compressor_gate,
+                                    layer.attn_compressor_ape,
+                                    layer.attn_compressor_norm,
+                                    comp_pos_part,
+                                    n_embd_head_k, n_rot, n_rows, compress_ratio, row_start, rope_type, rope_cfg, norm_rms_eps)
+                            : dsv4_build_compressor_prefill(ctx0, cur_part,
+                                    layer.attn_compressor_kv,
+                                    layer.attn_compressor_gate,
+                                    layer.attn_compressor_ape,
+                                    layer.attn_compressor_norm,
+                                    comp_pos_part,
+                                    n_embd_head_k, n_rot, n_rows, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
+                        kv_comp_part = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp_part, n_rot);
+                        kv_comp = kv_comp == nullptr ? kv_comp_part : ggml_concat(ctx0, kv_comp, kv_comp_part, 2);
+
+                        prev_state = dsv4_build_compressor_prefill_state(ctx0, cur_part,
+                                layer.attn_compressor_kv,
+                                layer.attn_compressor_gate,
+                                layer.attn_compressor_ape,
+                                n_embd_head_k,
+                                n_rows,
+                                compress_ratio);
+                        have_prev_state = true;
+                    }
+                } else {
+                    ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
+                    comp_pos = ggml_cast(ctx0, comp_pos, GGML_TYPE_I32);
+
+                    kv_comp = dsv4_build_compressor_prefill(ctx0, cur,
+                            layer.attn_compressor_kv,
+                            layer.attn_compressor_gate,
+                            layer.attn_compressor_ape,
+                            layer.attn_compressor_norm,
+                            comp_pos,
+                            n_embd_head_k, n_rot, n_tokens, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
+                    kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
+                }
                 cb(kv_comp, "KVcompress", il);
 
                 store_attn_cache_rows(kv_comp, 0, n_comp);
 
+                kv_comp_all = kv_comp;
                 k_all = ggml_concat(ctx0, kv, kv_comp, 2);
                 v_all = k_all;
 
                 if (compress_ratio == 4) {
-                    ggml_tensor * raw_mask = get_dsv4_inputs()->add_mask(ctx0,
-                            dsv4_mask_kind::RAW_WINDOW,
-                            n_tokens, n_tokens,
-                            n_tokens, n_comp, hparams.n_swa, compress_ratio,
-                            "dsv4_attn_raw_window_mask");
-                    ggml_tensor * index_mask = get_dsv4_inputs()->add_mask(ctx0,
-                            dsv4_mask_kind::COMPRESS_CAUSAL,
-                            n_comp, n_tokens,
-                            0, n_comp, 0, compress_ratio,
-                            "dsv4_indexer_causal_mask");
+                    ggml_tensor * index_kv = nullptr;
+                    if (segment_compress_prefill) {
+                        dsv4_state_pair prev_state = {};
+                        bool have_prev_state = false;
+                        for (int64_t row_start = 0; row_start < n_tokens; row_start += dsv4_compress_prefill_segment) {
+                            const int64_t n_rows = std::min<int64_t>(dsv4_compress_prefill_segment, n_tokens - row_start);
+                            const int64_t n_comp_part = n_rows / compress_ratio;
+                            if (n_comp_part <= 0) {
+                                continue;
+                            }
 
-                    ggml_tensor * index_kv = dsv4_build_compressor_prefill(ctx0, cur,
-                            layer.indexer_compressor_kv,
-                            layer.indexer_compressor_gate,
-                            layer.indexer_compressor_ape,
-                            layer.indexer_compressor_norm,
-                            comp_pos,
-                            hparams.indexer_head_size, n_rot, n_tokens, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
-                    index_kv = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_kv);
+                            ggml_tensor * cur_part = ggml_view_2d(ctx0, cur,
+                                    cur->ne[0], n_rows,
+                                    cur->nb[1],
+                                    row_start*cur->nb[1]);
+                            ggml_tensor * comp_pos_part = ggml_arange(ctx0,
+                                    float(row_start),
+                                    float(row_start + n_comp_part*compress_ratio),
+                                    float(compress_ratio));
+                            comp_pos_part = ggml_cast(ctx0, comp_pos_part, GGML_TYPE_I32);
+
+                            ggml_tensor * index_kv_part = have_prev_state
+                                ? dsv4_build_compressor_prefill_with_overlap(ctx0, cur_part,
+                                        prev_state.kv,
+                                        prev_state.score,
+                                        layer.indexer_compressor_kv,
+                                        layer.indexer_compressor_gate,
+                                        layer.indexer_compressor_ape,
+                                        layer.indexer_compressor_norm,
+                                        comp_pos_part,
+                                        hparams.indexer_head_size, n_rot, n_rows, compress_ratio, row_start, rope_type, rope_cfg, norm_rms_eps)
+                                : dsv4_build_compressor_prefill(ctx0, cur_part,
+                                        layer.indexer_compressor_kv,
+                                        layer.indexer_compressor_gate,
+                                        layer.indexer_compressor_ape,
+                                        layer.indexer_compressor_norm,
+                                        comp_pos_part,
+                                        hparams.indexer_head_size, n_rot, n_rows, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
+                            index_kv_part = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_kv_part);
+                            index_kv = index_kv == nullptr ? index_kv_part : ggml_concat(ctx0, index_kv, index_kv_part, 2);
+
+                            prev_state = dsv4_build_compressor_prefill_state(ctx0, cur_part,
+                                    layer.indexer_compressor_kv,
+                                    layer.indexer_compressor_gate,
+                                    layer.indexer_compressor_ape,
+                                    hparams.indexer_head_size,
+                                    n_rows,
+                                    compress_ratio);
+                            have_prev_state = true;
+                        }
+                    } else {
+                        ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
+                        comp_pos = ggml_cast(ctx0, comp_pos, GGML_TYPE_I32);
+
+                        index_kv = dsv4_build_compressor_prefill(ctx0, cur,
+                                layer.indexer_compressor_kv,
+                                layer.indexer_compressor_gate,
+                                layer.indexer_compressor_ape,
+                                layer.indexer_compressor_norm,
+                                comp_pos,
+                                hparams.indexer_head_size, n_rot, n_tokens, compress_ratio, rope_type, rope_cfg, norm_rms_eps);
+                        index_kv = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_kv);
+                    }
                     cb(index_kv, "indexer_KVcompress", il);
+                    index_kv_all = index_kv;
 
                     store_index_cache_rows(index_kv, 0, n_comp);
 
-                    ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
-                            cur, qr, index_kv,
-                            layer.indexer_attn_q_b,
-                            layer.indexer_proj,
-                            inp_pos,
-                            index_mask,
-                            hparams.indexer_n_head,
-                            hparams.indexer_head_size,
-                            n_tokens,
-                            n_rot,
-                            rope_type,
-                            rope_cfg);
-                    cb(index_scores, "indexer_scores", il);
+                    if (should_segment_compress_attention(n_tokens, n_comp)) {
+                        segment_compress_attention = true;
+                    } else {
+                        ggml_tensor * raw_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                dsv4_mask_kind::RAW_WINDOW,
+                                n_tokens, n_tokens,
+                                n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                                "dsv4_attn_raw_window_mask");
+                        raw_attn_mask = raw_mask;
 
-                    const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
-                    ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
-                    cb(topk, "indexer_topk", il);
+                        ggml_tensor * index_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                dsv4_mask_kind::COMPRESS_CAUSAL,
+                                n_comp, n_tokens,
+                                0, n_comp, 0, compress_ratio,
+                                "dsv4_indexer_causal_mask");
 
-                    ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
-                    cb(comp_mask, "dsv4_attn_compress_mask", il);
+                        ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
+                                cur, qr, index_kv,
+                                layer.indexer_attn_q_b,
+                                layer.indexer_proj,
+                                inp_pos,
+                                index_mask,
+                                hparams.indexer_n_head,
+                                hparams.indexer_head_size,
+                                n_tokens,
+                                n_rot,
+                                rope_type,
+                                rope_cfg);
+                        cb(index_scores, "indexer_scores", il);
 
-                    attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+                        const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
+                        ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                        cb(topk, "indexer_topk", il);
+
+                        ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                        cb(comp_mask, "dsv4_attn_compress_mask", il);
+
+                        attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+                    }
                 } else {
-                    attn_mask = get_dsv4_inputs()->add_mask(ctx0,
-                            dsv4_mask_kind::ATTN_STATIC,
-                            n_tokens + n_comp, n_tokens,
-                            n_tokens, n_comp, hparams.n_swa, compress_ratio,
-                            "dsv4_attn_static_mask");
+                    if (should_segment_compress_attention(n_tokens, n_comp)) {
+                        segment_compress_attention = true;
+                    } else {
+                        raw_attn_mask = get_dsv4_inputs()->add_mask(ctx0,
+                                dsv4_mask_kind::ATTN_STATIC,
+                                n_tokens + n_comp, n_tokens,
+                                n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                                "dsv4_attn_static_mask");
+                        attn_mask = raw_attn_mask;
+                    }
                 }
             } else {
-                attn_mask = get_dsv4_inputs()->add_mask(ctx0,
+                raw_attn_mask = get_dsv4_inputs()->add_mask(ctx0,
                         dsv4_mask_kind::RAW_WINDOW,
                         n_tokens, n_tokens,
                         n_tokens, 0, hparams.n_swa, compress_ratio,
                         "dsv4_attn_raw_window_mask");
+                attn_mask = raw_attn_mask;
             }
 
             if (!is_prefill) {
                 const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
                 const int64_t n_comp_before  = first_pos / compress_ratio;
-                const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
+                n_comp_visible = (last_pos + 1) / compress_ratio;
                 const int64_t n_comp_new     = n_comp_visible - n_comp_before;
                 const bool aligned_chunk_prefill =
                         n_tokens > 1 &&
                         first_pos % compress_ratio == 0;
                 const int64_t n_comp_cache = mctx_dsv4->get_dsv4_n_comp(il);
                 GGML_ASSERT(n_comp_visible <= n_comp_cache);
+                ggml_tensor * kv_comp_new = nullptr;
+                ggml_tensor * index_kv_new = nullptr;
+                auto build_visible_comp_cache = [&](ggml_tensor * cache, ggml_tensor * new_rows) -> ggml_tensor * {
+                    if (n_comp_visible <= 0) {
+                        return nullptr;
+                    }
+                    if (new_rows != nullptr && n_comp_new > 0) {
+                        GGML_ASSERT(new_rows->ne[2] == n_comp_new);
+                        if (new_rows->type != cache->type) {
+                            new_rows = ggml_cast(ctx0, new_rows, cache->type);
+                        }
+                        if (n_comp_before > 0) {
+                            ggml_tensor * cached_before = dsv4_cache_view_3d(ctx0, cache, n_comp_before);
+                            return ggml_concat(ctx0, cached_before, new_rows, 2);
+                        }
+                        return new_rows;
+                    }
+                    return dsv4_cache_view_3d(ctx0, cache, n_comp_visible);
+                };
 
                 if (aligned_chunk_prefill) {
                     dsv4_state_pair state = dsv4_build_compressor_prefill_state(ctx0, cur,
@@ -1274,8 +1520,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                 layer.attn_compressor_norm,
                                 comp_pos,
                                 n_embd_head_k, n_rot, n_tokens, compress_ratio, first_pos, rope_type, rope_cfg, norm_rms_eps);
-                        kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
-                        store_attn_cache_rows(kv_comp, n_comp_before, n_comp_new);
+                        kv_comp_new = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
+                        cb(kv_comp_new, "KVcompress", il);
+                        store_attn_cache_rows(kv_comp_new, n_comp_before, n_comp_new);
                     }
                 } else {
                     dsv4_decode_compressor dec = n_tokens == 1
@@ -1313,19 +1560,24 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
 
                     if (dec.kv_comp != nullptr) {
-                        dec.kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
-                        store_attn_cache_rows(dec.kv_comp, n_comp_before, n_comp_new);
+                        kv_comp_new = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
+                        store_attn_cache_rows(kv_comp_new, n_comp_before, n_comp_new);
                     }
                 }
 
                 ggml_tensor * k_raw = mctx_swa->get_k(ctx0, il);
                 k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head_k, 1, k_raw->ne[2]);
+                k_raw_cache_all = k_raw;
                 k_all = k_raw;
                 v_all = k_raw;
-                attn_mask = inp_attn->self_kq_mask_swa;
+                raw_attn_mask = inp_attn->self_kq_mask_swa;
+                attn_mask = raw_attn_mask;
 
                 if (n_comp_visible > 0) {
-                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                    ggml_tensor * kv_comp_cache = build_visible_comp_cache(
+                            mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id),
+                            kv_comp_new);
+                    kv_comp_cache_all = kv_comp_cache;
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 
@@ -1361,8 +1613,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                         layer.indexer_compressor_norm,
                                         comp_pos,
                                         hparams.indexer_head_size, n_rot, n_tokens, compress_ratio, first_pos, rope_type, rope_cfg, norm_rms_eps);
-                                index_kv = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_kv);
-                                store_index_cache_rows(index_kv, n_comp_before, n_comp_new);
+                                index_kv_new = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_kv);
+                                cb(index_kv_new, "indexer_KVcompress", il);
+                                store_index_cache_rows(index_kv_new, n_comp_before, n_comp_new);
                             }
                         } else {
                             dsv4_decode_compressor index_dec = n_tokens == 1
@@ -1400,11 +1653,18 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             dsv4_store_state_segment(ctx0, gf, index_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
 
                             if (index_dec.kv_comp != nullptr) {
-                                index_dec.kv_comp = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_dec.kv_comp);
-                                store_index_cache_rows(index_dec.kv_comp, n_comp_before, n_comp_new);
+                                index_kv_new = ggml_dsv4_hadamard_fp4_quantize(ctx0, index_dec.kv_comp);
+                                store_index_cache_rows(index_kv_new, n_comp_before, n_comp_new);
                             }
                         }
+                        index_kv_all = build_visible_comp_cache(
+                                mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id),
+                                index_kv_new);
+                    }
 
+                    if (should_segment_compress_attention(n_tokens, n_comp_visible)) {
+                        segment_compress_attention = true;
+                    } else if (compress_ratio == 4) {
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     dsv4_mask_kind::COMPRESS_CAUSAL,
@@ -1412,7 +1672,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                     0, n_comp_visible, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
-                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
+                            GGML_ASSERT(index_kv_all != nullptr);
+                            ggml_tensor * index_cache = index_kv_all;
                             index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
                             ggml_tensor * index_scores = n_tokens == 1
                                 ? dsv4_build_indexer_scores_decode(ctx0,
@@ -1427,7 +1688,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                         rope_type,
                                         rope_cfg)
                                 : dsv4_build_indexer_scores_prefill(ctx0,
-                                        cur, qr, dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible),
+                                        cur, qr, index_kv_all,
                                         layer.indexer_attn_q_b,
                                         layer.indexer_proj,
                                         inp_pos,
@@ -1458,21 +1719,165 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                 "dsv4_attn_compress_mask");
                     }
 
-                    attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
+                    if (comp_mask != nullptr) {
+                        attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
+                    }
                 }
             }
 
-            ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
-            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
-            cb(cur, "kqv_out", il);
+            if (segment_compress_attention) {
+                ggml_tensor * segment_raw_k = is_prefill ? kv : k_raw_cache_all;
+                ggml_tensor * segment_comp_k = is_prefill ? kv_comp_all : kv_comp_cache_all;
+                const int64_t segment_comp_total = is_prefill ? n_comp : n_comp_visible;
+                GGML_ASSERT(is_prefill || raw_attn_mask != nullptr);
+                GGML_ASSERT(segment_raw_k != nullptr);
+                GGML_ASSERT(segment_comp_k != nullptr);
+
+                const int64_t q_limit = is_prefill ?
+                        choose_compress_prefill_q_limit(segment_comp_total) :
+                        choose_compress_attention_q_limit(segment_comp_total);
+                ggml_tensor * attn_out_all = nullptr;
+                for (int64_t row_start = 0; row_start < n_tokens; row_start += q_limit) {
+                    const int64_t n_rows = std::min<int64_t>(q_limit, n_tokens - row_start);
+                    const int64_t q_abs_end = (is_prefill ? 0 : (ubatch.pos ? ubatch.pos[0] : 0)) + row_start + n_rows;
+                    const int64_t raw_key_start = is_prefill ?
+                            std::max<int64_t>(0, row_start + 1 - hparams.n_swa) :
+                            0;
+                    const int64_t raw_key_end = is_prefill ?
+                            row_start + n_rows :
+                            std::min<int64_t>(segment_raw_k->ne[2], raw_attn_mask->ne[0]);
+                    const int64_t n_raw_keys = raw_key_end - raw_key_start;
+                    const int64_t n_comp_keys = std::min<int64_t>(segment_comp_total, q_abs_end / compress_ratio);
+                    GGML_ASSERT(n_raw_keys > 0);
+
+                    ggml_tensor * q_part = ggml_view_3d(ctx0, q,
+                            q->ne[0], q->ne[1], n_rows,
+                            q->nb[1], q->nb[2], row_start*q->nb[2]);
+                    ggml_tensor * k_raw_part = ggml_view_3d(ctx0, segment_raw_k,
+                            segment_raw_k->ne[0], segment_raw_k->ne[1], n_raw_keys,
+                            segment_raw_k->nb[1], segment_raw_k->nb[2], raw_key_start*segment_raw_k->nb[2]);
+                    ggml_tensor * k_part = k_raw_part;
+                    if (n_comp_keys > 0) {
+                        ggml_tensor * k_comp_part = ggml_view_3d(ctx0, segment_comp_k,
+                                segment_comp_k->ne[0], segment_comp_k->ne[1], n_comp_keys,
+                                segment_comp_k->nb[1], segment_comp_k->nb[2], 0);
+                        k_part = ggml_concat(ctx0, k_raw_part, k_comp_part, 2);
+                    }
+
+                    ggml_tensor * raw_mask_part = nullptr;
+                    if (is_prefill) {
+                        raw_mask_part = get_dsv4_inputs()->add_mask(ctx0,
+                                dsv4_mask_kind::RAW_WINDOW,
+                                n_raw_keys, n_rows,
+                                n_raw_keys, 0, hparams.n_swa, compress_ratio,
+                                "dsv4_attn_split_raw_window_mask",
+                                row_start, raw_key_start);
+                    } else {
+                        raw_mask_part = ggml_view_2d(ctx0, raw_attn_mask,
+                                n_raw_keys, n_rows,
+                                raw_attn_mask->nb[1],
+                                row_start*raw_attn_mask->nb[1]);
+                    }
+                    raw_mask_part = ggml_cont(ctx0, raw_mask_part);
+                    if (cparams.flash_attn) {
+                        raw_mask_part = ggml_cast(ctx0, raw_mask_part, GGML_TYPE_F16);
+                    }
+                    ggml_tensor * mask_part = raw_mask_part;
+                    if (n_comp_keys > 0) {
+                        ggml_tensor * comp_mask_part = nullptr;
+                        if (compress_ratio == 4) {
+                            ggml_tensor * cur_part = ggml_view_2d(ctx0, cur,
+                                    cur->ne[0], n_rows,
+                                    cur->nb[1],
+                                    row_start*cur->nb[1]);
+                            ggml_tensor * qr_part = ggml_view_2d(ctx0, qr,
+                                    qr->ne[0], n_rows,
+                                    qr->nb[1],
+                                    row_start*qr->nb[1]);
+                            ggml_tensor * inp_pos_part = ggml_view_1d(ctx0, inp_pos,
+                                    n_rows,
+                                    row_start*inp_pos->nb[0]);
+                            ggml_tensor * index_kv_src = index_kv_all != nullptr ?
+                                    index_kv_all :
+                                    dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_keys);
+                            ggml_tensor * index_kv_part = ggml_view_3d(ctx0, index_kv_src,
+                                    index_kv_src->ne[0], index_kv_src->ne[1], n_comp_keys,
+                                    index_kv_src->nb[1], index_kv_src->nb[2], 0);
+                            ggml_tensor * index_mask_part = get_dsv4_inputs()->add_mask(ctx0,
+                                    dsv4_mask_kind::COMPRESS_CAUSAL,
+                                    n_comp_keys, n_rows,
+                                    0, n_comp_keys, 0, compress_ratio,
+                                    "dsv4_indexer_split_causal_mask",
+                                    row_start);
+                            ggml_tensor * index_scores_part = dsv4_build_indexer_scores_prefill(ctx0,
+                                    cur_part, qr_part, index_kv_part,
+                                    layer.indexer_attn_q_b,
+                                    layer.indexer_proj,
+                                    inp_pos_part,
+                                    index_mask_part,
+                                    hparams.indexer_n_head,
+                                    hparams.indexer_head_size,
+                                    n_rows,
+                                    n_rot,
+                                    rope_type,
+                                    rope_cfg);
+                            cb(index_scores_part, "indexer_scores", il);
+
+                            const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_keys);
+                            ggml_tensor * topk_part = ggml_argsort_top_k(ctx0, index_scores_part, top_k);
+                            cb(topk_part, "indexer_topk", il);
+                            comp_mask_part = dsv4_build_compressed_mask_from_topk(ctx0, index_scores_part, topk_part);
+                            cb(comp_mask_part, "dsv4_attn_compress_mask", il);
+                            if (cparams.flash_attn) {
+                                comp_mask_part = ggml_cast(ctx0, comp_mask_part, GGML_TYPE_F16);
+                            }
+                        } else {
+                            comp_mask_part = get_dsv4_inputs()->add_mask(ctx0,
+                                    dsv4_mask_kind::COMPRESS_CAUSAL,
+                                    n_comp_keys, n_rows,
+                                    0, n_comp_keys, 0, compress_ratio,
+                                    "dsv4_attn_split_compress_mask",
+                                    row_start);
+                            if (cparams.flash_attn) {
+                                comp_mask_part = ggml_cast(ctx0, comp_mask_part, GGML_TYPE_F16);
+                            }
+                        }
+                        mask_part = ggml_concat(ctx0, raw_mask_part, comp_mask_part, 0);
+                    }
+                    mask_part = ggml_cont(ctx0, mask_part);
+
+                    ggml_tensor * cur_part = build_attn_mha(q_part, k_part, k_part, nullptr, mask_part,
+                            layer.attn_sinks, nullptr, kq_scale, il);
+                    cb(cur_part, "kqv_out", il);
+                    ggml_tensor * inp_pos_part = ggml_view_1d(ctx0, inp_pos, n_rows, row_start*inp_pos->nb[0]);
+                    cur_part = ggml_reshape_3d(ctx0, cur_part, n_embd_head_v, n_head, n_rows);
+                    cur_part = dsv4_apply_rope_tail(ctx0, cur_part, inp_pos_part,
+                            n_embd_head_v, n_head, n_rows, n_rot, rope_type,
+                            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+                    cur_part = dsv4_grouped_out(ctx0, cur_part, layer.attn_wo_a, layer.attn_wo_b,
+                            n_embd_head_v, n_head, n_out_group, n_lora_o, n_rows);
+                    attn_out_all = attn_out_all == nullptr ? cur_part : ggml_concat(ctx0, attn_out_all, cur_part, 1);
+                }
+                cur = attn_out_all;
+                cur_is_attn_projected = true;
+            } else {
+                ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
+                cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
+            }
+            if (!cur_is_attn_projected) {
+                cb(cur, "kqv_out", il);
+            }
         }
-        cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
-        cur = dsv4_apply_rope_tail(ctx0, cur, inp_pos,
-                n_embd_head_v, n_head, n_tokens, n_rot, rope_type,
-                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
-                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
-        cur = dsv4_grouped_out(ctx0, cur, layer.attn_wo_a, layer.attn_wo_b,
-                n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+        if (!cur_is_attn_projected) {
+            cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
+            cur = dsv4_apply_rope_tail(ctx0, cur, inp_pos,
+                    n_embd_head_v, n_head, n_tokens, n_rot, rope_type,
+                    rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                    rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+            cur = dsv4_grouped_out(ctx0, cur, layer.attn_wo_a, layer.attn_wo_b,
+                    n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+        }
         cb(cur, "attn_out", il);
         inpL = dsv4_hc_post(ctx0, cur, residual, mix.post, mix.comb, n_embd, n_hc, n_tokens);
         cb(inpL, "hc_attn_post", il);

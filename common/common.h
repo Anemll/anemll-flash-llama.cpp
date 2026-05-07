@@ -422,6 +422,7 @@ struct common_params {
     bool    n_ubatch_explicit     = false; // true when -ub/--ubatch-size (or env alias) was set by the user
     int32_t moe_prefill_batch     =     0; // prefill-only logical batch override for --moe-prefill-layer-major (0 = follow n_batch)
     int32_t moe_prefill_micro_batch =   0; // prefill-only expert compute micro-batch (0 = follow prefill batch, -1 = auto)
+    bool    moe_force_prefill_batch = false; // accept large --moe-prefill-batch values; model memory may still split internally while DSv4 true-slab sizing stays behind explicit envs
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

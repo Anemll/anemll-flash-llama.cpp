@@ -127,12 +127,13 @@ static ggml_tensor * build_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        ggml_type type = GGML_TYPE_F32) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens/n_stream, 1, n_stream);
+    return ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
 }
 
 static bool can_reuse_kq_mask(

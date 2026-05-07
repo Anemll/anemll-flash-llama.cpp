@@ -46,6 +46,7 @@ struct llama_cparams {
     bool moe_shared_only;
     bool moe_router_only;
     bool moe_sort_decode_expert_ids;
+    bool moe_force_prefill_batch;
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;

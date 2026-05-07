@@ -452,6 +452,7 @@ extern "C" {
         bool moe_shared_only; // bypass routed experts during graph build and keep shared experts only
         bool moe_router_only; // keep routed gating/top-k active but bypass routed expert matmuls
         bool moe_sort_decode_expert_ids; // sort single-token Flash-MoE routed decode experts by ascending expert id before routed MLP
+        bool moe_force_prefill_batch; // accept large moe_prefill_batch values; model memory may still split internally while DSv4 true-slab sizing stays behind explicit envs
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
