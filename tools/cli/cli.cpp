@@ -384,6 +384,7 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    bool show_prefill_timing;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1;
     int reasoning_budget = -1;
@@ -404,6 +405,7 @@ struct cli_context {
         // defaults.return_progress = true; // TODO: show progress
 
         verbose_prompt = params.verbose_prompt;
+        show_prefill_timing = params.show_timings && params.moe_prefill_layer_major;
         reasoning_format = params.reasoning_format;
         enable_reasoning = params.enable_reasoning;
         reasoning_budget = params.reasoning_budget;
@@ -493,8 +495,23 @@ private:
         bool defer_initial_content = suppress_raw_thinking && reasoning_format != COMMON_REASONING_FORMAT_NONE;
         bool saw_reasoning_delta = false;
         bool inside_raw_think = false;
+        bool printed_prefill_timing = false;
         std::string raw_think_scan_buf;
         std::string deferred_content_buf;
+
+        auto maybe_print_prefill_timing = [&](const result_timings & timings) {
+            if (!show_prefill_timing || printed_prefill_timing || timings.prompt_n <= 0 || timings.prompt_per_second <= 0) {
+                return;
+            }
+
+            console::set_display(DISPLAY_TYPE_INFO);
+            console::log("[ Flash-MoE prefill: %.1f t/s | tokens: %d | %.1f ms ]\n",
+                    timings.prompt_per_second,
+                    timings.prompt_n,
+                    timings.prompt_ms);
+            console::set_display(DISPLAY_TYPE_RESET);
+            printed_prefill_timing = true;
+        };
 
         auto emit_content = [&](const std::string & text) {
             if (text.empty()) {
@@ -584,6 +601,7 @@ private:
             auto res_partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get());
             if (res_partial) {
                 out_timings = std::move(res_partial->timings);
+                maybe_print_prefill_timing(out_timings);
                 if (raw_prompt.has_value()) {
                     emit_content(res_partial->content);
                     result = rd.next(should_stop);
@@ -618,6 +636,7 @@ private:
             auto res_final = dynamic_cast<server_task_result_cmpl_final *>(result.get());
             if (res_final) {
                 out_timings = std::move(res_final->timings);
+                maybe_print_prefill_timing(out_timings);
                 break;
             }
             result = rd.next(should_stop);

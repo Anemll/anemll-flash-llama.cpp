@@ -2532,7 +2532,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-sort-decode-expert-ids"},
         {"--no-moe-sort-decode-expert-ids"},
-        string_format("for single-token Flash-MoE decode, sort routed experts by ascending expert id before the routed MLP so weights and matmuls follow the same reordered top-k list (default: %s)", params.moe_sort_decode_expert_ids ? "enabled" : "disabled"),
+        string_format("for single-token Flash-MoE decode, sort routed experts by ascending expert id before the routed MLP so weights and matmuls follow the same reordered top-k list; disabled for DeepSeek V4 in this build (default: %s)", params.moe_sort_decode_expert_ids ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.moe_sort_decode_expert_ids = value;
         }

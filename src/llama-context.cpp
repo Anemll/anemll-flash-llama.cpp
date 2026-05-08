@@ -341,6 +341,15 @@ static bool llama_moe_deepseek4_allow_true_prefill_slab() {
     return enabled == 1;
 }
 
+static bool flash_moe_release_prefill_reserve_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = flash_moe_env_flag_enabled("LLAMA_FLASH_MOE_RELEASE_PREFILL_RESERVE", false) ? 1 : 0;
+    }
+
+    return enabled == 1;
+}
+
 static constexpr uint32_t LLAMA_MOE_DSV4_TRUE_PREFILL_SLAB_VALIDATED_MAX = 32u*1024u;
 
 static bool llama_moe_deepseek4_allow_broken_true_prefill_slab() {
@@ -583,6 +592,7 @@ static bool flash_moe_prefill_metal_split_glu_supported(ggml_type type) {
             return false;
     }
 }
+#endif
 
 static bool flash_moe_prefill_split_glu_compare_enabled() {
     static int enabled = -1;
@@ -641,6 +651,7 @@ static bool flash_moe_debug_op_emission_enabled() {
     return enabled == 1;
 }
 
+#ifdef GGML_USE_METAL
 static int32_t flash_moe_prefill_m5_split_repack_min_visible_cols() {
     static int32_t min_cols = -1;
     if (min_cols == -1) {
@@ -2829,8 +2840,6 @@ private:
             const bool metal_expert_mm_chunk_too_small = false;
             const bool metal_expert_mm_unsupported_quant = false;
             const bool metal_expert_mm_capable = false;
-            const bool metal_split_repack_capable = false;
-            const bool metal_split_glu_capable = false;
 #endif
 
             if (flash_moe_debug_op_emission_enabled()) {
@@ -2880,7 +2889,9 @@ private:
             const bool use_fp16_expert_mm_activations =
                     metal_expert_mm_capable &&
                     flash_moe_in_memory_prefill_fp16_activations_enabled();
+#ifdef GGML_USE_METAL
             const bool prefer_metal_expert_mm_path = use_fp16_expert_mm_activations;
+#endif
 
             ggml_tensor * cur_in = ggml_new_tensor_2d(temp_ctx, GGML_TYPE_F32, n_embd, chunk_tokens);
             ggml_tensor * cur_in_mm = nullptr;
@@ -2890,10 +2901,12 @@ private:
             ggml_tensor * down_w = nullptr;
             ggml_tensor * out = nullptr;
             ggml_tensor * out_mm = nullptr;
+#ifdef GGML_USE_METAL
             ggml_tensor * gate_ref = nullptr;
             ggml_tensor * up_ref = nullptr;
             ggml_tensor * act_ref = nullptr;
             ggml_tensor * fused_split_ref = nullptr;
+#endif
 
             auto build_swiglu_act = [&](ggml_tensor * gate, ggml_tensor * up) -> ggml_tensor * {
                 if (!use_limited_swiglu) {
@@ -2925,6 +2938,7 @@ private:
                 ggml_tensor * act = ggml_geglu_split(temp_ctx, gate, up);
                 out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, down_w, act));
 
+#ifdef GGML_USE_METAL
                 if (metal_expert_mm_capable) {
                     ggml_tensor * mm_cur_in = cur_in_mm != nullptr ? cur_in_mm : cur_in;
                     ggml_tensor * gate_up_f16 = flash_moe_prefill_mul_mat_f16(temp_ctx, gate_up_w, mm_cur_in);
@@ -2938,6 +2952,7 @@ private:
                     ggml_set_name(down_mm, "flashmoe_prefill_expert_mm_down");
                     out_mm = ggml_cont(temp_ctx, down_mm);
                 }
+#endif
             } else {
                 gate_w = ggml_new_tensor_2d(temp_ctx, gate_entry->quant_type, state.gate_tensor->ne[0], state.gate_tensor->ne[1]);
                 up_w = ggml_new_tensor_2d(temp_ctx, up_entry->quant_type, state.up_tensor->ne[0], state.up_tensor->ne[1]);
@@ -2951,10 +2966,13 @@ private:
                 ggml_tensor * up = ggml_mul_mat(temp_ctx, up_w, cur_in);
                 ggml_tensor * act = build_swiglu_act(gate, up);
                 out = ggml_cont(temp_ctx, ggml_mul_mat(temp_ctx, down_w, act));
+#ifdef GGML_USE_METAL
                 gate_ref = gate;
                 up_ref = up;
                 act_ref = act;
+#endif
 
+#ifdef GGML_USE_METAL
                 if (metal_split_glu_capable && !prefer_metal_expert_mm_path) {
                     ggml_tensor * fused_mm = flash_moe_prefill_split_glu(temp_ctx, gate_w, up_w, down_w, cur_in, GGML_GLU_OP_SWIGLU);
                     ggml_set_name(fused_mm, "flashmoe_prefill_split_mlp_out");
@@ -2972,6 +2990,7 @@ private:
                     ggml_set_name(down_mm, "flashmoe_prefill_expert_mm_down");
                     out_mm = ggml_cont(temp_ctx, down_mm);
                 }
+#endif
             }
 
             ggml_cgraph * temp_graph = ggml_new_graph_custom(temp_ctx, 32, false);
@@ -4020,6 +4039,8 @@ private:
                         const bool use_metal_expert_mm_for_chunk =
                                 use_metal_expert_mm_for_expert &&
                                 ref_chunk > 8;
+#ifdef GGML_USE_METAL
+                        static bool split_glu_stage_compare_done = false;
                         const bool use_metal_split_repack_for_chunk =
                                 metal_split_repack_capable &&
                                 ref_chunk <= 8;
@@ -4038,7 +4059,6 @@ private:
                                         0);
                             }
                         }
-                        static bool split_glu_stage_compare_done = false;
                         const bool debug_compare_split_glu =
                                 !split_glu_stage_compare_done &&
                                 flash_moe_prefill_split_glu_compare_enabled() &&
@@ -4049,6 +4069,9 @@ private:
                                 act_ref != nullptr &&
                                 ref_chunk == int32_t(chunk_tokens) &&
                                 use_metal_expert_mm_for_chunk;
+#else
+                        const bool debug_compare_split_glu = false;
+#endif
                         const int64_t t_compute_start_us = ggml_time_us();
                         const int64_t t_chunk_start_us = profile_m5_chunks ? t_compute_start_us : 0;
                         int64_t chunk_gather_us = 0;
@@ -4235,7 +4258,9 @@ private:
                             log_stage_diff("act",  act_ref,  &act_mm_tmp);
                             log_stage_diff("out",  out,      out_mm);
 #endif
+#ifdef GGML_USE_METAL
                             split_glu_stage_compare_done = true;
+#endif
                         }
 
                         ggml_tensor * active_out = use_metal_expert_mm_for_chunk ? out_mm : out;
@@ -4271,6 +4296,7 @@ private:
                     }
                 }
 
+#ifdef GGML_USE_METAL
                 if (flash_moe_prefill_m5_split_repack_debug_enabled() && split_repack_stats.candidate_chunks > 0) {
                     std::fprintf(stderr,
                             "%s: split_repack_summary layer=%d candidates=%" PRIu64 " used=%" PRIu64 " used_stage1_only=%" PRIu64 " skipped_not_capable=%" PRIu64 " skipped_type=%" PRIu64 " skipped_gate=%" PRIu64 " skipped_down=%" PRIu64 "\n",
@@ -4285,6 +4311,7 @@ private:
                             split_repack_stats.skipped_down_slices);
                     std::fflush(stderr);
                 }
+#endif
 
                 if (!next_batch_future.valid()) {
                     break;
@@ -4633,7 +4660,9 @@ private:
         const char * ansi_compute = use_colors ? "\033[1m\x1b[38;5;226m" : "";
         const char * ansi_balanced = use_colors ? "\033[1m\x1b[38;5;82m" : "";
         const char * ansi_slot_hit = use_colors ? "\033[1m\x1b[38;5;82m" : "";
+#ifdef GGML_USE_METAL
         const char * ansi_replay_hit = use_colors ? "\033[1m\x1b[38;5;214m" : "";
+#endif
 
         LLAMA_LOG_INFO("%s: %sLegend%s\n", __func__, ansi_label, ansi_reset);
         if (prefill_profile) {
@@ -10354,6 +10383,16 @@ llama_context::llama_context(
                 __func__);
     }
 
+    if (cparams.moe_sort_decode_expert_ids && model.arch == LLM_ARCH_DEEPSEEK4) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr,
+                    "warning: %s: disabling --moe-sort-decode-expert-ids for DeepSeek V4; this architecture's routed decode is not order-invariant with the current slot-bank graph\n",
+                    __func__);
+        }
+        cparams.moe_sort_decode_expert_ids = false;
+    }
+
     if (cparams.moe_sort_decode_expert_ids) {
         if (model.flash_moe_slot_bank_enabled()) {
             LLAMA_LOG_INFO("%s: --moe-sort-decode-expert-ids is enabled; single-token Flash-MoE decode will reorder routed experts by ascending expert id before routed MLP execution\n",
@@ -10790,6 +10829,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = n_tokens_target;
+    const bool allow_flash_moe_prefill_reserve = n_tokens_hint > 1;
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -10816,7 +10856,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
 
     // resolve automatic Flash Attention use
     if (cparams.auto_fa) {
-        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true, nullptr, false);
         if (!gf) {
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
@@ -10859,7 +10899,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
         if (cparams.fused_gdn_ar) {
-            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true, nullptr, false);
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (autoregressive)");
             }
@@ -10900,7 +10940,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
             // it with t_embd which is reduced to [n_outputs, ...] via out_ids. if n_outputs != n_tokens,
             // the ggml_mul_mat assertion fails. this matches the pp reservation below (line ~553).
             const uint32_t n_tokens_ch = 16*n_seqs;
-            auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true);
+            auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true, nullptr, false);
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (chunked)");
             }
@@ -10947,13 +10987,14 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
+                allow_flash_moe_prefill_reserve);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), false, nullptr, allow_flash_moe_prefill_reserve);
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -10966,7 +11007,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc, nullptr, false);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -10981,7 +11022,8 @@ void llama_context::sched_reserve(uint32_t n_tokens_hint) {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc, nullptr,
+                allow_flash_moe_prefill_reserve);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -11025,6 +11067,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    const int64_t eval_wall_us = t_compute_start_us > 0 ? ggml_time_us() - t_compute_start_us : 0;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -11033,17 +11076,16 @@ void llama_context::synchronize() {
     // add the evaluation to the stats
     if (n_queued_tokens == 1) {
         if (!cparams.no_perf) {
-            t_eval_us += ggml_time_us() - t_compute_start_us;
+            t_eval_us += eval_wall_us;
         }
         n_eval++;
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
-            t_p_eval_us += ggml_time_us() - t_compute_start_us;
+            t_p_eval_us += eval_wall_us;
         }
         n_p_eval += n_queued_tokens;
     }
 
-    const int64_t eval_wall_us = t_compute_start_us > 0 ? ggml_time_us() - t_compute_start_us : 0;
     if (eval_wall_us > 0) {
         if (flash_moe_queued_eval_kind == 2 ||
                 (flash_moe_queued_eval_kind == 0 && flash_moe_active_runtime == flash_moe_slot_runtime.get())) {
@@ -11054,6 +11096,18 @@ void llama_context::synchronize() {
             flash_moe_prefill_eval_us += eval_wall_us;
             flash_moe_prefill_eval_tokens += n_queued_tokens;
         }
+    }
+
+    if (!cparams.no_perf &&
+            (flash_moe_slot_runtime || flash_moe_prefill_runtime) &&
+            n_queued_tokens > 8 &&
+            eval_wall_us > 0) {
+        flash_moe_prefill_inline_progress_close_line_if_needed();
+        LLAMA_LOG_INFO("%s: Flash-MoE prefill throughput = %.2f t/s (%" PRId64 " tokens in %.2f ms)\n",
+                __func__,
+                1e6 * double(n_queued_tokens) / double(eval_wall_us),
+                n_queued_tokens,
+                double(eval_wall_us) / 1000.0);
     }
 
     // get a more accurate load time, upon first eval
@@ -12171,7 +12225,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
     const bool use_prefill_eval =
-            flash_moe_prefill_runtime && n_tokens_all > 1 && cparams.moe_prefill_batch > 0;
+            flash_moe_prefill_runtime &&
+            n_tokens_all > 1 &&
+            cparams.moe_prefill_batch > 0;
     const int flash_moe_eval_kind = use_prefill_eval ? 1 : (flash_moe_slot_runtime ? 2 : 0);
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
@@ -12508,27 +12564,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     if (use_prefill_eval) {
-        if (n_outputs_all == 0) {
+        auto finish_prefill_eval = [&](const char * label) {
             // Layer-major prefill batches before the final prompt token produce
-            // no logits, so no downstream read forces the Metal command buffer
-            // to finish. Synchronize before the next prefill slab reuses routed
-            // scratch/slot state.
+            // no logits, so no downstream read forces the backend work to finish.
+            // Synchronize here so routed scratch/slot state and perf counters are
+            // complete before the next prompt slab or decode step.
             const uint32_t prefill_reserved_n_tokens = sched_reserved_n_tokens;
             synchronize();
             if (prefill_reserved_n_tokens > cparams.n_ubatch) {
-                sched_need_reserve = true;
-                LLAMA_LOG_DEBUG("%s: prefill batch produced no outputs; releasing prefill compute reserve from %u to %u tokens\n",
-                        __func__, prefill_reserved_n_tokens, cparams.n_ubatch);
-                sched_reserve(cparams.n_ubatch);
+                if (flash_moe_release_prefill_reserve_enabled()) {
+                    sched_need_reserve = true;
+                    LLAMA_LOG_DEBUG("%s: prefill %s; releasing prefill compute reserve from %u to %u tokens\n",
+                            __func__, label, prefill_reserved_n_tokens, cparams.n_ubatch);
+                    sched_reserve(cparams.n_ubatch);
+                } else {
+                    LLAMA_LOG_DEBUG("%s: prefill %s; retaining prefill compute reserve at %u tokens for decode "
+                            "(set LLAMA_FLASH_MOE_RELEASE_PREFILL_RESERVE=1 to force release to %u)\n",
+                            __func__, label, prefill_reserved_n_tokens, cparams.n_ubatch);
+                }
             }
-        } else if (sched_reserved_n_tokens > cparams.n_ubatch) {
-            const uint32_t prefill_reserved_n_tokens = sched_reserved_n_tokens;
-            synchronize();
-            sched_need_reserve = true;
-            LLAMA_LOG_DEBUG("%s: prefill batch produced outputs; releasing prefill compute reserve from %u to %u tokens\n",
-                    __func__, prefill_reserved_n_tokens, cparams.n_ubatch);
-            sched_reserve(cparams.n_ubatch);
-        }
+        };
+
+        finish_prefill_eval(n_outputs_all == 0 ? "batch" : "complete");
     }
 
     return 0;
@@ -12740,7 +12797,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx,
+        bool split_only, size_t * sizes, bool allow_flash_moe_prefill) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -12776,7 +12834,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT, allow_flash_moe_prefill);
 
     res->reset();
 
@@ -12806,13 +12864,22 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                bool       allow_flash_moe_prefill) const {
     llm_flash_moe_slot_runtime_i * runtime = flash_moe_slot_runtime.get();
-    // Prompt ubatches can arrive either as one sequence with many tokens or as many
-    // single-token sequence sets packed into one multi-token batch. Use n_tokens so
-    // the layer-major prefill runtime catches both forms while single-token decode
-    // remains on the normal slot-bank runtime.
-    if (flash_moe_prefill_runtime && ubatch.n_tokens > 1) {
+    uint32_t n_outputs = 0;
+    if (ubatch.output != nullptr) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            n_outputs += ubatch.output[i] != 0;
+        }
+    }
+    // Layer-major prefill is for prompt-processing work where not every input
+    // token requests logits. Batched decode and TG reserve graphs can also have
+    // n_tokens > 1, but they mark every token as output and must stay slot-bank.
+    if (allow_flash_moe_prefill &&
+            flash_moe_prefill_runtime &&
+            ubatch.n_tokens > 1 &&
+            n_outputs < ubatch.n_tokens) {
         runtime = flash_moe_prefill_runtime.get();
     }
     flash_moe_active_runtime = runtime;

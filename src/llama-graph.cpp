@@ -1494,6 +1494,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     const bool sort_decode_expert_ids =
             cparams.moe_sort_decode_expert_ids &&
+            // DeepSeek V4 decode/prediction paths depend on the native top-k
+            // priority order. Sorting by expert id preserves the unordered MoE
+            // sum algebraically, but it can change top1 semantics and corrupt
+            // Flash-MoE slot-bank decode.
+            arch != LLM_ARCH_DEEPSEEK4 &&
             n_tokens == 1 &&
             n_expert_used > 1 &&
             flash_moe_slot_runtime != nullptr &&

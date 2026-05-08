@@ -799,6 +799,27 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+static __device__ __forceinline__ float ggml_cuda_f8_e4m3fn_to_fp32(uint8_t x) {
+    const uint8_t ax = x & 0x7F;
+
+    if (ax == 0x7F) {
+        const uint32_t bits = 0x7FFFFFFF;
+        float result;
+        memcpy(&result, &bits, sizeof(float));
+        return result;
+    }
+
+    const uint8_t e = ax >> 3;
+    const uint8_t m = ax & 0x07;
+
+    const uint32_t scale_bits = (uint32_t) (e == 0 ? 118 : e + 117) << 23;
+    float scale;
+    memcpy(&scale, &scale_bits, sizeof(float));
+
+    const float mag = float(e == 0 ? m : 8 + m) * scale;
+    return (x & 0x80) ? -mag : mag;
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
