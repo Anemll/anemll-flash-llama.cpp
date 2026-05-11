@@ -652,10 +652,12 @@ struct common_params {
     std::string moe_quant_map         = "";      // reserved dynamic-quant policy path                           // NOLINT
     std::string moe_demand_stripe     = "";      // experimental weighted demand striping, e.g. 5:1:1          // NOLINT
     std::string moe_demand_distribute = "";      // experimental whole-expert demand fanout, e.g. 1:1:1        // NOLINT
+    bool        moe_demand_concurrent = false;   // race full demand reads between primary and secondary sidecars // NOLINT
     std::string moe_prefill_stripe    = "";      // experimental prefill-only weighted striping, e.g. 3:2:2    // NOLINT
     std::string moe_prefill_distribute = "";     // experimental prefill-only whole-expert fanout, e.g. 1:1:1 // NOLINT
     std::string moe_prefetch_stripe   = "";      // experimental weighted prefetch striping, e.g. 0:1:1        // NOLINT
     std::string moe_prefetch_distribute = "";    // experimental whole-expert prefetch fanout, e.g. 1:1:1      // NOLINT
+    std::string moe_predictor         = "";      // raw Flash-MoE hidden-state predictor directory             // NOLINT
     std::string oracle_dump           = "";      // llama-cli tensor oracle dump directory                       // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
     int32_t     moe_prefill_banks = 1;   // in-flight prefill expert staging banks / read-batch depth // NOLINT
@@ -664,6 +666,7 @@ struct common_params {
     int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
     int32_t     moe_prefill_cache_io_split = 0; // override split count for layer-major prefill reads  // NOLINT
     int32_t     moe_prefetch_cache_io_split = 0; // override split count for prefetch sidecar reads     // NOLINT
+    int32_t     moe_predictor_prefetch_topk = 0; // max hidden-predictor experts to prefetch; 0 follows predictor topk // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
     int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT

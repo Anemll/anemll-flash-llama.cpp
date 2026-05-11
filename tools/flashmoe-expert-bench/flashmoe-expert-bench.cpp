@@ -3,6 +3,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,7 @@ struct bench_config {
     int32_t n_gpu_layers = -1;
     int32_t nk = 32;
     std::string walk = "legacy";
+    bool force_cpu_backend = false;
     bench_component component = bench_component::full;
     std::string dump_output_path;
     std::string compare_output_path;
@@ -66,7 +68,7 @@ static void print_usage(const char * argv0) {
             "Usage: %s -m MODEL [--component up|down|full] [--layer N] [--expert N]\n"
             "          [--tokens N] [--warmup N] [--iters N] [--seed N]\n"
             "          [--nk N] [--walk legacy|regular|morton]\n"
-            "          [--dump-output FILE] [--compare-output FILE] [--n-gpu-layers N]\n"
+            "          [--backend auto|cpu] [--dump-output FILE] [--compare-output FILE] [--n-gpu-layers N]\n"
             "          [--sidecar PATH]\n"
             "\n"
             "MODEL may be a full GGUF, a Flash-MoE package directory containing model-dense.gguf + sidecar/, or flashmoe-package.json.\n",
@@ -145,6 +147,15 @@ static bench_config parse_args(int argc, char ** argv) {
             cfg.walk = require_value(arg.c_str());
             if (cfg.walk != "legacy" && cfg.walk != "regular" && cfg.walk != "morton") {
                 throw std::runtime_error("invalid --walk value");
+            }
+        } else if (arg == "--backend") {
+            const std::string value = require_value(arg.c_str());
+            if (value == "cpu") {
+                cfg.force_cpu_backend = true;
+            } else if (value == "auto") {
+                cfg.force_cpu_backend = false;
+            } else {
+                throw std::runtime_error("invalid --backend value");
             }
         } else if (arg == "--dump-output") {
             cfg.dump_output_path = require_value(arg.c_str());
@@ -290,7 +301,8 @@ static void read_expert_slice_from_sidecar(
         throw std::runtime_error("failed to open sidecar file: " + entry->repacked_path);
     }
 
-    const size_t offset = entry->repacked_offset + size_t(expert) * bytes;
+    const size_t stride = entry->expert_stride > 0 ? entry->expert_stride : bytes;
+    const size_t offset = entry->repacked_offset + size_t(expert) * stride;
     in.seekg(std::streamoff(offset), std::ios::beg);
     if (!in) {
         throw std::runtime_error("failed to seek sidecar file: " + entry->repacked_path);
@@ -302,7 +314,20 @@ static void read_expert_slice_from_sidecar(
     }
 }
 
-static ggml_backend_t init_exec_backend(const ggml_tensor * reference) {
+static ggml_backend_t init_cpu_backend() {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend == nullptr) {
+        throw std::runtime_error("failed to initialize CPU execution backend");
+    }
+    ggml_backend_cpu_set_n_threads(backend, std::max(1u, std::thread::hardware_concurrency()));
+    return backend;
+}
+
+static ggml_backend_t init_exec_backend(const ggml_tensor * reference, bool force_cpu_backend) {
+    if (force_cpu_backend) {
+        return init_cpu_backend();
+    }
+
     ggml_backend_dev_t dev = nullptr;
     if (reference != nullptr && reference->buffer != nullptr) {
         dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(reference->buffer));
@@ -317,12 +342,7 @@ static ggml_backend_t init_exec_backend(const ggml_tensor * reference) {
         }
     }
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    if (backend == nullptr) {
-        throw std::runtime_error("failed to initialize execution backend");
-    }
-    ggml_backend_cpu_set_n_threads(backend, std::max(1u, std::thread::hardware_concurrency()));
-    return backend;
+    return init_cpu_backend();
 }
 
 static void fill_input(std::vector<float> & data, int32_t seed) {
@@ -397,7 +417,7 @@ static bench_stats run_bench(const bench_config & cfg, const llama_model & model
         read_expert_slice_from_sidecar(model, down_src, cfg.expert, down_bytes);
     }
 
-    ggml_backend_t backend = init_exec_backend(up_src);
+    ggml_backend_t backend = init_exec_backend(up_src, cfg.force_cpu_backend);
 
     ggml_init_params init_params = {
         /*.mem_size   =*/ 1024 * 1024 + 64 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),

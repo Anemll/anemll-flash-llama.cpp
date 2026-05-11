@@ -1125,6 +1125,9 @@ common_init_result::common_init_result(common_params & params) :
         mparams_fit.moe_tertiary_sidecar_path = nullptr;
         mparams_fit.moe_demand_stripe = nullptr;
         mparams_fit.moe_demand_distribute = nullptr;
+        mparams_fit.moe_demand_concurrent = false;
+        mparams_fit.moe_predictor_path = nullptr;
+        mparams_fit.moe_predictor_prefetch_topk = 0;
         mparams_fit.moe_prefill_stripe = nullptr;
         mparams_fit.moe_prefill_distribute = nullptr;
         mparams_fit.moe_prefetch_stripe = nullptr;
@@ -1421,10 +1424,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_quant_map             = params.moe_quant_map.empty() ? nullptr : params.moe_quant_map.c_str();
     mparams.moe_demand_stripe         = params.moe_demand_stripe.empty() ? nullptr : params.moe_demand_stripe.c_str();
     mparams.moe_demand_distribute     = params.moe_demand_distribute.empty() ? nullptr : params.moe_demand_distribute.c_str();
+    mparams.moe_demand_concurrent     = params.moe_demand_concurrent;
     mparams.moe_prefill_stripe        = params.moe_prefill_stripe.empty() ? nullptr : params.moe_prefill_stripe.c_str();
     mparams.moe_prefill_distribute    = params.moe_prefill_distribute.empty() ? nullptr : params.moe_prefill_distribute.c_str();
     mparams.moe_prefetch_stripe       = params.moe_prefetch_stripe.empty() ? nullptr : params.moe_prefetch_stripe.c_str();
     mparams.moe_prefetch_distribute   = params.moe_prefetch_distribute.empty() ? nullptr : params.moe_prefetch_distribute.c_str();
+    mparams.moe_predictor_path        = params.moe_predictor.empty() ? nullptr : params.moe_predictor.c_str();
+    mparams.moe_predictor_prefetch_topk = params.moe_predictor_prefetch_topk;
     mparams.moe_verify_sidecar        = params.moe_verify_sidecar;
     mparams.moe_prefetch_temporal = params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse;
     mparams.moe_prefetch_temporal_sparse = params.moe_prefetch_temporal_sparse;

@@ -18,6 +18,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <signal.h>
 
@@ -93,7 +94,34 @@ std::pair<std::string, int> oracle_parse_name_layer(const std::string & raw_name
 }
 
 bool oracle_wants_base_name(const std::string_view base_name) {
+    if (const char * filter = std::getenv("LLAMA_ORACLE_TENSORS")) {
+        if (filter[0] != '\0') {
+            std::string_view list(filter);
+            size_t pos = 0;
+            while (pos <= list.size()) {
+                const size_t comma = list.find(',', pos);
+                const size_t end = comma == std::string_view::npos ? list.size() : comma;
+                std::string_view item = list.substr(pos, end - pos);
+                while (!item.empty() && item.front() == ' ') {
+                    item.remove_prefix(1);
+                }
+                while (!item.empty() && item.back() == ' ') {
+                    item.remove_suffix(1);
+                }
+                if (item == base_name) {
+                    return true;
+                }
+                if (comma == std::string_view::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+            return false;
+        }
+    }
+
     return base_name == "embd" ||
+           base_name == "hc_attn_pre" ||
            base_name == "attn_norm" ||
            base_name == "q_pe" ||
            base_name == "k_pe" ||
@@ -103,6 +131,9 @@ bool oracle_wants_base_name(const std::string_view base_name) {
            base_name == "kqv_out" ||
            base_name == "ffn_inp" ||
            base_name == "ffn_norm" ||
+           base_name == "ffn_moe_topk" ||
+           base_name == "ffn_moe_topk_reduced" ||
+           base_name == "ffn_moe_hash_topk" ||
            base_name == "ffn_shexp" ||
            base_name == "ffn_out" ||
            base_name == "l_out" ||
@@ -169,7 +200,7 @@ public:
         }
 
         const auto values = flatten_tensor_f32(t);
-        const std::string file_name = tensor_file_name(raw_name);
+        const std::string file_name = tensor_file_name(raw_name, tensor_records_.size());
         const std::filesystem::path file_path = tensor_dir_ / file_name;
         std::ofstream fout(file_path, std::ios::binary);
         if (!fout) {
@@ -206,6 +237,7 @@ public:
         manifest["logits_topk"] = logits_topk_;
         manifest["tensor_names"] = json::array({
             "embd",
+            "hc_attn_pre",
             "attn_norm",
             "q_pe",
             "k_pe",
@@ -215,6 +247,9 @@ public:
             "kqv_out",
             "ffn_inp",
             "ffn_norm",
+            "ffn_moe_topk",
+            "ffn_moe_topk_reduced",
+            "ffn_moe_hash_topk",
             "ffn_shexp",
             "ffn_out",
             "l_out",
@@ -223,6 +258,7 @@ public:
         manifest["records"] = json::array();
         for (const auto & record : tensor_records_) {
             manifest["records"].push_back({
+                {"record_index", manifest["records"].size()},
                 {"eval_index", record.eval_index},
                 {"phase", record.phase},
                 {"name", record.name},
@@ -264,9 +300,9 @@ private:
         return eval_index < static_cast<int>(prompt_ids_.size()) ? "prefill" : "decode";
     }
 
-    std::string tensor_file_name(const std::string & name) const {
+    std::string tensor_file_name(const std::string & name, size_t record_index) const {
         char prefix[32];
-        std::snprintf(prefix, sizeof(prefix), "%06d_", eval_index_);
+        std::snprintf(prefix, sizeof(prefix), "%06zu_%06d_", record_index, eval_index_);
         return std::string(prefix) + oracle_sanitize_name(name) + ".bin";
     }
 
@@ -923,6 +959,7 @@ int main(int argc, char ** argv) {
                 params.moe_prefetch_cache_io_split > 0 ? "" : " (follows cache-io-split)");
         fprintf(stderr, "  demand-stripe    = %s\n", params.moe_demand_stripe.empty() ? "off" : params.moe_demand_stripe.c_str());
         fprintf(stderr, "  demand-distribute = %s\n", params.moe_demand_distribute.empty() ? "off" : params.moe_demand_distribute.c_str());
+        fprintf(stderr, "  demand-concurrent = %s\n", params.moe_demand_concurrent ? "on" : "off");
         fprintf(stderr, "  prefill-stripe   = %s\n", params.moe_prefill_stripe.empty() ? "follow demand" : params.moe_prefill_stripe.c_str());
         fprintf(stderr, "  prefill-distribute = %s\n", params.moe_prefill_distribute.empty() ? "follow demand" : params.moe_prefill_distribute.c_str());
         fprintf(stderr, "  prefetch-stripe  = %s\n", params.moe_prefetch_stripe.empty() ? "off" : params.moe_prefetch_stripe.c_str());
@@ -932,6 +969,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  prefetch-temporal-sparse = %s\n", params.moe_prefetch_temporal_sparse ? "on" : "off");
         fprintf(stderr, "  predict-prev-token = %s\n", params.moe_predict_prev_token ? "on" : "off");
         fprintf(stderr, "  predict-top1-prev = %s\n", params.moe_predict_top1_prev ? "on" : "off");
+        fprintf(stderr, "  predictor        = %s\n", params.moe_predictor.empty() ? "off" : params.moe_predictor.c_str());
+        if (!params.moe_predictor.empty()) {
+            fprintf(stderr, "  predictor-prefetch-topk = %d%s\n",
+                    params.moe_predictor_prefetch_topk,
+                    params.moe_predictor_prefetch_topk > 0 ? "" : " (follows predictor)");
+        }
         fprintf(stderr, "  shared-only      = %s\n", params.moe_shared_only ? "on" : "off");
         fprintf(stderr, "  sort-decode-ids  = %s\n", params.moe_sort_decode_expert_ids ? "on" : "off");
         fprintf(stderr, "  trace-harness    = %s\n", params.moe_trace_harness ? "on" : "off");

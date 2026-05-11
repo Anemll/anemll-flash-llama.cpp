@@ -621,10 +621,13 @@ struct llama_model {
     bool flash_moe_temporal_prefetch_sparse_enabled() const;
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
+    const char * flash_moe_predictor_path() const;
+    int32_t flash_moe_predictor_prefetch_topk() const;
     bool flash_moe_secondary_sidecar_enabled() const;
     bool flash_moe_tertiary_sidecar_enabled() const;
     bool flash_moe_demand_stripe_enabled() const;
     bool flash_moe_demand_distribute_enabled() const;
+    bool flash_moe_demand_concurrent_enabled() const;
     bool flash_moe_prefill_stripe_enabled() const;
     bool flash_moe_prefill_distribute_enabled() const;
     bool flash_moe_prefetch_stripe_enabled() const;
@@ -681,6 +684,8 @@ struct llama_flash_moe_sidecar_entry {
     size_t                          repacked_offset   = 0;
     size_t                          exact_byte_length = 0;
     size_t                          bytes_per_expert  = 0;
+    size_t                          expert_stride     = 0;
+    bool                            expert_major      = false;
 };
 
 // For internal test use

@@ -2427,6 +2427,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_DEMAND_DISTRIBUTE"));
     add_opt(common_arg(
+        {"--moe-demand-concurrent"},
+        {"--no-moe-demand-concurrent"},
+        string_format("experimental: race full demand expert reads from primary and secondary sidecars; first completed read wins (default: %s)", params.moe_demand_concurrent ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_demand_concurrent = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DEMAND_CONCURRENT"));
+    add_opt(common_arg(
         {"--moe-prefill-stripe"}, "A:B:C",
         "experimental weighted prefill-only striping across primary:secondary:tertiary sidecars for dedicated layer-major prompt reads, e.g. 3:2:2",
         [](common_params & params, const std::string & value) {
@@ -2513,6 +2521,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_PREDICT_TOP1_PREV"));
+    add_opt(common_arg(
+        {"--moe-predictor"}, "DIR",
+        "raw Flash-MoE hidden-state predictor directory for pre-attention slot-bank prefetch",
+        [](common_params & params, const std::string & value) {
+            params.moe_predictor = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICTOR"));
+    add_opt(common_arg(
+        {"--moe-predictor-prefetch-topk"}, "N",
+        "limit hidden-state predictor prefetch installs to the top N predicted experts per layer (0 = predictor topk)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_predictor_prefetch_topk = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICTOR_PREFETCH_TOPK"));
     add_opt(common_arg(
         {"--moe-shared-only"},
         {"--no-moe-shared-only"},

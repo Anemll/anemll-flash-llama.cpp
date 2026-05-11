@@ -391,6 +391,9 @@ extern "C" {
         // NOTE: new fields must be appended at the end to preserve ABI for out-of-tree consumers.
         bool moe_prefill_next_hot_exclusive_drives; // pin prefill next-hot host staging to secondary/tertiary sidecars
         int32_t moe_prefill_next_hot_experts; // prototype one-lookahead prefill hot-expert host staging budget
+        const char * moe_predictor_path; // optional raw Flash-MoE hidden-state predictor directory
+        int32_t moe_predictor_prefetch_topk; // max predicted experts to prefetch per layer (0 = predictor topk)
+        bool moe_demand_concurrent; // race demand reads between primary and secondary sidecars; first complete read wins
     };
 
     struct llama_sampler_seq_config {

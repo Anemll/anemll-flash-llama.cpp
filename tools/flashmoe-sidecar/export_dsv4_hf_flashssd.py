@@ -9,6 +9,7 @@ import re
 import shutil
 import struct
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,27 @@ EXPERT_FAMILIES = (
 )
 LAYER_TENSOR_RE = re.compile(r"layers\.(\d+)\.")
 EXPERT_WEIGHT_RE = re.compile(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w1\.weight")
+
+
+@contextmanager
+def atomic_write_path(path: Path, mode: str, encoding: str | None = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    kwargs: dict[str, str] = {}
+    if "b" not in mode:
+        kwargs["encoding"] = encoding or "utf-8"
+    try:
+        with tmp.open(mode, **kwargs) as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 @dataclass(frozen=True)
@@ -702,7 +724,16 @@ def sidecar_logical_shape(cfg: dict, family: str) -> list[int]:
     return [n_embd, n_ff, n_expert]
 
 
-def write_sidecar(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_dir: Path, expert_limit: int | None) -> dict:
+def sidecar_manifest_layout(sidecar_layout: str) -> str:
+    if sidecar_layout == "expert-major":
+        return "layer_major_expert"
+    return "layer_major_whole_tensor"
+
+
+def write_sidecar(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_dir: Path, expert_limit: int | None, sidecar_layout: str) -> dict:
+    if sidecar_layout == "expert-major":
+        return write_sidecar_expert_major(store, cfg, layers, out_dir, expert_limit)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     n_expert_total = int(cfg["n_routed_experts"])
     n_expert_written = min(n_expert_total, expert_limit) if expert_limit is not None else n_expert_total
@@ -711,7 +742,7 @@ def write_sidecar(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_
     for layer_index, layer in enumerate(layers, start=1):
         layer_path = out_dir / f"layer_{layer:03d}.bin"
         print(f"sidecar layer {layer} ({layer_index}/{len(layers)}) -> {layer_path}", flush=True)
-        with layer_path.open("wb") as handle:
+        with atomic_write_path(layer_path, "wb") as handle:
             for family, short in EXPERT_FAMILIES:
                 offset = handle.tell()
                 bytes_per_expert: int | None = None
@@ -752,7 +783,7 @@ def write_sidecar(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_
     manifest = {
         "schema_version": 1,
         "sidecar_kind": "flashmoe_gguf",
-        "layout": "layer_major_whole_tensor",
+        "layout": sidecar_manifest_layout(sidecar_layout),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "model_dir": str(store.hf_dir),
@@ -766,28 +797,29 @@ def write_sidecar(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_
             "expert_written_count": n_expert_written,
             "expert_used_count": int(cfg["num_experts_per_tok"]),
             "expert_format": "native_fp4_mxfp4",
+            "sidecar_layout": sidecar_layout,
         },
         "entries": entries,
     }
 
-    with (out_dir / "manifest.json").open("w", encoding="utf-8") as handle:
+    with atomic_write_path(out_dir / "manifest.json", "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
         handle.write("\n")
     return manifest
 
 
-def refresh_sidecar_manifest(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_dir: Path, expert_limit: int | None) -> dict:
+def write_sidecar_expert_major(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_dir: Path, expert_limit: int | None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     n_expert_total = int(cfg["n_routed_experts"])
     n_expert_written = min(n_expert_total, expert_limit) if expert_limit is not None else n_expert_total
     entries: list[dict] = []
 
-    for layer in layers:
+    for layer_index, layer in enumerate(layers, start=1):
         layer_path = out_dir / f"layer_{layer:03d}.bin"
-        if not layer_path.is_file():
-            raise SystemExit(f"cannot refresh sidecar manifest; missing existing sidecar layer file: {layer_path}")
+        print(f"sidecar layer {layer} ({layer_index}/{len(layers)}) -> {layer_path} [expert-major]", flush=True)
 
-        offset = 0
+        family_specs: list[dict] = []
+        expert_stride = 0
         for family, short in EXPERT_FAMILIES:
             weight_name, scale_name = expert_tensor_names(layer, 0, short)
             weight_ref = store.get(weight_name)
@@ -796,8 +828,35 @@ def refresh_sidecar_manifest(store: SafeTensorStore, cfg: dict, layers: Sequence
                 raise SystemExit(
                     f"expected native FP4 I8/F8_E8M0 expert tensors, got {weight_name}={weight_ref.dtype}, {scale_name}={scale_ref.dtype}"
                 )
-
             bytes_per_expert = mxfp4_packed_nbytes(weight_ref.shape)
+            family_specs.append({
+                "family": family,
+                "short": short,
+                "offset": expert_stride,
+                "bytes_per_expert": bytes_per_expert,
+            })
+            expert_stride += bytes_per_expert
+
+        with atomic_write_path(layer_path, "wb") as handle:
+            for expert in range(n_expert_written):
+                for spec in family_specs:
+                    weight_name, scale_name = expert_tensor_names(layer, expert, spec["short"])
+                    weight_ref = store.get(weight_name)
+                    scale_ref = store.get(scale_name)
+                    if weight_ref.dtype != "I8" or scale_ref.dtype != "F8_E8M0":
+                        raise SystemExit(
+                            f"expected native FP4 I8/F8_E8M0 expert tensors, got {weight_name}={weight_ref.dtype}, {scale_name}={scale_ref.dtype}"
+                        )
+                    packed = pack_mxfp4_from_hf_fp4(store.read_u8(weight_name), store.read_u8(scale_name), weight_ref.shape, scale_ref.shape)
+                    if packed.nbytes != spec["bytes_per_expert"]:
+                        raise SystemExit(
+                            f"inconsistent expert byte size for {weight_name}: {packed.nbytes} vs {spec['bytes_per_expert']}"
+                        )
+                    packed.tofile(handle)
+
+        for spec in family_specs:
+            family = str(spec["family"])
+            bytes_per_expert = int(spec["bytes_per_expert"])
             exact = bytes_per_expert * n_expert_written
             entries.append(
                 {
@@ -809,24 +868,104 @@ def refresh_sidecar_manifest(store: SafeTensorStore, cfg: dict, layers: Sequence
                     "shape": sidecar_logical_shape(cfg, family),
                     "expert_count": n_expert_written,
                     "repacked_file": layer_path.name,
-                    "repacked_offset": offset,
+                    "repacked_offset": int(spec["offset"]),
                     "exact_byte_length": exact,
                     "bytes_per_expert": bytes_per_expert,
+                    "expert_stride": expert_stride,
+                    "expert_major": True,
                 }
             )
-            offset += exact
+            print(f"  {family}: {n_expert_written} experts, {human_bytes(exact)}", flush=True)
+        print(f"  expert-major stride: {human_bytes(expert_stride)} per expert", flush=True)
+
+    manifest = {
+        "schema_version": 1,
+        "sidecar_kind": "flashmoe_gguf",
+        "layout": sidecar_manifest_layout("expert-major"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "model_dir": str(store.hf_dir),
+            "model_files": sorted(set(store.weight_map.values())),
+            "preserve_quant": True,
+        },
+        "model": {
+            "arch": ARCH,
+            "layer_count": int(cfg["num_hidden_layers"]),
+            "expert_count": n_expert_total,
+            "expert_written_count": n_expert_written,
+            "expert_used_count": int(cfg["num_experts_per_tok"]),
+            "expert_format": "native_fp4_mxfp4",
+            "sidecar_layout": "expert-major",
+        },
+        "entries": entries,
+    }
+
+    with atomic_write_path(out_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
+    return manifest
+
+
+def refresh_sidecar_manifest(store: SafeTensorStore, cfg: dict, layers: Sequence[int], out_dir: Path, expert_limit: int | None, sidecar_layout: str) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_expert_total = int(cfg["n_routed_experts"])
+    n_expert_written = min(n_expert_total, expert_limit) if expert_limit is not None else n_expert_total
+    entries: list[dict] = []
+
+    for layer in layers:
+        layer_path = out_dir / f"layer_{layer:03d}.bin"
+        if not layer_path.is_file():
+            raise SystemExit(f"cannot refresh sidecar manifest; missing existing sidecar layer file: {layer_path}")
+
+        offset = 0
+        expert_stride = 0
+        family_bytes: list[tuple[str, int]] = []
+        for family, short in EXPERT_FAMILIES:
+            weight_name, scale_name = expert_tensor_names(layer, 0, short)
+            weight_ref = store.get(weight_name)
+            scale_ref = store.get(scale_name)
+            if weight_ref.dtype != "I8" or scale_ref.dtype != "F8_E8M0":
+                raise SystemExit(
+                    f"expected native FP4 I8/F8_E8M0 expert tensors, got {weight_name}={weight_ref.dtype}, {scale_name}={scale_ref.dtype}"
+                )
+
+            bytes_per_expert = mxfp4_packed_nbytes(weight_ref.shape)
+            family_bytes.append((family, bytes_per_expert))
+            expert_stride += bytes_per_expert
+
+        for family, bytes_per_expert in family_bytes:
+            exact = bytes_per_expert * n_expert_written
+            item = {
+                "tensor_name": sidecar_entry_tensor_name(layer, family),
+                "original_gguf_tensor_name": sidecar_entry_tensor_name(layer, family),
+                "tensor_family": family,
+                "layer": layer,
+                "quant_type": "mxfp4",
+                "shape": sidecar_logical_shape(cfg, family),
+                "expert_count": n_expert_written,
+                "repacked_file": layer_path.name,
+                "repacked_offset": offset,
+                "exact_byte_length": exact,
+                "bytes_per_expert": bytes_per_expert,
+            }
+            if sidecar_layout == "expert-major":
+                item["expert_stride"] = expert_stride
+                item["expert_major"] = True
+            entries.append(item)
+            offset += bytes_per_expert if sidecar_layout == "expert-major" else exact
 
         actual_size = layer_path.stat().st_size
-        if actual_size != offset:
+        expected_size = expert_stride * n_expert_written if sidecar_layout == "expert-major" else offset
+        if actual_size != expected_size:
             raise SystemExit(
-                f"existing sidecar layer file size mismatch for {layer_path}: got {actual_size}, expected {offset}; "
+                f"existing sidecar layer file size mismatch for {layer_path}: got {actual_size}, expected {expected_size}; "
                 "rerun without --skip-sidecar to rebuild sidecar binaries"
             )
 
     manifest = {
         "schema_version": 1,
         "sidecar_kind": "flashmoe_gguf",
-        "layout": "layer_major_whole_tensor",
+        "layout": sidecar_manifest_layout(sidecar_layout),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "model_dir": str(store.hf_dir),
@@ -841,11 +980,12 @@ def refresh_sidecar_manifest(store: SafeTensorStore, cfg: dict, layers: Sequence
             "expert_written_count": n_expert_written,
             "expert_used_count": int(cfg["num_experts_per_tok"]),
             "expert_format": "native_fp4_mxfp4",
+            "sidecar_layout": sidecar_layout,
         },
         "entries": entries,
     }
 
-    with (out_dir / "manifest.json").open("w", encoding="utf-8") as handle:
+    with atomic_write_path(out_dir / "manifest.json", "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
         handle.write("\n")
     return manifest
@@ -949,7 +1089,7 @@ estimate:
         },
         "estimate": estimate,
     }
-    with (out_dir / "flashmoe-package.json").open("w", encoding="utf-8") as handle:
+    with atomic_write_path(out_dir / "flashmoe-package.json", "w", encoding="utf-8") as handle:
         json.dump(package, handle, indent=2)
         handle.write("\n")
 
@@ -1010,6 +1150,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense", choices=("fp8",), default="fp8", help="Dense quantization to preserve")
     parser.add_argument("--layers", help="Optional sidecar layer filter, e.g. 0,2-4")
     parser.add_argument("--expert-limit", type=int, help="Debug/smoke-test limit; omit for full 384 experts")
+    parser.add_argument(
+        "--sidecar-layout",
+        choices=("layer-major", "expert-major"),
+        default="layer-major",
+        help="Expert sidecar physical layout: layer-major keeps whole tensor-family runs; expert-major stores gate/up/down contiguously per expert",
+    )
     parser.add_argument("--skip-dense", action="store_true", help="Only write sidecar/package files")
     parser.add_argument("--skip-sidecar", action="store_true", help="Only write dense GGUF/package files")
     parser.add_argument("--dry-run", action="store_true", help="Validate mappings and print size estimates without writing")
@@ -1084,10 +1230,10 @@ def main() -> int:
         write_dense_gguf(store, cfg, dense_specs, out_dir / "dense" / "model-dense.gguf", hf_dir)
         dense_written = True
     if not args.skip_sidecar:
-        write_sidecar(store, cfg, layers, out_dir / "sidecar", args.expert_limit)
+        write_sidecar(store, cfg, layers, out_dir / "sidecar", args.expert_limit, args.sidecar_layout)
         sidecar_written = True
     elif (out_dir / "sidecar").is_dir():
-        refresh_sidecar_manifest(store, cfg, layers, out_dir / "sidecar", args.expert_limit)
+        refresh_sidecar_manifest(store, cfg, layers, out_dir / "sidecar", args.expert_limit, args.sidecar_layout)
         print(f"note: refreshed sidecar manifest for existing sidecar bins at {out_dir / 'sidecar'}")
 
     encoding_written = copy_encoding_assets(hf_dir, out_dir)

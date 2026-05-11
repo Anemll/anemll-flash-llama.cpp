@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,27 @@ LAYER_TENSOR_RE = re.compile(r"^blk\.(\d+)\.(ffn_[^.]+)\.weight$")
 GGUF_SPLIT_RE = re.compile(r"^(?P<prefix>.+-)(?P<idx>\d+)-of-(?P<count>\d+)(?P<suffix>\.gguf)$")
 
 
+@contextmanager
+def atomic_write_path(path: Path, mode: str, encoding: str | None = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    kwargs: dict[str, Any] = {}
+    if "b" not in mode:
+        kwargs["encoding"] = encoding or "utf-8"
+    try:
+        with tmp.open(mode, **kwargs) as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and verify Flash-MoE GGUF sidecars.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -53,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     add_filter_args(extract)
     extract.add_argument("--out-dir", required=True, type=Path, help="output sidecar directory")
     extract.add_argument("--include-shared", action="store_true", help="include shared expert tensors as well")
+    extract.add_argument(
+        "--layout",
+        choices=("layer-major", "expert-major"),
+        default="layer-major",
+        help="physical sidecar layout: layer-major copies whole tensor-family runs; expert-major stores selected families contiguously per expert",
+    )
     extract.add_argument("--force", action="store_true", help="overwrite manifest and layer files in the output directory")
     extract.set_defaults(func=cmd_extract)
 
@@ -62,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     verify.add_argument("--sidecar", required=True, type=Path, help="sidecar directory or manifest path")
     verify.add_argument("--metadata-only", action="store_true", help="only validate metadata and offsets, not raw bytes")
     verify.set_defaults(func=cmd_verify)
+
+    repack = subparsers.add_parser("repack-expert-major", help="repack an existing sidecar so each expert's families are contiguous")
+    add_filter_args(repack)
+    repack.add_argument("--sidecar", required=True, type=Path, help="source sidecar directory or manifest path")
+    repack.add_argument("--out-dir", required=True, type=Path, help="output sidecar directory")
+    repack.add_argument("--force", action="store_true", help="overwrite manifest and layer files in the output directory")
+    repack.set_defaults(func=cmd_repack_expert_major)
 
     inspect = subparsers.add_parser("inspect", help="inspect GGUF MoE tensor layout and optional sidecar parity")
     add_common_model_arg(inspect)
@@ -351,7 +386,22 @@ def print_summary(summary: dict[str, Any], title: str) -> None:
         print(f"    blk.{layer}: tensors={values['tensors']} bytes={values['bytes']} families={families}")
 
 
-def copy_exact_bytes(model_paths: list[Path], entries: list[dict[str, Any]], out_dir: Path) -> None:
+def copy_source_range(src: Any, dst: Any, offset: int, nbytes: int, label: str) -> None:
+    src.seek(offset)
+    remaining = nbytes
+    while remaining > 0:
+        chunk = src.read(min(8 << 20, remaining))
+        if not chunk:
+            raise SystemExit(f"unexpected EOF while reading '{label}'")
+        dst.write(chunk)
+        remaining -= len(chunk)
+
+
+def copy_exact_bytes(model_paths: list[Path], entries: list[dict[str, Any]], out_dir: Path, layout: str) -> None:
+    if layout == "expert-major":
+        copy_expert_major_from_source(model_paths, entries, out_dir)
+        return
+
     with ExitStack() as stack:
         source_handles = [stack.enter_context(path.open("rb")) for path in model_paths]
         layer_handles: dict[Path, Any] = {}
@@ -360,21 +410,57 @@ def copy_exact_bytes(model_paths: list[Path], entries: list[dict[str, Any]], out
             layer_file = out_dir / f"layer_{entry['layer']:03d}.bin"
             handle = layer_handles.get(layer_file)
             if handle is None:
-                handle = stack.enter_context(layer_file.open("wb"))
+                handle = stack.enter_context(atomic_write_path(layer_file, "wb"))
                 layer_handles[layer_file] = handle
 
             entry["repacked_file"] = layer_file.name
             entry["repacked_offset"] = handle.tell()
 
             src = source_handles[entry["source_shard_index"]]
-            src.seek(entry["source_offset"])
-            remaining = entry["exact_byte_length"]
-            while remaining > 0:
-                chunk = src.read(min(8 << 20, remaining))
-                if not chunk:
-                    raise SystemExit(f"unexpected EOF while reading '{entry['tensor_name']}'")
-                handle.write(chunk)
-                remaining -= len(chunk)
+            copy_source_range(src, handle, entry["source_offset"], entry["exact_byte_length"], entry["tensor_name"])
+
+
+def copy_expert_major_from_source(model_paths: list[Path], entries: list[dict[str, Any]], out_dir: Path) -> None:
+    by_layer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        if entry.get("bytes_per_expert") is None:
+            raise SystemExit(f"entry '{entry['tensor_name']}' cannot use expert-major layout without bytes_per_expert")
+        by_layer[int(entry["layer"])].append(entry)
+
+    with ExitStack() as stack:
+        source_handles = [stack.enter_context(path.open("rb")) for path in model_paths]
+
+        for layer, layer_entries in sorted(by_layer.items()):
+            layer_entries = sorted(layer_entries, key=lambda entry: FAMILY_ORDER.get(entry["tensor_family"], 99))
+            layer_file = out_dir / f"layer_{layer:03d}.bin"
+            expert_counts = {
+                int(entry["exact_byte_length"]) // int(entry["bytes_per_expert"])
+                for entry in layer_entries
+            }
+            if len(expert_counts) != 1:
+                raise SystemExit(f"layer {layer} has inconsistent expert counts: {sorted(expert_counts)}")
+            expert_count = expert_counts.pop()
+
+            expert_stride = 0
+            for entry in layer_entries:
+                entry["repacked_file"] = layer_file.name
+                entry["repacked_offset"] = expert_stride
+                entry["expert_stride"] = sum(int(item["bytes_per_expert"]) for item in layer_entries)
+                entry["expert_major"] = True
+                expert_stride += int(entry["bytes_per_expert"])
+
+            with atomic_write_path(layer_file, "wb") as handle:
+                for expert in range(expert_count):
+                    for entry in layer_entries:
+                        src = source_handles[entry["source_shard_index"]]
+                        bpe = int(entry["bytes_per_expert"])
+                        copy_source_range(
+                            src,
+                            handle,
+                            int(entry["source_offset"]) + expert * bpe,
+                            bpe,
+                            f"{entry['tensor_name']} expert {expert}",
+                        )
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
@@ -397,12 +483,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if not entries:
         raise SystemExit("no MoE tensors matched the requested extraction scope")
 
-    copy_exact_bytes(model_paths, entries, out_dir)
+    copy_exact_bytes(model_paths, entries, out_dir, args.layout)
 
     manifest = {
         "schema_version": 1,
         "sidecar_kind": "flashmoe_gguf",
-        "layout": "layer_major_whole_tensor",
+        "layout": "layer_major_expert" if args.layout == "expert-major" else "layer_major_whole_tensor",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "include_shared": bool(args.include_shared),
         "filters": {
@@ -415,9 +501,10 @@ def cmd_extract(args: argparse.Namespace) -> int:
         "model": metadata,
         "entries": entries,
     }
+    manifest["model"]["sidecar_layout"] = args.layout
 
     manifest_path = out_dir / "manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as handle:
+    with atomic_write_path(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=False)
         handle.write("\n")
 
@@ -451,6 +538,26 @@ def compare_exact_bytes(
         if source_chunk != sidecar_chunk:
             raise SystemExit(f"byte mismatch for tensor '{tensor_name}'")
         remaining -= chunk_size
+
+
+def compare_expert_major_bytes(
+    source_handle: Any,
+    source_offset: int,
+    sidecar_handle: Any,
+    entry: dict[str, Any],
+    tensor_name: str,
+) -> None:
+    bytes_per_expert = int(entry["bytes_per_expert"])
+    expert_count = int(entry["expert_count"])
+    for expert in range(expert_count):
+        compare_exact_bytes(
+            source_handle=source_handle,
+            source_offset=source_offset + expert * bytes_per_expert,
+            sidecar_handle=sidecar_handle,
+            sidecar_offset=sidecar_entry_expert_offset(entry, expert),
+            nbytes=bytes_per_expert,
+            tensor_name=f"{tensor_name} expert {expert}",
+        )
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -503,17 +610,122 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 sidecar_handles[sidecar_path] = sidecar_handle
 
             source_handle = source_handles[source["source_shard_index"]]
-            compare_exact_bytes(
-                source_handle=source_handle,
-                source_offset=source["source_offset"],
-                sidecar_handle=sidecar_handle,
-                sidecar_offset=entry["repacked_offset"],
-                nbytes=entry["exact_byte_length"],
-                tensor_name=tensor_name,
-            )
+            if entry.get("expert_major") or manifest.get("layout") in ("expert_major", "layer_major_expert"):
+                compare_expert_major_bytes(
+                    source_handle=source_handle,
+                    source_offset=source["source_offset"],
+                    sidecar_handle=sidecar_handle,
+                    entry=entry,
+                    tensor_name=tensor_name,
+                )
+            else:
+                compare_exact_bytes(
+                    source_handle=source_handle,
+                    source_offset=source["source_offset"],
+                    sidecar_handle=sidecar_handle,
+                    sidecar_offset=entry["repacked_offset"],
+                    nbytes=entry["exact_byte_length"],
+                    tensor_name=tensor_name,
+                )
 
     mode = "metadata-only" if args.metadata_only else "metadata+bytes"
     print(f"verified {len(entries)} Flash-MoE sidecar entries against {len(model_paths)} GGUF file(s) using {mode}")
+    return 0
+
+
+def sidecar_entry_expert_offset(entry: dict[str, Any], expert: int) -> int:
+    stride = int(entry.get("expert_stride") or entry["bytes_per_expert"])
+    return int(entry["repacked_offset"]) + expert * stride
+
+
+def copy_exact_range(src: Any, dst: Any, offset: int, nbytes: int, label: str) -> None:
+    src.seek(offset)
+    remaining = nbytes
+    while remaining > 0:
+        chunk = src.read(min(8 << 20, remaining))
+        if not chunk:
+            raise SystemExit(f"unexpected EOF while reading '{label}'")
+        dst.write(chunk)
+        remaining -= len(chunk)
+
+
+def cmd_repack_expert_major(args: argparse.Namespace) -> int:
+    manifest_path, manifest = load_manifest(args.sidecar)
+    manifest_dir = manifest_path.parent
+    out_dir = args.out_dir.expanduser().resolve()
+    layer_filter = parse_layer_spec(args.layers)
+    family_filter = parse_family_spec(args.families)
+
+    if not args.force and out_dir.exists() and any(out_dir.iterdir()):
+        raise SystemExit(f"output directory '{out_dir}' is not empty; use --force to overwrite files")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    entries = filter_manifest_entries(manifest["entries"], layer_filter=layer_filter, family_filter=family_filter)
+    if not entries:
+        raise SystemExit("no sidecar entries matched the requested repack scope")
+
+    by_layer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        by_layer[int(entry["layer"])].append(entry)
+
+    new_entries: list[dict[str, Any]] = []
+    with ExitStack() as stack:
+        source_handles: dict[Path, Any] = {}
+
+        for layer, layer_entries in sorted(by_layer.items()):
+            layer_entries = sorted(layer_entries, key=lambda entry: FAMILY_ORDER.get(entry["tensor_family"], 99))
+            expert_counts = {int(entry["expert_count"]) for entry in layer_entries}
+            if len(expert_counts) != 1:
+                raise SystemExit(f"layer {layer} has inconsistent expert counts: {sorted(expert_counts)}")
+            expert_count = expert_counts.pop()
+
+            layer_path = out_dir / f"layer_{layer:03d}.bin"
+            print(f"repack layer {layer} -> {layer_path} [expert-major]", flush=True)
+            family_offsets: dict[str, int] = {}
+            expert_stride = 0
+            for entry in layer_entries:
+                family_offsets[entry["tensor_name"]] = expert_stride
+                expert_stride += int(entry["bytes_per_expert"])
+
+            with atomic_write_path(layer_path, "wb") as out:
+                for expert in range(expert_count):
+                    for entry in layer_entries:
+                        source_path = (manifest_dir / entry["repacked_file"]).resolve()
+                        src = source_handles.get(source_path)
+                        if src is None:
+                            src = stack.enter_context(source_path.open("rb"))
+                            source_handles[source_path] = src
+                        copy_exact_range(
+                            src,
+                            out,
+                            sidecar_entry_expert_offset(entry, expert),
+                            int(entry["bytes_per_expert"]),
+                            f"{entry['tensor_name']} expert {expert}",
+                        )
+
+            for entry in layer_entries:
+                item = dict(entry)
+                item["repacked_file"] = layer_path.name
+                item["repacked_offset"] = family_offsets[entry["tensor_name"]]
+                item["expert_stride"] = expert_stride
+                item["expert_major"] = True
+                new_entries.append(item)
+
+    new_manifest = dict(manifest)
+    new_manifest["layout"] = "layer_major_expert"
+    new_manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
+    new_manifest["source"] = dict(manifest.get("source") or {})
+    new_manifest["source"]["repacked_from_sidecar"] = str(manifest_path)
+    new_manifest["model"] = dict(manifest.get("model") or {})
+    new_manifest["model"]["sidecar_layout"] = "expert-major"
+    new_manifest["entries"] = new_entries
+
+    manifest_out = out_dir / "manifest.json"
+    with atomic_write_path(manifest_out, "w", encoding="utf-8") as handle:
+        json.dump(new_manifest, handle, indent=2, sort_keys=False)
+        handle.write("\n")
+
+    print(f"wrote expert-major sidecar: {manifest_out}")
     return 0
 
 

@@ -46,6 +46,7 @@ class Entry:
     family: str
     repacked_offset: int
     bytes_per_expert: int
+    expert_stride: int
     exact_byte_length: int
     paths: dict[str, str]
 
@@ -318,6 +319,7 @@ def build_entries(
                 family=family,
                 repacked_offset=int(raw["repacked_offset"]),
                 bytes_per_expert=int(bytes_per_expert),
+                expert_stride=int(raw.get("expert_stride") or bytes_per_expert),
                 exact_byte_length=int(raw["exact_byte_length"]),
                 paths=paths,
             )
@@ -462,7 +464,7 @@ def bench_strategy(
                 futures: list[cf.Future[int]] = []
                 for entry in sample.entries:
                     entry_segments = allocate_segments(entry.bytes_per_expert, page_bytes, strategy.weights)
-                    base_offset = entry.repacked_offset + sample.expert * entry.bytes_per_expert
+                    base_offset = entry.repacked_offset + sample.expert * entry.expert_stride
                     for segment in entry_segments:
                         drive = DRIVE_NAMES[segment.drive_idx]
                         fd = fds[entry.paths[drive]]
