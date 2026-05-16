@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include <string.h>
+#include <stdatomic.h>
 
 #undef MIN
 #undef MAX
@@ -59,6 +60,7 @@ struct ggml_metal {
     int n_nodes_0;      // number of nodes submitted by the main thread
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
     int n_nodes_per_cb;
+    int trace_token;
 
     struct ggml_cgraph * gf;
 
@@ -82,6 +84,8 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
+
+static atomic_int g_ggml_metal_dsv4_trace_graph_index = 0;
 
 static bool ggml_metal_flash_attn_mem_debug_enabled_ctx(void) {
     static int enabled = -1;
@@ -216,6 +220,201 @@ static void ggml_metal_graph_log_flash_attn_mem_summary(struct ggml_cgraph * gf)
     fflush(stderr);
 }
 
+static bool ggml_metal_stage_profile_enabled(void) {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = getenv("LLAMA_FLASH_MOE_METAL_STAGE_PROFILE");
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static bool ggml_metal_stage_profile_detail_enabled(void) {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    enabled = 0;
+    const char * value = getenv("LLAMA_FLASH_MOE_METAL_STAGE_PROFILE_DETAIL");
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+
+    enabled = strcmp(value, "0") != 0 ? 1 : 0;
+    return enabled == 1;
+}
+
+static const char * ggml_metal_stage_profile_update_stage(const struct ggml_tensor * node, const char * current) {
+    const char * name = ggml_get_name(node);
+    if (name == NULL) {
+        return current;
+    }
+
+    if (ggml_metal_stage_profile_detail_enabled()) {
+        if (strstr(name, "hc_attn_pre_mixes") != NULL) {
+            return "attn_hc_pre";
+        }
+        if (strstr(name, "attn_norm") != NULL) {
+            return "attn_qkv";
+        }
+        if (strstr(name, "Qcur") != NULL) {
+            return "attn_kv";
+        }
+        if (strstr(name, "KVcur") != NULL || strstr(name, "KVcompress") != NULL) {
+            return "attn_compress";
+        }
+        if (strstr(name, "indexer_scores") != NULL ||
+                strstr(name, "indexer_topk") != NULL ||
+                strstr(name, "dsv4_attn_compress_mask") != NULL) {
+            return "attn_index";
+        }
+        if (strstr(name, "kqv_out") != NULL) {
+            return "attn_core";
+        }
+        if (strstr(name, "attn_out") != NULL) {
+            return "attn_out";
+        }
+        if (strstr(name, "hc_attn_post") != NULL) {
+            return "attn_hc_post";
+        }
+        if (strstr(name, "hc_ffn_pre_mixes") != NULL) {
+            return "ffn";
+        }
+        if (strstr(name, "result_norm") != NULL) {
+            return "head";
+        }
+    }
+
+    if (strstr(name, "hc_attn_pre_mixes") != NULL) {
+        return "attn";
+    }
+    if (strstr(name, "hc_ffn_pre_mixes") != NULL) {
+        return "ffn";
+    }
+    if (strstr(name, "result_norm") != NULL) {
+        return "head";
+    }
+
+    return current;
+}
+
+static enum ggml_status ggml_metal_stage_profile_encode_range(
+        ggml_metal_t        ctx,
+        struct ggml_cgraph * gf,
+        int                 idx_start,
+        int                 idx_end,
+        const char        * stage,
+        int                 graph_id,
+        int                 range_id) {
+    if (idx_start >= idx_end) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+
+    const int64_t t0 = ggml_time_us();
+    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+            ctx->dev,
+            cmd_buf,
+            gf,
+            idx_start,
+            idx_end,
+            ctx->use_fusion,
+            false,
+            false,
+            ctx->debug_graph,
+            ctx->debug_fusion,
+            graph_id,
+            range_id);
+
+    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+        const int res = ggml_metal_op_encode(ctx_op, idx);
+        if (res == 0) {
+            break;
+        }
+
+        idx += res - 1;
+    }
+
+    ggml_metal_op_free(ctx_op);
+    const int64_t t1 = ggml_time_us();
+
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+    const int64_t t2 = ggml_time_us();
+
+    MTLCommandBufferStatus status = [cmd_buf status];
+    if (status != MTLCommandBufferStatusCompleted) {
+        GGML_LOG_INFO("%s: command buffer failed graph=%d range=%d stage=%s status=%lu\n",
+                __func__, graph_id, range_id, stage, status);
+        if (status == MTLCommandBufferStatusError) {
+            GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+        }
+        return GGML_STATUS_FAILED;
+    }
+
+    fprintf(stderr, "%s: graph=%d range=%d stage=%s nodes=%d encode=%.3f ms execute=%.3f ms total=%.3f ms\n",
+            __func__, graph_id, range_id, stage, idx_end - idx_start,
+            (t1 - t0) / 1000.0,
+            (t2 - t1) / 1000.0,
+            (t2 - t0) / 1000.0);
+    fflush(stderr);
+
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_metal_graph_compute_stage_profile(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    static int graph_id = 0;
+
+    const int cur_graph = graph_id++;
+
+    if (ctx->cmd_buf_last) {
+        [ctx->cmd_buf_last waitUntilCompleted];
+        ctx->cmd_buf_last = nil;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const char * stage = "other";
+    int idx_start = 0;
+    int range_id = 0;
+
+    for (int idx = 0; idx < gf->n_nodes; ++idx) {
+        struct ggml_tensor * node = ggml_graph_node(gf, idx);
+        const char * next_stage = ggml_metal_stage_profile_update_stage(node, stage);
+        if (strcmp(next_stage, stage) != 0 && idx_start < idx) {
+            enum ggml_status status = ggml_metal_stage_profile_encode_range(
+                    ctx, gf, idx_start, idx, stage, cur_graph, range_id++);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            idx_start = idx;
+        }
+        stage = next_stage;
+    }
+
+    enum ggml_status status = ggml_metal_stage_profile_encode_range(
+            ctx, gf, idx_start, gf->n_nodes, stage, cur_graph, range_id++);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+
+    const int64_t t1 = ggml_time_us();
+    fprintf(stderr, "%s: graph=%d ranges=%d nodes=%d total=%.3f ms\n",
+            __func__, cur_graph, range_id, gf->n_nodes, (t1 - t0) / 1000.0);
+    fflush(stderr);
+
+    return GGML_STATUS_SUCCESS;
+}
+
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
 
@@ -323,6 +522,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+    ggml_metal_op_mul_mat_log_stats();
+    ggml_metal_op_mul_mat_reset_stats();
     ggml_metal_op_mul_mat_id_log_stats();
     ggml_metal_op_mul_mat_id_reset_stats();
 
@@ -583,9 +784,19 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
+    ctx->trace_token = atomic_fetch_add_explicit(&g_ggml_metal_dsv4_trace_graph_index, 1, memory_order_relaxed);
 
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    if (ggml_metal_stage_profile_enabled()) {
+        static bool logged_stage_profile = false;
+        if (!logged_stage_profile) {
+            fprintf(stderr, "%s: LLAMA_FLASH_MOE_METAL_STAGE_PROFILE active\n", __func__);
+            logged_stage_profile = true;
+        }
+        return ggml_metal_graph_compute_stage_profile(ctx, gf);
+    }
 
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
@@ -841,7 +1052,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute,
             ctx->debug_graph,
-            ctx->debug_fusion);
+            ctx->debug_fusion,
+            ctx->trace_token,
+            (int) cb_idx);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

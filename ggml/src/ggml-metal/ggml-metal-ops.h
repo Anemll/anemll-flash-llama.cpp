@@ -28,7 +28,9 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion);
+        int  debug_fusion,
+        int  trace_token,
+        int  trace_command_buffer);
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
@@ -100,7 +102,19 @@ int ggml_metal_op_dsv4_hc_weighted_sum  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_expand        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_fp8_kv_quantize  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hadamard_fp4_quantize(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_indexer_weighted_score(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_compressor_pair_proj(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_mixed_attn(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_decode_compress(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_compressor_update_decode(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_compressor_update_decode_v2(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_kv_finalize_decode(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_ffn_moe_decode_stage(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_routed_moe_one_tensor_decode(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_decode_layer_executor_dryrun(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_decode_layer     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_rope_tail        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_attn_out_decode  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_transpose_1d (ggml_metal_op_t ctx, int idx);

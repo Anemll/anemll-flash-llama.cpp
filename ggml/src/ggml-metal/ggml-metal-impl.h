@@ -79,6 +79,7 @@
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
+#define FC_MUL_MM_M5_SGMATRIX          (FC_MUL_MM + 3)
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
 #define FC_SOLVE_TRI                   1000
@@ -344,6 +345,19 @@ typedef struct {
 
 typedef struct {
     int64_t  n_embd;
+    int64_t  n_tokens;
+    uint64_t sum_nb0;
+    uint64_t sum_nb1;
+    uint64_t norm_nb0;
+    uint64_t norm_nb1;
+    uint64_t mul_nb0;
+    uint64_t mul_nb1;
+    uint64_t weight_nb0;
+    float    norm_eps;
+} ggml_metal_kargs_dsv4_hc_weighted_sum_norm;
+
+typedef struct {
+    int64_t  n_embd;
     int64_t  n_hc;
     int64_t  n_tokens;
     int64_t  n_elem;
@@ -395,6 +409,151 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hadamard_fp4_quantize;
 
 typedef struct {
+    int64_t  n_comp;
+    int64_t  n_tokens;
+    int64_t  n_heads;
+    int64_t  n_elem;
+    uint64_t score_nb0;
+    uint64_t score_nb1;
+    uint64_t score_nb2;
+    uint64_t weights_nb0;
+    uint64_t weights_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    float    scale;
+} ggml_metal_kargs_dsv4_indexer_weighted_score;
+
+typedef struct {
+    int32_t  n_heads;
+    int32_t  n_raw;
+    int32_t  n_comp;
+    uint64_t q_nb1;
+    uint64_t q_nb2;
+    uint64_t raw_nb2;
+    uint64_t comp_nb2;
+    uint64_t raw_mask_nb0;
+    uint64_t raw_mask_nb1;
+    uint64_t comp_mask_nb0;
+    uint64_t comp_mask_nb1;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    float    scale;
+} ggml_metal_kargs_dsv4_mixed_attn;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  n_pool;
+    int32_t  n_dims;
+    int32_t  n_nope;
+    int32_t  n_ctx_orig;
+    int32_t  mode;
+    uint64_t kv_nb0;
+    uint64_t kv_nb1;
+    uint64_t score_nb0;
+    uint64_t score_nb1;
+    uint64_t norm_nb0;
+    uint64_t dst_nb0;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    float    norm_eps;
+    int32_t  output_stage;
+} ggml_metal_kargs_dsv4_decode_compress;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  width;
+    int64_t  rows;
+    int64_t  state_elems;
+    int32_t  pos;
+    int32_t  pos_mod;
+    int32_t  row;
+    int32_t  compress_ratio;
+    int32_t  should_compress;
+    int32_t  fused_comp;
+    int32_t  n_pool;
+    int32_t  n_dims;
+    int32_t  n_nope;
+    int32_t  n_ctx_orig;
+    int32_t  mode;
+    uint64_t prev_kv_nb0;
+    uint64_t prev_kv_nb1;
+    uint64_t prev_score_nb0;
+    uint64_t prev_score_nb1;
+    uint64_t ape_nb0;
+    uint64_t ape_nb1;
+    uint64_t norm_nb0;
+    uint64_t dst_nb0;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    float    norm_eps;
+} ggml_metal_kargs_dsv4_compressor_update_decode;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  width;
+    int64_t  rows;
+    int64_t  state_elems;
+    int64_t  pool_off_elems;
+    int32_t  pos;
+    int32_t  pos_mod;
+    int32_t  row;
+    int32_t  compress_ratio;
+    int32_t  should_compress;
+    int32_t  fused_comp;
+    int32_t  n_pool;
+    int32_t  n_dims;
+    int32_t  n_nope;
+    int32_t  n_ctx_orig;
+    int32_t  mode;
+    uint64_t kv_nb0;
+    uint64_t score_nb0;
+    uint64_t prev_kv_nb0;
+    uint64_t prev_kv_nb1;
+    uint64_t prev_score_nb0;
+    uint64_t prev_score_nb1;
+    uint64_t ape_nb0;
+    uint64_t ape_nb1;
+    uint64_t norm_nb0;
+    uint64_t dst_nb0;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    float    norm_eps;
+} ggml_metal_kargs_dsv4_compressor_update_decode_v2;
+
+typedef struct {
+    int32_t  width;
+    int32_t  n_rows;
+    int32_t  dry_run;
+    uint64_t src_nb0;
+    uint64_t src_nb1;
+    uint64_t src_nb2;
+    uint64_t src_nb3;
+    uint64_t cache_nb0;
+    uint64_t cache_nb1;
+    uint64_t cache_nb2;
+    uint64_t cache_nb3;
+    uint64_t rows_nb0;
+    uint64_t rows_nb1;
+    uint64_t rows_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_dsv4_kv_finalize_decode;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
@@ -423,6 +582,16 @@ typedef struct {
     float    beta_slow;
     bool     src2;
 } ggml_metal_kargs_dsv4_rope_tail;
+
+// DSV4 hybrid decode-layer orchestrator stub (T104).
+// At T104 the kernel performs a passthrough copy from src[0] to dst.
+// T105 will extend this struct with per-stage tensor offsets and replace
+// the kernel body with per-stage dispatch when stage_mask bits are set.
+typedef struct {
+    int32_t  layer_index;
+    uint32_t stage_mask;
+    uint64_t total_elems_f32;
+} ggml_metal_kargs_dsv4_decode_layer;
 
 typedef struct {
     int32_t  ne11;

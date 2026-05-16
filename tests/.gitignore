@@ -4,3 +4,10 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!fixtures/
+!fixtures/dsv4_layer_executor/
+!fixtures/dsv4_layer_executor/*.md
+!fixtures/dsv4_layer_executor/*.jsonl
+!fixtures/dsv4_layer_executor_negative/
+!fixtures/dsv4_layer_executor_negative/*/
+!fixtures/dsv4_layer_executor_negative/*/*.jsonl

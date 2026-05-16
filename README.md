@@ -1142,7 +1142,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 - Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
 - Any help with managing issues, PRs and projects is very appreciated!
 - See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+- Check the issue tracker and project notes before sending larger changes.
 - Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
 - A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
 

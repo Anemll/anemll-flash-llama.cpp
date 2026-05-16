@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -43,7 +44,9 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
+#include <vector>
 
 //
 // llama_context
@@ -51,8 +54,2471 @@
 
 static bool flash_moe_backend_trace_enabled();
 static void flash_moe_log_routed_backends(struct ggml_cgraph * gf, ggml_backend_sched_t sched);
+static bool dsv4_layer_executor_env_flag_enabled(const char * name);
 static constexpr uint32_t LLAMA_MOE_PREFILL_MICRO_BATCH_AUTO = uint32_t(-1);
 static constexpr uint32_t LLAMA_MOE_DEEPSEEK4_PREFILL_BATCH_SAFE_MAX = 8192;
+
+struct dsv4_layer_executor_payload_capture_entry {
+    std::string stage;
+    std::string tensor_name;
+    int layer = -1;
+    int64_t token = -1;
+    ggml_tensor * tensor = nullptr;
+};
+
+extern "C" void dsv4_layer_executor_payload_register(
+        const char  * stage,
+        int           layer,
+        int64_t       token,
+        const char  * tensor_name,
+        ggml_tensor * tensor);
+
+static bool dsv4_layer_executor_side_probe_payload_enabled_ctx() {
+    return dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_SIDE_PROBE_PAYLOAD");
+}
+
+static const char * dsv4_layer_executor_side_probe_payload_dir_ctx() {
+    const char * dir = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_SIDE_PROBE_PAYLOAD_DIR");
+    return dir != nullptr && dir[0] != '\0' ? dir : nullptr;
+}
+
+static std::vector<dsv4_layer_executor_payload_capture_entry> & dsv4_layer_executor_payload_registry() {
+    static auto * registry = new std::vector<dsv4_layer_executor_payload_capture_entry>();
+    return *registry;
+}
+
+static std::mutex & dsv4_layer_executor_payload_registry_mutex() {
+    static auto * mutex = new std::mutex();
+    return *mutex;
+}
+
+extern "C" void dsv4_layer_executor_payload_register(
+        const char  * stage,
+        int           layer,
+        int64_t       token,
+        const char  * tensor_name,
+        ggml_tensor * tensor) {
+    if (!dsv4_layer_executor_side_probe_payload_enabled_ctx() || tensor == nullptr || stage == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(dsv4_layer_executor_payload_registry_mutex());
+    auto & registry = dsv4_layer_executor_payload_registry();
+    registry.push_back({
+            stage,
+            tensor_name != nullptr ? tensor_name : "payload",
+            layer,
+            token,
+            tensor,
+    });
+}
+
+static std::string dsv4_layer_executor_payload_safe_name(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? "payload" : out;
+}
+
+static void dsv4_layer_executor_payload_flush() {
+    if (!dsv4_layer_executor_side_probe_payload_enabled_ctx()) {
+        return;
+    }
+    const char * dir_raw = dsv4_layer_executor_side_probe_payload_dir_ctx();
+    if (dir_raw == nullptr) {
+        return;
+    }
+
+    std::vector<dsv4_layer_executor_payload_capture_entry> entries;
+    {
+        std::lock_guard<std::mutex> lock(dsv4_layer_executor_payload_registry_mutex());
+        entries.swap(dsv4_layer_executor_payload_registry());
+    }
+    if (entries.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir_raw, ec);
+    if (ec) {
+        LLAMA_LOG_ERROR("%s: failed to create payload dir %s: %s\n", __func__, dir_raw, ec.message().c_str());
+        return;
+    }
+
+    for (const auto & entry : entries) {
+        if (entry.tensor == nullptr || entry.tensor->buffer == nullptr) {
+            continue;
+        }
+
+        const size_t bytes = ggml_nbytes(entry.tensor);
+        if (bytes == 0) {
+            continue;
+        }
+
+        std::vector<uint8_t> data(bytes);
+        ggml_backend_tensor_get(entry.tensor, data.data(), 0, bytes);
+
+        const std::string stage = dsv4_layer_executor_payload_safe_name(entry.stage);
+        const std::string tensor_name = dsv4_layer_executor_payload_safe_name(entry.tensor_name);
+        const std::string prefix = tensor_name.empty() || tensor_name == stage ? stage : stage + "_" + tensor_name;
+        const std::filesystem::path path =
+            std::filesystem::path(dir_raw) /
+            (prefix + "_l" + std::to_string(entry.layer) + "_t" + std::to_string((long long) entry.token) + ".bin");
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+            LLAMA_LOG_ERROR("%s: failed to write payload %s\n", __func__, path.string().c_str());
+            continue;
+        }
+        out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    }
+}
+
+static bool dsv4_attn_out_decode_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_DECODE_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_compressor_update_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_compressor_update_v2_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V2_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_compressor_update_v3_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * shadow = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_SHADOW");
+        const char * compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_COMPARE");
+        enabled =
+            shadow != nullptr && shadow[0] != '\0' && std::strcmp(shadow, "0") != 0 &&
+            compare != nullptr && compare[0] != '\0' && std::strcmp(compare, "0") != 0 ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_hc_pre_norm_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_HC_PRE_NORM_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_kv_finalize_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_KV_FINALIZE_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_ffn_moe_stage_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_layer_executor_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * shadow = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_SHADOW");
+        const char * compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_COMPARE");
+        enabled =
+            shadow != nullptr && shadow[0] != '\0' && std::strcmp(shadow, "0") != 0 &&
+            compare != nullptr && compare[0] != '\0' && std::strcmp(compare, "0") != 0 ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_indexed_attn_output_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * shadow = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_SHADOW");
+        const char * output = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_SHADOW_OUTPUT");
+        const char * compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_OUTPUT_COMPARE");
+        enabled =
+            shadow != nullptr && shadow[0] != '\0' && std::strcmp(shadow, "0") != 0 &&
+            output != nullptr && output[0] != '\0' && std::strcmp(output, "0") != 0 &&
+            compare != nullptr && compare[0] != '\0' && std::strcmp(compare, "0") != 0 ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_aohc_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * shadow = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_SHADOW");
+        const char * compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_COMPARE");
+        enabled =
+            shadow != nullptr && shadow[0] != '\0' && std::strcmp(shadow, "0") != 0 &&
+            compare != nullptr && compare[0] != '\0' && std::strcmp(compare, "0") != 0 ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_aohc_candidate_compare_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * shadow = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_SHADOW");
+        const char * candidate = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_CANDIDATE");
+        const char * compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_CANDIDATE_COMPARE");
+        const char * fused = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_AOHC_FUSED");
+        const char * fused_compare = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_AOHC_FUSED_COMPARE");
+        const bool candidate_compare =
+            shadow != nullptr && shadow[0] != '\0' && std::strcmp(shadow, "0") != 0 &&
+            candidate != nullptr && candidate[0] != '\0' && std::strcmp(candidate, "0") != 0 &&
+            compare != nullptr && compare[0] != '\0' && std::strcmp(compare, "0") != 0;
+        const bool fused_candidate_compare =
+            fused != nullptr && fused[0] != '\0' && std::strcmp(fused, "0") != 0 &&
+            fused_compare != nullptr && fused_compare[0] != '\0' && std::strcmp(fused_compare, "0") != 0;
+        enabled = (candidate_compare || fused_candidate_compare) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool dsv4_indexed_attn_diff_trace_eval_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_DIFF_TRACE");
+        enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static const char * dsv4_indexed_attn_arith_mode_eval() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_ARITH_MODE");
+    if (value != nullptr && value[0] != '\0') {
+        if (std::strcmp(value, "generic_attention") == 0) {
+            return "generic_flash";
+        }
+        if (std::strcmp(value, "mixed_attention") == 0) {
+            return "dsv4_mixed";
+        }
+        return value;
+    }
+
+    const char * legacy = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_SHADOW_IMPL");
+    if (legacy != nullptr && legacy[0] != '\0') {
+        if (std::strcmp(legacy, "generic_attention") == 0) {
+            return "generic_flash";
+        }
+        if (std::strcmp(legacy, "mixed_attention") == 0) {
+            return "dsv4_mixed";
+        }
+        return legacy;
+    }
+    return "dsv4_mixed";
+}
+
+static const char * dsv4_indexed_attn_shape_mode_eval() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_SHAPE_MODE");
+    return value != nullptr && value[0] != '\0' ? value : "sparse_topk";
+}
+
+static const char * dsv4_aohc_mode_eval() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_MODE");
+    return value != nullptr && value[0] != '\0' ? value : "generic_shadow";
+}
+
+static const char * dsv4_aohc_candidate_mode_eval() {
+    const char * fused = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_AOHC_FUSED");
+    if (fused != nullptr && fused[0] != '\0' && std::strcmp(fused, "0") != 0) {
+        return "aohc_fused_partial_q8hc";
+    }
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_CANDIDATE_MODE");
+    return value != nullptr && value[0] != '\0' ? value : "candidate_graph_exact";
+}
+
+static int64_t dsv4_indexed_attn_env_i64(const char * name, int64_t default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    return end != value ? (int64_t) parsed : default_value;
+}
+
+static bool dsv4_layer_executor_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' &&
+        std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 &&
+        std::strcmp(value, "OFF") != 0;
+}
+
+static bool dsv4_layer_executor_env_is_set(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0';
+}
+
+static bool dsv4_layer_executor_env_equals(const char * name, const char * expected) {
+    const char * value = std::getenv(name);
+    return value != nullptr && std::strcmp(value, expected) == 0;
+}
+
+static std::string dsv4_layer_executor_consume_style() {
+    const char * style = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_CONSUME_STYLE");
+    return style != nullptr && style[0] != '\0' ? style : "current_identity";
+}
+
+static bool dsv4_layer_executor_consume_style_supported(const std::string & style) {
+    return style == "same_tensor" ||
+        style == "view_alias" ||
+        style == "reshape_alias" ||
+        style == "add_zero" ||
+        style == "mul_one" ||
+        style == "copy_materialized" ||
+        style == "current_identity";
+}
+
+static bool dsv4_layer_executor_consume_style_materialized(const std::string & style) {
+    return style == "add_zero" ||
+        style == "mul_one" ||
+        style == "copy_materialized" ||
+        style == "current_identity";
+}
+
+static int64_t dsv4_layer_executor_env_i64(const char * name, int64_t default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    return end != value ? (int64_t) parsed : default_value;
+}
+
+static void dsv4_layer_executor_append_rejected_path(std::string & out, const char * env_name) {
+    if (!dsv4_layer_executor_env_flag_enabled(env_name)) {
+        return;
+    }
+    if (!out.empty()) {
+        out += ",";
+    }
+    out += env_name;
+}
+
+static std::string dsv4_layer_executor_rejected_paths_enabled() {
+    std::string out;
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_FULL_CONSUME");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_FUSED_COMP");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V2_FUSED_COMP");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_DOWN_SUM6");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_WEIGHTED_SWIGLU");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_SHARED_SWIGLU");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_WEIGHTED_DOWN");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_MIXED_ATTN");
+    dsv4_layer_executor_append_rejected_path(out, "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_KV_FINALIZE");
+    return out;
+}
+
+static std::string dsv4_layer_executor_consume_reject_reason() {
+    if (!dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_CONSUME")) {
+        return "consume_disabled";
+    }
+    if (!dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_SHADOW")) {
+        return "shadow_disabled";
+    }
+    if (!dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_COMPARE")) {
+        return "compare_disabled";
+    }
+    if (!dsv4_layer_executor_env_equals(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_CONSUME_MODEL",
+            "layer_output_identity")) {
+        return "bad_consume_model";
+    }
+    if (!dsv4_layer_executor_consume_style_supported(dsv4_layer_executor_consume_style())) {
+        return "bad_consume_style";
+    }
+    if (!dsv4_layer_executor_env_is_set("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_LAYER")) {
+        return "missing_layer_filter";
+    }
+    const int64_t layer = dsv4_layer_executor_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_LAYER", -1);
+    if (layer < 0) {
+        return "bad_layer_filter";
+    }
+    if (!dsv4_layer_executor_env_is_set("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MIN") ||
+            !dsv4_layer_executor_env_is_set("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MAX")) {
+        return "missing_token_range";
+    }
+    const int64_t token_min = dsv4_layer_executor_env_i64("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MIN", 0);
+    const int64_t token_max = dsv4_layer_executor_env_i64("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MAX", -1);
+    if (token_min > token_max) {
+        return "bad_token_range";
+    }
+    if (!dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_ABORT_ON_MISMATCH")) {
+        return "abort_on_mismatch_disabled";
+    }
+    const std::string rejected = dsv4_layer_executor_rejected_paths_enabled();
+    if (!rejected.empty()) {
+        return "rejected_paths_enabled:" + rejected;
+    }
+    return "";
+}
+
+static bool dsv4_layer_executor_consume_enabled() {
+    return dsv4_layer_executor_consume_reject_reason().empty();
+}
+
+static bool dsv4_attn_out_decode_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if (!dsv4_attn_out_decode_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    static constexpr const char * fused_prefix = "dsv4_attn_out_decode-";
+    static constexpr const char * work_prefix  = "dsv4_attn_out_decode_work-";
+    static constexpr const char * ref_prefix   = "dsv4_attn_out_decode_ref-";
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = true;
+        }
+        if (key) {
+            *key = name + std::strlen(ref_prefix);
+        }
+        return true;
+    }
+
+    if (std::strncmp(name, fused_prefix, std::strlen(fused_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = false;
+        }
+        if (key) {
+            *key = name + std::strlen(fused_prefix);
+        }
+        return true;
+    }
+
+    if (std::strncmp(name, work_prefix, std::strlen(work_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = false;
+        }
+        if (key) {
+            *key = name + std::strlen(work_prefix);
+        }
+        return true;
+    }
+
+    if (t->op == GGML_OP_DSV4_ATTN_OUT_DECODE) {
+        const char * dash = std::strrchr(name, '-');
+        if (dash == nullptr || dash[1] == '\0') {
+            return false;
+        }
+        if (is_ref) {
+            *is_ref = false;
+        }
+        if (key) {
+            *key = dash + 1;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool dsv4_attn_out_decode_compare_wants(const ggml_tensor * t) {
+    return dsv4_attn_out_decode_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_compressor_update_compare_key_one(
+        const char  * name,
+        const char  * fused_prefix,
+        const char  * ref_prefix,
+        const char  * kind,
+        bool        * is_ref,
+        std::string * key) {
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = true;
+        }
+        if (key) {
+            *key = std::string(kind) + ":" + (name + std::strlen(ref_prefix));
+        }
+        return true;
+    }
+
+    if (std::strncmp(name, fused_prefix, std::strlen(fused_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = false;
+        }
+        if (key) {
+            *key = std::string(kind) + ":" + (name + std::strlen(fused_prefix));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool dsv4_compressor_update_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if ((!dsv4_compressor_update_compare_eval_enabled() && !dsv4_compressor_update_v2_compare_eval_enabled()) ||
+            t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    const bool cupd = dsv4_compressor_update_compare_eval_enabled();
+    const bool cupd2 = dsv4_compressor_update_v2_compare_eval_enabled();
+
+    return (cupd && (dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd_kv_state-", "dsv4_cupd_kv_state_ref-", "kv_state", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd_score_state-", "dsv4_cupd_score_state_ref-", "score_state", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd_kv_comp-", "dsv4_cupd_kv_comp_ref-", "kv_comp", is_ref, key))) ||
+        (cupd2 && (dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd2_kv_state-", "dsv4_cupd2_kv_state_ref-", "cupd2_kv_state", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd2_score_state-", "dsv4_cupd2_score_state_ref-", "cupd2_score_state", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd2_kv_comp-", "dsv4_cupd2_kv_comp_ref-", "cupd2_kv_comp", is_ref, key)));
+}
+
+static bool dsv4_compressor_update_compare_wants(const ggml_tensor * t) {
+    return dsv4_compressor_update_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_compressor_update_v3_compare_key(
+        const ggml_tensor * t,
+        bool              * is_ref,
+        std::string       * key) {
+    if (!dsv4_compressor_update_v3_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return dsv4_compressor_update_compare_key_one(name,
+            "dsv4_cupd3_shadow-", "dsv4_cupd3_ref-", "cupd3", is_ref, key);
+}
+
+static bool dsv4_compressor_update_v3_compare_wants(const ggml_tensor * t) {
+    return dsv4_compressor_update_v3_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_kv_finalize_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if (!dsv4_kv_finalize_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return dsv4_compressor_update_compare_key_one(name,
+            "dsv4_kvfin_fused-", "dsv4_kvfin_ref-", "kvfin", is_ref, key);
+}
+
+static bool dsv4_kv_finalize_compare_wants(const ggml_tensor * t) {
+    return dsv4_kv_finalize_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_indexed_attn_output_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if (!dsv4_indexed_attn_output_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return dsv4_compressor_update_compare_key_one(name,
+            "dsv4_iattn_shadow_out-", "dsv4_iattn_ref-", "iattn_out", is_ref, key);
+}
+
+static bool dsv4_indexed_attn_output_compare_wants(const ggml_tensor * t) {
+    return dsv4_indexed_attn_output_compare_key(t, nullptr, nullptr);
+}
+
+struct dsv4_indexed_attn_output_compare_summary_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t compares = 0;
+    uint64_t over_tol_total = 0;
+    uint64_t exact_cases = 0;
+    uint64_t non_exact_cases = 0;
+    float max_abs = 0.0f;
+    double max_rms = 0.0;
+    std::string first_non_exact_key;
+};
+
+static dsv4_indexed_attn_output_compare_summary_state & dsv4_indexed_attn_output_compare_summary() {
+    static dsv4_indexed_attn_output_compare_summary_state state;
+    return state;
+}
+
+static void dsv4_indexed_attn_output_compare_print_summary() {
+    auto & state = dsv4_indexed_attn_output_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.compares == 0) {
+        return;
+    }
+
+    std::fprintf(stderr,
+            "dsv4_iattn_output_compare_summary: arith_mode=%s"
+            " compares=%" PRIu64
+            " output_max_abs=%g output_rms=%g over_tol=%" PRIu64
+            " exact_output=%d row_ids_exact=1 shadow_kv_exact=%s consume_path=disabled\n",
+            dsv4_indexed_attn_arith_mode_eval(),
+            state.compares,
+            double(state.max_abs),
+            state.max_rms,
+            state.over_tol_total,
+            state.max_abs == 0.0f && state.over_tol_total == 0 ? 1 : 0,
+            std::strcmp(dsv4_indexed_attn_arith_mode_eval(), "generic_flash") == 0 ? "proven_by_generic_attention" : "not_proven_in_this_run");
+
+    std::fprintf(stderr,
+            "dsv4_iattn_shape_summary: shape_mode=%s"
+            " subset_cases=%" PRIu64
+            " exact_cases=%" PRIu64
+            " non_exact_cases=%" PRIu64
+            " max_abs=%g max_rms=%g first_non_exact_key=%s consume_path=disabled\n",
+            dsv4_indexed_attn_shape_mode_eval(),
+            state.compares,
+            state.exact_cases,
+            state.non_exact_cases,
+            double(state.max_abs),
+            state.max_rms,
+            state.first_non_exact_key.empty() ? "none" : state.first_non_exact_key.c_str());
+}
+
+static void dsv4_indexed_attn_output_compare_note_summary(const std::string & key, float max_abs, double rms_err, size_t over_tol) {
+    auto & state = dsv4_indexed_attn_output_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.atexit_registered) {
+        std::atexit(dsv4_indexed_attn_output_compare_print_summary);
+        state.atexit_registered = true;
+    }
+    state.compares++;
+    state.over_tol_total += uint64_t(over_tol);
+    if (max_abs == 0.0f && over_tol == 0) {
+        state.exact_cases++;
+    } else {
+        state.non_exact_cases++;
+        if (state.first_non_exact_key.empty()) {
+            state.first_non_exact_key = key;
+        }
+    }
+    state.max_abs = std::max(state.max_abs, max_abs);
+    state.max_rms = std::max(state.max_rms, rms_err);
+}
+
+static bool dsv4_ffn_moe_stage_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if (!dsv4_ffn_moe_stage_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    return dsv4_compressor_update_compare_key_one(name,
+            "dsv4_ffnmoe_partial_fused-", "dsv4_ffnmoe_partial_ref-", "ffnmoe_partial", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_ffnmoe_gate_fused-", "dsv4_ffnmoe_gate_ref-", "ffnmoe_gate", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_ffnmoe_up_fused-", "dsv4_ffnmoe_up_ref-", "ffnmoe_up", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_ffnmoe_mid_fused-", "dsv4_ffnmoe_mid_ref-", "ffnmoe_mid", is_ref, key) ||
+        dsv4_compressor_update_compare_key_one(name,
+            "dsv4_ffnmoe_final_fused-", "dsv4_ffnmoe_final_ref-", "ffnmoe_final", is_ref, key);
+}
+
+static bool dsv4_ffn_moe_stage_compare_wants(const ggml_tensor * t) {
+    return dsv4_ffn_moe_stage_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_layer_executor_compare_key(
+        const ggml_tensor * t,
+        bool              * is_ref,
+        std::string       * key,
+        bool              * is_consume = nullptr) {
+    if (!dsv4_layer_executor_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    if (is_consume != nullptr) {
+        *is_consume = false;
+    }
+
+    static constexpr const char * ref_prefix = "dsv4_lexec_ref-";
+    static constexpr const char * shadow_prefix = "dsv4_lexec_shadow-";
+    static constexpr const char * shadow_consume_prefix = "dsv4_lexec_shadow_consume-";
+
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = true;
+        }
+        if (key != nullptr) {
+            *key = std::string("lexec:") + (name + std::strlen(ref_prefix));
+        }
+        return true;
+    }
+    if (std::strncmp(name, shadow_consume_prefix, std::strlen(shadow_consume_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = false;
+        }
+        if (key != nullptr) {
+            *key = std::string("lexec:") + (name + std::strlen(shadow_consume_prefix));
+        }
+        if (is_consume != nullptr) {
+            *is_consume = true;
+        }
+        return true;
+    }
+    if (std::strncmp(name, shadow_prefix, std::strlen(shadow_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = false;
+        }
+        if (key != nullptr) {
+            *key = std::string("lexec:") + (name + std::strlen(shadow_prefix));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool dsv4_layer_executor_compare_wants(const ggml_tensor * t) {
+    return dsv4_layer_executor_compare_key(t, nullptr, nullptr);
+}
+
+struct dsv4_layer_executor_key_parts {
+    std::string stage;
+    std::string tensor;
+    int layer = -1;
+    int64_t token = -1;
+};
+
+static bool dsv4_layer_executor_parse_key(const std::string & key, dsv4_layer_executor_key_parts * parts) {
+    std::string s = key;
+    static constexpr const char * prefix = "lexec:";
+    if (s.rfind(prefix, 0) == 0) {
+        s = s.substr(std::strlen(prefix));
+    }
+
+    const size_t ppos = s.rfind("-p");
+    const size_t lpos = ppos == std::string::npos ? std::string::npos : s.rfind("-l", ppos);
+    if (ppos == std::string::npos || lpos == std::string::npos || lpos >= ppos) {
+        return false;
+    }
+
+    dsv4_layer_executor_key_parts out;
+    try {
+        out.layer = std::stoi(s.substr(lpos + 2, ppos - (lpos + 2)));
+        out.token = std::stoll(s.substr(ppos + 2));
+    } catch (...) {
+        return false;
+    }
+
+    const std::string stage_tensor = s.substr(0, lpos);
+    const size_t sep = stage_tensor.find('-');
+    if (sep == std::string::npos) {
+        out.stage = stage_tensor;
+        out.tensor = "output";
+    } else {
+        out.stage = stage_tensor.substr(0, sep);
+        out.tensor = stage_tensor.substr(sep + 1);
+    }
+
+    if (out.stage.empty()) {
+        return false;
+    }
+
+    if (parts != nullptr) {
+        *parts = std::move(out);
+    }
+    return true;
+}
+
+struct dsv4_layer_executor_summary_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t total_compares = 0;
+    uint64_t total_over_tol = 0;
+    uint64_t layer_output_consumes = 0;
+    std::unordered_map<std::string, uint64_t> layer_output_consumes_by_style;
+    double largest_max_abs = 0.0;
+    double largest_rms_err = 0.0;
+    std::string largest_key;
+    std::unordered_map<std::string, uint64_t> stage_counts;
+    std::unordered_map<std::string, uint64_t> stage_over_tol;
+    std::unordered_map<int, uint64_t> layer_output_compares_by_layer;
+    std::unordered_set<int> layer_output_layers;
+    std::unordered_set<int64_t> layer_output_tokens;
+};
+
+static dsv4_layer_executor_summary_state & dsv4_layer_executor_summary() {
+    static dsv4_layer_executor_summary_state * state = new dsv4_layer_executor_summary_state();
+    return *state;
+}
+
+static const char * dsv4_layer_executor_dump_path() {
+    const char * path = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_DUMP");
+    return path != nullptr && path[0] != '\0' ? path : nullptr;
+}
+
+static bool dsv4_layer_executor_trace_enabled() {
+    const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TRACE");
+    return value != nullptr && value[0] != '\0' &&
+        std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 &&
+        std::strcmp(value, "OFF") != 0;
+}
+
+static std::string dsv4_layer_executor_json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+static FILE * dsv4_layer_executor_open_dump_file() {
+    const char * path = dsv4_layer_executor_dump_path();
+    if (path == nullptr) {
+        return nullptr;
+    }
+
+    static std::mutex * mutex = new std::mutex();
+    static std::unordered_set<std::string> * initialized = new std::unordered_set<std::string>();
+    {
+        std::lock_guard<std::mutex> lock(*mutex);
+        if (initialized->emplace(path).second) {
+            FILE * fp = std::fopen(path, "w");
+            if (fp != nullptr) {
+                std::fclose(fp);
+            }
+        }
+    }
+
+    FILE * fp = std::fopen(path, "a");
+    if (fp != nullptr) {
+        std::setvbuf(fp, nullptr, _IOLBF, 0);
+    }
+    return fp;
+}
+
+static std::string dsv4_layer_executor_layers_requested_string() {
+    const char * layer = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_LAYER");
+    return layer != nullptr && layer[0] != '\0' ? layer : "all";
+}
+
+static std::string dsv4_layer_executor_tokens_requested_string() {
+    const char * token_min = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MIN");
+    const char * token_max = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MAX");
+    if ((token_min == nullptr || token_min[0] == '\0') && (token_max == nullptr || token_max[0] == '\0')) {
+        return "all_decode";
+    }
+    std::string out = token_min != nullptr && token_min[0] != '\0' ? token_min : "-inf";
+    out += "..";
+    out += token_max != nullptr && token_max[0] != '\0' ? token_max : "+inf";
+    return out;
+}
+
+static std::string dsv4_layer_executor_env_string_or(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : fallback;
+}
+
+static void dsv4_layer_executor_print_summary() {
+    auto & state = dsv4_layer_executor_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const uint64_t layer_output_count = state.stage_counts["layer_output"];
+    const uint64_t expected_layer_output =
+        uint64_t(state.layer_output_layers.size()) * uint64_t(state.layer_output_tokens.size());
+    const bool shadow_enabled = dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_SHADOW");
+    const bool compare_enabled = dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_COMPARE");
+    const bool consume_enabled = dsv4_layer_executor_consume_enabled();
+    const bool abort_on_mismatch = dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_ABORT_ON_MISMATCH");
+    const std::string consume_model = dsv4_layer_executor_env_string_or(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_CONSUME_MODEL", "(none)");
+    const std::string consume_style = dsv4_layer_executor_consume_style();
+    const bool consume_materialized = dsv4_layer_executor_consume_style_materialized(consume_style);
+    const bool consume_same_tensor = consume_style == "same_tensor";
+    const std::string consume_layer = dsv4_layer_executor_env_string_or(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_LAYER", "(none)");
+    const std::string token_min = dsv4_layer_executor_env_string_or(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MIN", "(none)");
+    const std::string token_max = dsv4_layer_executor_env_string_or(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_TOKEN_MAX", "(none)");
+    const int consume_layer_i = dsv4_layer_executor_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_LAYER", -1);
+    const uint64_t expected_layer_output_consumes =
+        consume_enabled && consume_layer_i >= 0 ? state.layer_output_compares_by_layer[static_cast<int>(consume_layer_i)] : 0;
+    const std::string rejected_paths = dsv4_layer_executor_rejected_paths_enabled();
+    const std::string reject_reason = dsv4_layer_executor_consume_reject_reason();
+
+    std::fprintf(stderr,
+            "dsv4_lexec_summary: enabled=1 shadow_enabled=%d compare_enabled=%d consume_enabled=%d"
+            " consume_model=%s consume_style=%s consume_materialized=%d consume_layer=%s token_min=%s token_max=%s"
+            " layers_requested=%s tokens_requested=%s"
+            " layer_output_compares=%" PRIu64
+            " expected_layer_output_compares=%" PRIu64
+            " layer_output_consumes=%" PRIu64
+            " expected_layer_output_consumes=%" PRIu64
+            " dsv4_lexec_consume=%" PRIu64
+            " over_tol=%" PRIu64
+            " total_compares=%" PRIu64
+            " largest_max_abs=%g largest_rms_err=%g largest_key=%s"
+            " abort_on_mismatch=%d cache_mutation_disabled=1 rejected_paths_enabled=%s"
+            " consume_reject_reason=%s transcript_consumed=%s consume_path=%s downstream_shadow_consumed=%d\n",
+            shadow_enabled ? 1 : 0,
+            compare_enabled ? 1 : 0,
+            consume_enabled ? 1 : 0,
+            consume_model.c_str(),
+            consume_style.c_str(),
+            consume_materialized ? 1 : 0,
+            consume_layer.c_str(),
+            token_min.c_str(),
+            token_max.c_str(),
+            dsv4_layer_executor_layers_requested_string().c_str(),
+            dsv4_layer_executor_tokens_requested_string().c_str(),
+            layer_output_count,
+            expected_layer_output,
+            state.layer_output_consumes,
+            expected_layer_output_consumes,
+            state.layer_output_consumes,
+            state.total_over_tol,
+            state.total_compares,
+            state.largest_max_abs,
+            state.largest_rms_err,
+            state.largest_key.empty() ? "(none)" : state.largest_key.c_str(),
+            abort_on_mismatch ? 1 : 0,
+            rejected_paths.empty() ? "none" : rejected_paths.c_str(),
+            reject_reason.c_str(),
+            consume_enabled ? (consume_same_tensor ? "generic_same_tensor" : "shadow_identity_selected_layer") : "generic",
+            consume_enabled ? (consume_same_tensor ? "same_tensor_guard_only" : "layer_output_identity") : "disabled",
+            consume_enabled && !consume_same_tensor ? 1 : 0);
+
+    FILE * fp = dsv4_layer_executor_open_dump_file();
+    if (fp != nullptr) {
+        std::fprintf(fp,
+                "{\"summary\":true,\"enabled\":1,\"shadow_enabled\":%s,\"compare_enabled\":%s,"
+                "\"consume_enabled\":%s,\"consume_model\":\"%s\",\"consume_style\":\"%s\","
+                "\"consume_materialized\":%s,\"consume_layer\":\"%s\","
+                "\"token_min\":\"%s\",\"token_max\":\"%s\","
+                "\"layers_requested\":\"%s\",\"tokens_requested\":\"%s\","
+                "\"layer_output_compares\":%" PRIu64 ",\"expected_layer_output_compares\":%" PRIu64 ","
+                "\"layer_output_consumes\":%" PRIu64 ",\"expected_layer_output_consumes\":%" PRIu64 ","
+                "\"dsv4_lexec_consume\":%" PRIu64 ","
+                "\"over_tol\":%" PRIu64 ",\"total_compares\":%" PRIu64 ","
+                "\"largest_max_abs\":%.9g,\"largest_rms_err\":%.9g,"
+                "\"abort_on_mismatch\":%s,\"cache_mutation_disabled\":true,"
+                "\"rejected_paths_enabled\":\"%s\",\"consume_reject_reason\":\"%s\","
+                "\"transcript_consumed\":\"%s\",\"consume_path\":\"%s\","
+                "\"downstream_shadow_consumed\":%s}\n",
+                shadow_enabled ? "true" : "false",
+                compare_enabled ? "true" : "false",
+                consume_enabled ? "true" : "false",
+                dsv4_layer_executor_json_escape(consume_model).c_str(),
+                dsv4_layer_executor_json_escape(consume_style).c_str(),
+                consume_materialized ? "true" : "false",
+                dsv4_layer_executor_json_escape(consume_layer).c_str(),
+                dsv4_layer_executor_json_escape(token_min).c_str(),
+                dsv4_layer_executor_json_escape(token_max).c_str(),
+                dsv4_layer_executor_json_escape(dsv4_layer_executor_layers_requested_string()).c_str(),
+                dsv4_layer_executor_json_escape(dsv4_layer_executor_tokens_requested_string()).c_str(),
+                layer_output_count,
+                expected_layer_output,
+                state.layer_output_consumes,
+                expected_layer_output_consumes,
+                state.layer_output_consumes,
+                state.total_over_tol,
+                state.total_compares,
+                state.largest_max_abs,
+                state.largest_rms_err,
+                abort_on_mismatch ? "true" : "false",
+                dsv4_layer_executor_json_escape(rejected_paths.empty() ? "none" : rejected_paths).c_str(),
+                dsv4_layer_executor_json_escape(reject_reason).c_str(),
+                consume_enabled ? (consume_same_tensor ? "generic_same_tensor" : "shadow_identity_selected_layer") : "generic",
+                consume_enabled ? (consume_same_tensor ? "same_tensor_guard_only" : "layer_output_identity") : "disabled",
+                consume_enabled && !consume_same_tensor ? "true" : "false");
+        std::fclose(fp);
+    }
+}
+
+static void dsv4_layer_executor_note_compare(
+        const std::string & key,
+        double              max_abs,
+        double              rms_err,
+        size_t              over_tol,
+        bool                consumed) {
+    auto & state = dsv4_layer_executor_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (!state.atexit_registered) {
+        std::atexit(dsv4_layer_executor_print_summary);
+        state.atexit_registered = true;
+    }
+
+    dsv4_layer_executor_key_parts parts;
+    const bool parsed = dsv4_layer_executor_parse_key(key, &parts);
+    const std::string stage = parsed ? parts.stage : "unknown";
+    state.total_compares++;
+    state.total_over_tol += uint64_t(over_tol);
+    state.stage_counts[stage]++;
+    state.stage_over_tol[stage] += uint64_t(over_tol);
+    if (parsed && parts.stage == "layer_output") {
+        state.layer_output_layers.insert(parts.layer);
+        state.layer_output_tokens.insert(parts.token);
+        state.layer_output_compares_by_layer[parts.layer]++;
+        if (consumed) {
+            state.layer_output_consumes++;
+            const std::string style = dsv4_layer_executor_consume_style();
+            state.layer_output_consumes_by_style[style]++;
+        }
+    }
+    if (max_abs > state.largest_max_abs || rms_err > state.largest_rms_err) {
+        state.largest_max_abs = std::max(state.largest_max_abs, max_abs);
+        state.largest_rms_err = std::max(state.largest_rms_err, rms_err);
+        state.largest_key = key;
+    }
+}
+
+static void dsv4_layer_executor_write_json_number(FILE * fp, double value) {
+    if (std::isfinite(value)) {
+        std::fprintf(fp, "%.9g", value);
+    } else {
+        std::fputs("null", fp);
+    }
+}
+
+static void dsv4_layer_executor_dump_compare_json(
+        const std::string & key,
+        const std::string & shape,
+        const std::string & shadow_name,
+        const std::string & shadow_op,
+        const std::string & shadow_src0_name,
+        const std::string & shadow_src0_op,
+        double              max_abs,
+        double              max_rel,
+        double              mean_abs,
+        double              rms_err,
+        size_t              over_tol,
+        size_t              first_bad_index,
+        bool                consumed,
+        bool                consume_allowed,
+        const char        * consume_reason) {
+    FILE * fp = dsv4_layer_executor_open_dump_file();
+    if (fp == nullptr) {
+        return;
+    }
+
+    dsv4_layer_executor_key_parts parts;
+    const bool parsed = dsv4_layer_executor_parse_key(key, &parts);
+    const std::string stage = parsed ? parts.stage : "unknown";
+    const std::string tensor = parsed ? parts.tensor : key;
+    const std::string consume_style = dsv4_layer_executor_consume_style();
+    const bool consume_materialized = dsv4_layer_executor_consume_style_materialized(consume_style);
+    const bool downstream_consumed = consumed && consume_style != "same_tensor";
+
+    std::fprintf(fp,
+            "{\"token\":%lld,\"layer\":%d,\"stage\":\"%s\",\"tensor\":\"%s\","
+            "\"shape\":\"%s\",\"dtype\":\"f32\",\"implemented\":true,"
+            "\"consume_style\":\"%s\",\"consume_materialized\":%s,"
+            "\"shadow_tensor\":\"%s\",\"shadow_op\":\"%s\","
+            "\"shadow_src0\":\"%s\",\"shadow_src0_op\":\"%s\","
+            "\"max_abs\":",
+            (long long) (parsed ? parts.token : -1),
+            parsed ? parts.layer : -1,
+            dsv4_layer_executor_json_escape(stage).c_str(),
+            dsv4_layer_executor_json_escape(tensor).c_str(),
+            dsv4_layer_executor_json_escape(shape).c_str(),
+            dsv4_layer_executor_json_escape(consume_style).c_str(),
+            consume_materialized ? "true" : "false",
+            dsv4_layer_executor_json_escape(shadow_name).c_str(),
+            dsv4_layer_executor_json_escape(shadow_op).c_str(),
+            dsv4_layer_executor_json_escape(shadow_src0_name).c_str(),
+            dsv4_layer_executor_json_escape(shadow_src0_op).c_str());
+    dsv4_layer_executor_write_json_number(fp, max_abs);
+    std::fputs(",\"max_rel\":", fp);
+    dsv4_layer_executor_write_json_number(fp, max_rel);
+    std::fputs(",\"mean_abs\":", fp);
+    dsv4_layer_executor_write_json_number(fp, mean_abs);
+    std::fputs(",\"rms_err\":", fp);
+    dsv4_layer_executor_write_json_number(fp, rms_err);
+    std::fprintf(fp,
+            ",\"over_tol\":%zu,\"first_bad_index\":%lld,"
+            "\"consume\":\"%s\",\"consumed\":%s,\"consume_allowed\":%s,"
+            "\"downstream_consumed\":%s,\"consume_reason\":\"%s\"}\n",
+            over_tol,
+            over_tol > 0 ? (long long) first_bad_index : -1ll,
+            consumed ? "shadow_identity" : "generic",
+            consumed ? "true" : "false",
+            consume_allowed ? "true" : "false",
+            downstream_consumed ? "true" : "false",
+            dsv4_layer_executor_json_escape(consume_reason != nullptr ? consume_reason : "").c_str());
+    std::fclose(fp);
+}
+
+static void dsv4_ffn_moe_stage_compare_tolerance(
+        const std::string & key,
+        float * abs_tol,
+        float * rel_tol) {
+    // Gate/up projections should be bit-identical. The V2 stage fuses weighted
+    // SwiGLU and down partials into a different float pipeline, so use a tight
+    // tolerance there and keep deterministic transcript validation as the hard gate.
+    if (key.find("ffnmoe_gate") == 0 || key.find("ffnmoe_up") == 0) {
+        *abs_tol = 0.0f;
+        *rel_tol = 0.0f;
+        return;
+    }
+
+    if (key.find("ffnmoe_mid") == 0) {
+        *abs_tol = 2.0e-6f;
+        *rel_tol = 2.0e-6f;
+        return;
+    }
+
+    *abs_tol = 5.0e-6f;
+    *rel_tol = 5.0e-5f;
+}
+
+static bool dsv4_hc_pre_norm_compare_key_one(
+        const char  * name,
+        const char  * fused_prefix,
+        const char  * ref_prefix,
+        const char  * kind,
+        bool        * is_ref,
+        std::string * key) {
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = true;
+        }
+        if (key) {
+            *key = std::string(kind) + ":" + (name + std::strlen(ref_prefix));
+        }
+        return true;
+    }
+
+    if (std::strncmp(name, fused_prefix, std::strlen(fused_prefix)) == 0) {
+        if (is_ref) {
+            *is_ref = false;
+        }
+        if (key) {
+            *key = std::string(kind) + ":" + (name + std::strlen(fused_prefix));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool dsv4_hc_pre_norm_compare_key(const ggml_tensor * t, bool * is_ref, std::string * key) {
+    if (!dsv4_hc_pre_norm_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    if (dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_cur_fused-", "dsv4_hcnorm_cur_ref-", "cur", is_ref, key)) {
+        return true;
+    }
+
+    if (dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_out_fused-", "dsv4_hcnorm_out_ref-", "norm", is_ref, key)) {
+        return true;
+    }
+
+    if (dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_pre_fused-", "dsv4_hcnorm_pre_ref-", "pre", is_ref, key)) {
+        return true;
+    }
+
+    if (dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_postw_fused-", "dsv4_hcnorm_postw_ref-", "postw", is_ref, key)) {
+        return true;
+    }
+
+    if (dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_comb_fused-", "dsv4_hcnorm_comb_ref-", "comb", is_ref, key)) {
+        return true;
+    }
+
+    return dsv4_hc_pre_norm_compare_key_one(name,
+            "dsv4_hcnorm_post_fused-", "dsv4_hcnorm_post_ref-", "post", is_ref, key);
+}
+
+static bool dsv4_hc_pre_norm_compare_wants(const ggml_tensor * t) {
+    return dsv4_hc_pre_norm_compare_key(t, nullptr, nullptr);
+}
+
+static bool dsv4_attn_out_decode_copy_f32(const ggml_tensor * t, std::vector<float> & out) {
+    if (t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const size_t n = ggml_nelements(t);
+    const size_t bytes = n * sizeof(float);
+    out.resize(n);
+
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        std::memcpy(out.data(), t->data, bytes);
+    } else {
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), out.data(), 0, bytes);
+    }
+
+    return true;
+}
+
+static std::string dsv4_compare_shape_string(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return "null";
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "[%lld,%lld,%lld,%lld]/%s",
+            (long long) t->ne[0], (long long) t->ne[1],
+            (long long) t->ne[2], (long long) t->ne[3],
+            ggml_type_name(t->type));
+    return buf;
+}
+
+static bool dsv4_aohc_compare_key(
+        const ggml_tensor * t,
+        bool              * is_ref,
+        std::string       * key) {
+    if (!dsv4_aohc_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    static constexpr const char * ref_prefix = "dsv4_aohc_ref-";
+    static constexpr const char * shadow_prefix = "dsv4_aohc_shadow-";
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = true;
+        }
+        if (key != nullptr) {
+            *key = std::string("aohc:") + (name + std::strlen(ref_prefix));
+        }
+        return true;
+    }
+    if (std::strncmp(name, shadow_prefix, std::strlen(shadow_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = false;
+        }
+        if (key != nullptr) {
+            *key = std::string("aohc:") + (name + std::strlen(shadow_prefix));
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool dsv4_aohc_compare_wants(const ggml_tensor * t) {
+    return dsv4_aohc_compare_key(t, nullptr, nullptr);
+}
+
+struct dsv4_aohc_compare_summary_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t stage_cases = 0;
+    uint64_t exact_cases = 0;
+    uint64_t non_exact_cases = 0;
+    uint64_t over_tol_total = 0;
+    double max_abs = 0.0;
+    double max_rms = 0.0;
+    std::string first_non_exact_key;
+};
+
+static dsv4_aohc_compare_summary_state & dsv4_aohc_compare_summary() {
+    static dsv4_aohc_compare_summary_state state;
+    return state;
+}
+
+static std::string dsv4_aohc_env_or(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : fallback;
+}
+
+static void dsv4_aohc_compare_print_summary() {
+    auto & state = dsv4_aohc_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.stage_cases == 0) {
+        return;
+    }
+
+    std::fprintf(stderr,
+            "dsv4_aohc_compare_summary: mode=%s"
+            " layer_filter=%s token_min=%s token_max=%s"
+            " dsv4_aohc_shadow=%" PRIu64
+            " stage_cases=%" PRIu64
+            " exact_cases=%" PRIu64
+            " non_exact_cases=%" PRIu64
+            " max_abs=%g max_rms=%g over_tol=%" PRIu64
+            " first_non_exact_key=%s consume_path=disabled\n",
+            dsv4_aohc_mode_eval(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_LAYER", "all").c_str(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_TOKEN_MIN", "all").c_str(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_TOKEN_MAX", "all").c_str(),
+            state.stage_cases,
+            state.stage_cases,
+            state.exact_cases,
+            state.non_exact_cases,
+            state.max_abs,
+            state.max_rms,
+            state.over_tol_total,
+            state.first_non_exact_key.empty() ? "none" : state.first_non_exact_key.c_str());
+}
+
+static void dsv4_aohc_compare_note_summary(const std::string & key, double max_abs, double rms_err, size_t over_tol) {
+    auto & state = dsv4_aohc_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.atexit_registered) {
+        std::atexit(dsv4_aohc_compare_print_summary);
+        state.atexit_registered = true;
+    }
+    state.stage_cases++;
+    state.over_tol_total += uint64_t(over_tol);
+    if (max_abs == 0.0 && over_tol == 0) {
+        state.exact_cases++;
+    } else {
+        state.non_exact_cases++;
+        if (state.first_non_exact_key.empty()) {
+            state.first_non_exact_key = key;
+        }
+    }
+    state.max_abs = std::max(state.max_abs, max_abs);
+    state.max_rms = std::max(state.max_rms, rms_err);
+}
+
+static bool dsv4_aohc_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_aohc_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> shadow_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        shadow_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto shadow_it = shadow_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (shadow_it == shadow_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & shadow = shadow_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(shadow.size(), ref.size());
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = shadow.size() == ref.size() ? 0 : std::max(shadow.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = shadow[i] == ref[i] ? 0.0f : std::fabs(shadow[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    dsv4_aohc_compare_note_summary(key, double(max_abs), rms_err, over_tol);
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 128 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_aohc_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu first_bad_index=%zu shadow=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                shadow_it->second.name.c_str(), shadow_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(),
+                n, double(max_abs), double(max_rel), mean_abs, rms_err, over_tol, max_idx,
+                n > 0 ? double(shadow[max_idx]) : 0.0,
+                n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    shadow_by_key.erase(shadow_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_aohc_candidate_compare_key(
+        const ggml_tensor * t,
+        bool              * is_ref,
+        std::string       * key) {
+    if (!dsv4_aohc_candidate_compare_eval_enabled() || t == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+
+    static constexpr const char * ref_prefix = "dsv4_aohc_candidate_ref-";
+    static constexpr const char * cand_prefix = "dsv4_aohc_candidate_out-";
+    if (std::strncmp(name, ref_prefix, std::strlen(ref_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = true;
+        }
+        if (key != nullptr) {
+            *key = std::string("aohc_candidate:") + (name + std::strlen(ref_prefix));
+        }
+        return true;
+    }
+    if (std::strncmp(name, cand_prefix, std::strlen(cand_prefix)) == 0) {
+        if (is_ref != nullptr) {
+            *is_ref = false;
+        }
+        if (key != nullptr) {
+            *key = std::string("aohc_candidate:") + (name + std::strlen(cand_prefix));
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool dsv4_aohc_candidate_compare_wants(const ggml_tensor * t) {
+    return dsv4_aohc_candidate_compare_key(t, nullptr, nullptr);
+}
+
+struct dsv4_aohc_candidate_compare_summary_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t compared_cases = 0;
+    uint64_t exact_cases = 0;
+    uint64_t non_exact_cases = 0;
+    uint64_t over_tol_total = 0;
+    double max_abs = 0.0;
+    double max_rms = 0.0;
+    std::string first_non_exact_key;
+};
+
+static dsv4_aohc_candidate_compare_summary_state & dsv4_aohc_candidate_compare_summary() {
+    static dsv4_aohc_candidate_compare_summary_state state;
+    return state;
+}
+
+static void dsv4_aohc_candidate_compare_print_summary() {
+    auto & state = dsv4_aohc_candidate_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.compared_cases == 0) {
+        return;
+    }
+
+    std::fprintf(stderr,
+            "dsv4_aohc_candidate_summary: mode=%s"
+            " layer_filter=%s token_min=%s token_max=%s"
+            " dsv4_aohc_candidate=%" PRIu64
+            " dsv4_aohc_candidate_exact=%" PRIu64
+            " compared_cases=%" PRIu64
+            " exact_cases=%" PRIu64
+            " non_exact_cases=%" PRIu64
+            " max_abs=%g max_rms=%g over_tol=%" PRIu64
+            " first_non_exact_key=%s dependency_audit_pass=1 consume_path=disabled\n",
+            dsv4_aohc_candidate_mode_eval(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_LAYER", "all").c_str(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_TOKEN_MIN", "all").c_str(),
+            dsv4_aohc_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ATTN_OUT_HC_POST_TOKEN_MAX", "all").c_str(),
+            state.compared_cases,
+            state.exact_cases,
+            state.compared_cases,
+            state.exact_cases,
+            state.non_exact_cases,
+            state.max_abs,
+            state.max_rms,
+            state.over_tol_total,
+            state.first_non_exact_key.empty() ? "none" : state.first_non_exact_key.c_str());
+}
+
+static void dsv4_aohc_candidate_compare_note_summary(const std::string & key, double max_abs, double rms_err, size_t over_tol) {
+    auto & state = dsv4_aohc_candidate_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.atexit_registered) {
+        std::atexit(dsv4_aohc_candidate_compare_print_summary);
+        state.atexit_registered = true;
+    }
+    state.compared_cases++;
+    state.over_tol_total += uint64_t(over_tol);
+    if (max_abs == 0.0 && over_tol == 0) {
+        state.exact_cases++;
+    } else {
+        state.non_exact_cases++;
+        if (state.first_non_exact_key.empty()) {
+            state.first_non_exact_key = key;
+        }
+    }
+    state.max_abs = std::max(state.max_abs, max_abs);
+    state.max_rms = std::max(state.max_rms, rms_err);
+}
+
+static bool dsv4_aohc_candidate_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_aohc_candidate_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> cand_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        cand_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto cand_it = cand_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (cand_it == cand_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & cand = cand_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(cand.size(), ref.size());
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = cand.size() == ref.size() ? 0 : std::max(cand.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = cand[i] == ref[i] ? 0.0f : std::fabs(cand[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    dsv4_aohc_candidate_compare_note_summary(key, double(max_abs), rms_err, over_tol);
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 128 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_aohc_candidate_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu first_bad_index=%zu candidate=%g refv=%g dependency_audit_pass=1\n",
+                __func__, key.c_str(), cmp_id,
+                cand_it->second.name.c_str(), cand_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(),
+                n, double(max_abs), double(max_rel), mean_abs, rms_err, over_tol, max_idx,
+                n > 0 ? double(cand[max_idx]) : 0.0,
+                n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    cand_by_key.erase(cand_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_hc_pre_norm_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_hc_pre_norm_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> fused_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        fused_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto fused_it = fused_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (fused_it == fused_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & fused = fused_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(fused.size(), ref.size());
+    float abs_tol = 0.0f;
+    float rel_tol = 0.0f;
+    dsv4_ffn_moe_stage_compare_tolerance(key, &abs_tol, &rel_tol);
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = fused.size() == ref.size() ? 0 : std::max(fused.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = fused[i] == ref[i] ? 0.0f : std::fabs(fused[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 1.0e-5f + 1.0e-5f * std::fabs(ref[i])) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 256 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_hc_pre_norm_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu idx=%zu fused=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                fused_it->second.name.c_str(), fused_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, rms_err, over_tol,
+                max_idx, n > 0 ? double(fused[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    fused_by_key.erase(fused_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_compressor_update_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_compressor_update_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> fused_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t) };
+    } else {
+        fused_by_key[key] = { std::move(data), ggml_get_name(t) };
+    }
+
+    auto fused_it = fused_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (fused_it == fused_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & fused = fused_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(fused.size(), ref.size());
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = fused.size() == ref.size() ? 0 : std::max(fused.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = fused[i] == ref[i] ? 0.0f : std::fabs(fused[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 1.0e-3f + 1.0e-3f * std::fabs(ref[i])) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 128 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_compressor_update_compare key=%s cmp=%" PRIu64
+                " tensor=%s ref=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g over_tol=%zu idx=%zu fused=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                fused_it->second.name.c_str(), ref_it->second.name.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, over_tol,
+                max_idx, n > 0 ? double(fused[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    fused_by_key.erase(fused_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+struct dsv4_cupd3_compare_summary_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t cases = 0;
+    uint64_t exact_cases = 0;
+    uint64_t non_exact_cases = 0;
+    uint64_t over_tol_total = 0;
+    double max_abs = 0.0;
+    double max_rms = 0.0;
+    std::string first_non_exact_key;
+};
+
+static dsv4_cupd3_compare_summary_state & dsv4_cupd3_compare_summary() {
+    static dsv4_cupd3_compare_summary_state state;
+    return state;
+}
+
+static std::string dsv4_cupd3_env_or(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : fallback;
+}
+
+static void dsv4_cupd3_compare_print_summary() {
+    auto & state = dsv4_cupd3_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.cases == 0) {
+        return;
+    }
+    const bool consume_enabled = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_CONSUME") != nullptr &&
+        std::strcmp(std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_CONSUME"), "0") != 0;
+
+    std::fprintf(stderr,
+            "dsv4_cupd3_summary: mode=%s layer_filter=%s token_min=%s token_max=%s"
+            " cases=%" PRIu64 " exact_cases=%" PRIu64 " non_exact_cases=%" PRIu64
+            " max_abs=%g max_rms=%g over_tol=%" PRIu64
+            " first_non_exact_layer=-1 first_non_exact_token=-1 first_non_exact_tensor=%s"
+            " projection_source=%s cache_mutation=%s consume_path=%s\n",
+            dsv4_cupd3_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_MODE", "generic_shadow").c_str(),
+            dsv4_cupd3_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_LAYER", "all").c_str(),
+            dsv4_cupd3_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_TOKEN_MIN", "all").c_str(),
+            dsv4_cupd3_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_TOKEN_MAX", "all").c_str(),
+            state.cases,
+            state.exact_cases,
+            state.non_exact_cases,
+            state.max_abs,
+            state.max_rms,
+            state.over_tol_total,
+            state.first_non_exact_key.empty() ? "none" : state.first_non_exact_key.c_str(),
+            dsv4_cupd3_env_or("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_COMPRESSOR_UPDATE_V3_PROJECTION_SOURCE", "generic").c_str(),
+            consume_enabled ? "generic_existing_write" : "disabled",
+            consume_enabled ? "tail_candidate_generic_cache" : "disabled");
+}
+
+static void dsv4_cupd3_compare_note_summary(const std::string & key, double max_abs, double rms_err, size_t over_tol) {
+    auto & state = dsv4_cupd3_compare_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.atexit_registered) {
+        std::atexit(dsv4_cupd3_compare_print_summary);
+        state.atexit_registered = true;
+    }
+    state.cases++;
+    state.over_tol_total += uint64_t(over_tol);
+    if (max_abs == 0.0 && over_tol == 0) {
+        state.exact_cases++;
+    } else {
+        state.non_exact_cases++;
+        if (state.first_non_exact_key.empty()) {
+            state.first_non_exact_key = key;
+        }
+    }
+    state.max_abs = std::max(state.max_abs, max_abs);
+    state.max_rms = std::max(state.max_rms, rms_err);
+}
+
+static bool dsv4_compressor_update_v3_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_compressor_update_v3_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> shadow_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        shadow_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto shadow_it = shadow_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (shadow_it == shadow_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & shadow = shadow_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(shadow.size(), ref.size());
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = shadow.size() == ref.size() ? 0 : std::max(shadow.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = shadow[i] == ref[i] ? 0.0f : std::fabs(shadow[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    dsv4_cupd3_compare_note_summary(key, double(max_abs), rms_err, over_tol);
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 256 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_cupd3_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu first_bad_index=%zu shadow=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                shadow_it->second.name.c_str(), shadow_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(),
+                n, double(max_abs), double(max_rel), mean_abs, rms_err, over_tol, max_idx,
+                n > 0 ? double(shadow[max_idx]) : 0.0,
+                n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    shadow_by_key.erase(shadow_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_kv_finalize_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_kv_finalize_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> fused_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        fused_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto fused_it = fused_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (fused_it == fused_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & fused = fused_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(fused.size(), ref.size());
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = fused.size() == ref.size() ? 0 : std::max(fused.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = fused[i] == ref[i] ? 0.0f : std::fabs(fused[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 256 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_kv_finalize_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu idx=%zu fused=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                fused_it->second.name.c_str(), fused_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, rms_err, over_tol,
+                max_idx, n > 0 ? double(fused[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    fused_by_key.erase(fused_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_indexed_attn_output_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_indexed_attn_output_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> shadow_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        shadow_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto shadow_it = shadow_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (shadow_it == shadow_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & shadow = shadow_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(shadow.size(), ref.size());
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = shadow.size() == ref.size() ? 0 : std::max(shadow.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = shadow[i] == ref[i] ? 0.0f : std::fabs(shadow[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    dsv4_indexed_attn_output_compare_note_summary(key, max_abs, rms_err, over_tol);
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 256 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_indexed_attn_output_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu idx=%zu shadow=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                shadow_it->second.name.c_str(), shadow_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, rms_err, over_tol,
+                max_idx, n > 0 ? double(shadow[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+    if (dsv4_indexed_attn_diff_trace_eval_enabled() && n > 0 && max_abs > 0.0f) {
+        const int64_t requested_head = dsv4_indexed_attn_env_i64("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_INDEXED_ATTN_DIFF_HEAD", -1);
+        const int64_t head_dim = t->ne[0] > 0 ? t->ne[0] : 512;
+        const int64_t first_bad_dim = int64_t(max_idx % size_t(head_dim));
+        const int64_t first_bad_head = int64_t(max_idx / size_t(head_dim));
+        if (requested_head < 0 || requested_head == first_bad_head) {
+            std::fprintf(stderr,
+                    "dsv4_iattn_diff_trace: key=%s first_nonzero_delta_stage=attention_output"
+                    " first_bad_output_index=%zu first_bad_head=%lld first_bad_dim=%lld"
+                    " generic_value=%g shadow_value=%g abs_err=%g rel_err=%g"
+                    " row_ids_exact=1 row_order_visible_all_equivalent=1"
+                    " qkv_mask_stage=not_read_back_in_hot_path"
+                    " note=compare generic_attention shadow mode to isolate tensor construction vs mixed-attention arithmetic\n",
+                    key.c_str(),
+                    max_idx,
+                    (long long) first_bad_head,
+                    (long long) first_bad_dim,
+                    double(ref[max_idx]),
+                    double(shadow[max_idx]),
+                    double(max_abs),
+                    double(max_rel));
+        }
+    }
+
+    shadow_by_key.erase(shadow_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_ffn_moe_stage_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_ffn_moe_stage_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> fused_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    } else {
+        fused_by_key[key] = { std::move(data), ggml_get_name(t), dsv4_compare_shape_string(t) };
+    }
+
+    auto fused_it = fused_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (fused_it == fused_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & fused = fused_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(fused.size(), ref.size());
+    float abs_tol = 0.0f;
+    float rel_tol = 0.0f;
+    dsv4_ffn_moe_stage_compare_tolerance(key, &abs_tol, &rel_tol);
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = fused.size() == ref.size() ? 0 : std::max(fused.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = fused[i] == ref[i] ? 0.0f : std::fabs(fused[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > abs_tol && rel > rel_tol) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 512 || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_ffn_moe_stage_compare key=%s cmp=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g abs_tol=%g rel_tol=%g over_tol=%zu idx=%zu fused=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                fused_it->second.name.c_str(), fused_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, rms_err, double(abs_tol), double(rel_tol), over_tol,
+                max_idx, n > 0 ? double(fused[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    fused_by_key.erase(fused_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_layer_executor_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    bool is_consume = false;
+    std::string key;
+    if (!dsv4_layer_executor_compare_key(t, &is_ref, &key, &is_consume)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+        std::string shape;
+        std::string op;
+        std::string src0_name;
+        std::string src0_op;
+        bool consumed = false;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> shadow_by_key;
+    static std::unordered_map<std::string, cached_tensor> ref_by_key;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_key[key] = {
+            std::move(data),
+            ggml_get_name(t),
+            dsv4_compare_shape_string(t),
+            ggml_op_name(t->op),
+            t->src[0] != nullptr ? ggml_get_name(t->src[0]) : "(null)",
+            t->src[0] != nullptr ? ggml_op_name(t->src[0]->op) : "(null)",
+            false
+        };
+    } else {
+        shadow_by_key[key] = {
+            std::move(data),
+            ggml_get_name(t),
+            dsv4_compare_shape_string(t),
+            ggml_op_name(t->op),
+            t->src[0] != nullptr ? ggml_get_name(t->src[0]) : "(null)",
+            t->src[0] != nullptr ? ggml_op_name(t->src[0]->op) : "(null)",
+            is_consume
+        };
+    }
+
+    auto shadow_it = shadow_by_key.find(key);
+    auto ref_it = ref_by_key.find(key);
+    if (shadow_it == shadow_by_key.end() || ref_it == ref_by_key.end()) {
+        return true;
+    }
+
+    const std::vector<float> & shadow = shadow_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(shadow.size(), ref.size());
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = shadow.size() == ref.size() ? 0 : std::max(shadow.size(), ref.size()) - n;
+
+    for (size_t i = 0; i < n; ++i) {
+        float diff = 0.0f;
+        if (shadow[i] == ref[i] || (std::isnan(shadow[i]) && std::isnan(ref[i]))) {
+            diff = 0.0f;
+        } else if (std::isfinite(shadow[i]) && std::isfinite(ref[i])) {
+            diff = std::fabs(shadow[i] - ref[i]);
+        } else {
+            diff = std::numeric_limits<float>::infinity();
+        }
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        sum_sq += double(diff) * double(diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 0.0f) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const double rms_err = n > 0 ? std::sqrt(sum_sq / double(n)) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    const bool consumed = shadow_it->second.consumed;
+    const bool mismatch = max_abs != 0.0f || over_tol != 0;
+    dsv4_layer_executor_note_compare(key, double(max_abs), rms_err, over_tol, consumed && !mismatch);
+    dsv4_layer_executor_dump_compare_json(key, shadow_it->second.shape,
+            shadow_it->second.name, shadow_it->second.op,
+            shadow_it->second.src0_name, shadow_it->second.src0_op,
+            double(max_abs), double(max_rel), mean_abs, rms_err, over_tol, max_idx,
+            consumed, consumed && !mismatch,
+            consumed ? (mismatch ? "mismatch_abort" : "exact_compare") : "not_consumed");
+    if ((dsv4_layer_executor_trace_enabled() && (log_id < 128 || ((cmp_id + 1) % 512) == 0)) || over_tol > 0) {
+        std::fprintf(stderr, "%s: dsv4_layer_executor_shadow_compare key=%s dsv4_lexec=%" PRIu64
+                " tensor=%s shape=%s ref=%s ref_shape=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu idx=%zu shadow=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id + 1,
+                shadow_it->second.name.c_str(), shadow_it->second.shape.c_str(),
+                ref_it->second.name.c_str(), ref_it->second.shape.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, rms_err, over_tol,
+                max_idx, n > 0 ? double(shadow[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+    if (consumed && mismatch &&
+            dsv4_layer_executor_env_flag_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_LAYER_EXECUTOR_ABORT_ON_MISMATCH")) {
+        std::fprintf(stderr, "%s: dsv4_layer_executor_consume_abort key=%s"
+                " max_abs=%g max_rel=%g mean_abs=%g rms_err=%g over_tol=%zu first_bad_index=%zu shadow=%g refv=%g\n",
+                __func__, key.c_str(), double(max_abs), double(max_rel), mean_abs, rms_err, over_tol, max_idx,
+                n > 0 ? double(shadow[max_idx]) : 0.0,
+                n > 0 ? double(ref[max_idx]) : 0.0);
+        shadow_by_key.erase(shadow_it);
+        ref_by_key.erase(ref_it);
+        return false;
+    }
+
+    shadow_by_key.erase(shadow_it);
+    ref_by_key.erase(ref_it);
+    return true;
+}
+
+static bool dsv4_attn_out_decode_compare_handle(ggml_tensor * t) {
+    bool is_ref = false;
+    std::string key;
+    if (!dsv4_attn_out_decode_compare_key(t, &is_ref, &key)) {
+        return true;
+    }
+
+    struct cached_tensor {
+        std::vector<float> data;
+        std::string name;
+    };
+
+    static std::unordered_map<std::string, cached_tensor> fused_by_layer;
+    static std::unordered_map<std::string, cached_tensor> ref_by_layer;
+    static std::atomic<uint64_t> compare_count { 0 };
+    static std::atomic<uint64_t> log_count { 0 };
+
+    std::vector<float> data;
+    if (!dsv4_attn_out_decode_copy_f32(t, data)) {
+        return false;
+    }
+
+    if (is_ref) {
+        ref_by_layer[key] = { std::move(data), ggml_get_name(t) };
+    } else {
+        fused_by_layer[key] = { std::move(data), ggml_get_name(t) };
+    }
+
+    auto fused_it = fused_by_layer.find(key);
+    auto ref_it = ref_by_layer.find(key);
+    if (fused_it == fused_by_layer.end() || ref_it == ref_by_layer.end()) {
+        return true;
+    }
+
+    const std::vector<float> & fused = fused_it->second.data;
+    const std::vector<float> & ref = ref_it->second.data;
+    const size_t n = std::min(fused.size(), ref.size());
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    double sum_abs = 0.0;
+    size_t max_idx = 0;
+    size_t over_tol = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        const float diff = fused[i] == ref[i] ? 0.0f : std::fabs(fused[i] - ref[i]);
+        const float denom = std::max(std::fabs(ref[i]), 1.0e-12f);
+        const float rel = std::isfinite(diff) && std::isfinite(denom) ? diff / denom : diff;
+        sum_abs += diff;
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_rel = rel;
+            max_idx = i;
+        }
+        if (diff > 1.0e-3f + 1.0e-3f * std::fabs(ref[i])) {
+            ++over_tol;
+        }
+    }
+
+    const double mean_abs = n > 0 ? sum_abs / double(n) : 0.0;
+    const uint64_t cmp_id = compare_count.fetch_add(1);
+    const uint64_t log_id = log_count.fetch_add(1);
+    if (log_id < 64) {
+        std::fprintf(stderr, "%s: dsv4_attn_out_decode_compare layer=%s cmp=%" PRIu64
+                " tensor=%s ref=%s elems=%zu max_abs=%g max_rel=%g mean_abs=%g over_tol=%zu idx=%zu fused=%g refv=%g\n",
+                __func__, key.c_str(), cmp_id,
+                fused_it->second.name.c_str(), ref_it->second.name.c_str(), n,
+                double(max_abs), double(max_rel), mean_abs, over_tol,
+                max_idx, n > 0 ? double(fused[max_idx]) : 0.0, n > 0 ? double(ref[max_idx]) : 0.0);
+    }
+
+    fused_by_layer.erase(fused_it);
+    ref_by_layer.erase(ref_it);
+    return true;
+}
 
 static bool llama_moe_prefill_micro_batch_is_auto(uint32_t value) {
     return value == LLAMA_MOE_PREFILL_MICRO_BATCH_AUTO;
@@ -11830,6 +14296,13 @@ llama_context::llama_context(
         cparams.cb_eval = llama_context_flash_moe_eval_cb;
         cparams.cb_eval_user_data = this;
         flash_moe_active_runtime = flash_moe_slot_runtime.get();
+        if (dsv4_attn_out_decode_compare_eval_enabled() || dsv4_compressor_update_compare_eval_enabled() ||
+                dsv4_compressor_update_v2_compare_eval_enabled() || dsv4_compressor_update_v3_compare_eval_enabled() || dsv4_hc_pre_norm_compare_eval_enabled() ||
+                dsv4_kv_finalize_compare_eval_enabled() || dsv4_ffn_moe_stage_compare_eval_enabled() ||
+                dsv4_layer_executor_compare_eval_enabled() || dsv4_indexed_attn_output_compare_eval_enabled() ||
+                dsv4_aohc_compare_eval_enabled() || dsv4_aohc_candidate_compare_eval_enabled()) {
+            LLAMA_LOG_INFO("%s: DSV4 Metal compare callback enabled with Flash-MoE slot runtime\n", __func__);
+        }
     } else if (model.flash_moe_prefill_layer_major_enabled()) {
         const int32_t resolved_prefill_micro_batch =
                 llama_moe_prefill_micro_batch_is_auto(cparams.moe_prefill_micro_batch) ?
@@ -11842,6 +14315,23 @@ llama_context::llama_context(
         flash_moe_cb_eval_downstream_user_data = cparams.cb_eval_user_data;
         cparams.cb_eval = llama_context_flash_moe_eval_cb;
         cparams.cb_eval_user_data = this;
+        if (dsv4_attn_out_decode_compare_eval_enabled() || dsv4_compressor_update_compare_eval_enabled() ||
+                dsv4_compressor_update_v2_compare_eval_enabled() || dsv4_compressor_update_v3_compare_eval_enabled() || dsv4_hc_pre_norm_compare_eval_enabled() ||
+                dsv4_kv_finalize_compare_eval_enabled() || dsv4_ffn_moe_stage_compare_eval_enabled() ||
+                dsv4_layer_executor_compare_eval_enabled() || dsv4_indexed_attn_output_compare_eval_enabled() ||
+                dsv4_aohc_compare_eval_enabled() || dsv4_aohc_candidate_compare_eval_enabled()) {
+            LLAMA_LOG_INFO("%s: DSV4 Metal compare callback enabled with Flash-MoE prefill runtime\n", __func__);
+        }
+    } else if (dsv4_attn_out_decode_compare_eval_enabled() || dsv4_compressor_update_compare_eval_enabled() ||
+            dsv4_compressor_update_v2_compare_eval_enabled() || dsv4_compressor_update_v3_compare_eval_enabled() || dsv4_hc_pre_norm_compare_eval_enabled() ||
+            dsv4_kv_finalize_compare_eval_enabled() || dsv4_ffn_moe_stage_compare_eval_enabled() ||
+            dsv4_layer_executor_compare_eval_enabled() || dsv4_indexed_attn_output_compare_eval_enabled() ||
+            dsv4_aohc_compare_eval_enabled() || dsv4_aohc_candidate_compare_eval_enabled()) {
+        flash_moe_cb_eval_downstream = cparams.cb_eval;
+        flash_moe_cb_eval_downstream_user_data = cparams.cb_eval_user_data;
+        cparams.cb_eval = llama_context_flash_moe_eval_cb;
+        cparams.cb_eval_user_data = this;
+        LLAMA_LOG_INFO("%s: DSV4 Metal compare callback enabled\n", __func__);
     }
 
     if (cparams.moe_shared_only) {
@@ -12538,6 +15028,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    dsv4_layer_executor_payload_flush();
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -13116,6 +15607,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -14352,16 +16844,56 @@ llm_graph_params llama_context::graph_params(
 
 bool llama_context::flash_moe_eval_cb(ggml_tensor * t, bool ask) {
     const bool internal_need = flash_moe_active_runtime && flash_moe_active_runtime->wants_tensor(t);
+    const bool dsv4_attn_out_compare_need = dsv4_attn_out_decode_compare_wants(t);
+    const bool dsv4_cupd_compare_need = dsv4_compressor_update_compare_wants(t);
+    const bool dsv4_cupd3_compare_need = dsv4_compressor_update_v3_compare_wants(t);
+    const bool dsv4_hcnorm_compare_need = dsv4_hc_pre_norm_compare_wants(t);
+    const bool dsv4_kvfin_compare_need = dsv4_kv_finalize_compare_wants(t);
+    const bool dsv4_iattn_compare_need = dsv4_indexed_attn_output_compare_wants(t);
+    const bool dsv4_aohc_compare_need = dsv4_aohc_compare_wants(t);
+    const bool dsv4_aohc_candidate_compare_need = dsv4_aohc_candidate_compare_wants(t);
+    const bool dsv4_ffnmoe_compare_need = dsv4_ffn_moe_stage_compare_wants(t);
+    const bool dsv4_lexec_compare_need = dsv4_layer_executor_compare_wants(t);
     const bool downstream_need = flash_moe_cb_eval_downstream ?
         flash_moe_cb_eval_downstream(t, ask, flash_moe_cb_eval_downstream_user_data) : false;
 
     if (ask) {
-        return internal_need || downstream_need;
+        return internal_need || dsv4_attn_out_compare_need || dsv4_cupd_compare_need || dsv4_cupd3_compare_need || dsv4_hcnorm_compare_need || dsv4_kvfin_compare_need || dsv4_iattn_compare_need || dsv4_aohc_compare_need || dsv4_aohc_candidate_compare_need || dsv4_ffnmoe_compare_need || dsv4_lexec_compare_need || downstream_need;
     }
 
     bool ok = true;
     if (internal_need) {
         ok = flash_moe_active_runtime->handle_tensor(t);
+    }
+    if (dsv4_attn_out_compare_need) {
+        ok = dsv4_attn_out_decode_compare_handle(t) && ok;
+    }
+    if (dsv4_cupd_compare_need) {
+        ok = dsv4_compressor_update_compare_handle(t) && ok;
+    }
+    if (dsv4_cupd3_compare_need) {
+        ok = dsv4_compressor_update_v3_compare_handle(t) && ok;
+    }
+    if (dsv4_hcnorm_compare_need) {
+        ok = dsv4_hc_pre_norm_compare_handle(t) && ok;
+    }
+    if (dsv4_kvfin_compare_need) {
+        ok = dsv4_kv_finalize_compare_handle(t) && ok;
+    }
+    if (dsv4_iattn_compare_need) {
+        ok = dsv4_indexed_attn_output_compare_handle(t) && ok;
+    }
+    if (dsv4_aohc_compare_need) {
+        ok = dsv4_aohc_compare_handle(t) && ok;
+    }
+    if (dsv4_aohc_candidate_compare_need) {
+        ok = dsv4_aohc_candidate_compare_handle(t) && ok;
+    }
+    if (dsv4_ffnmoe_compare_need) {
+        ok = dsv4_ffn_moe_stage_compare_handle(t) && ok;
+    }
+    if (dsv4_lexec_compare_need) {
+        ok = dsv4_layer_executor_compare_handle(t) && ok;
     }
     if (flash_moe_cb_eval_downstream) {
         ok = ok && flash_moe_cb_eval_downstream(t, ask, flash_moe_cb_eval_downstream_user_data);

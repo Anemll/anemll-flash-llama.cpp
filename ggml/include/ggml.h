@@ -584,9 +584,33 @@ extern "C" {
         GGML_OP_DSV4_HC_EXPAND,
         GGML_OP_DSV4_FP8_KV_QUANTIZE,
         GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE,
+        GGML_OP_DSV4_INDEXER_WEIGHTED_SCORE,
+        GGML_OP_DSV4_COMPRESSOR_PAIR_PROJ,
+        GGML_OP_DSV4_DECODE_COMPRESS,
         GGML_OP_DSV4_ROPE_TAIL,
+        GGML_OP_DSV4_MIXED_ATTN,
+        GGML_OP_DSV4_ATTN_OUT_DECODE,
+        GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE,
+        GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE_V2,
+        GGML_OP_DSV4_KV_FINALIZE_DECODE,
+        GGML_OP_DSV4_FFN_MOE_DECODE_STAGE,
+        GGML_OP_DSV4_ROUTED_MOE_ONE_TENSOR_DECODE,
+        GGML_OP_DSV4_DECODE_LAYER_EXECUTOR_DRYRUN,
+        GGML_OP_DSV4_DECODE_LAYER,
 
         GGML_OP_COUNT,
+    };
+
+    // DSV4 hybrid decode-layer orchestrator stage mask bits (op_params[1]).
+    // At T104 the mask is always 0 (stub passthrough). T105 wires per-stage
+    // dispatch from inside the op when the corresponding bit is set.
+    enum {
+        DSV4_LAYER_STAGE_HC_PRE_NORM   = 1 << 0,
+        DSV4_LAYER_STAGE_ROUTED_MOE    = 1 << 1,
+        DSV4_LAYER_STAGE_AOHC          = 1 << 2,
+        DSV4_LAYER_STAGE_CUPD          = 1 << 3,
+        DSV4_LAYER_STAGE_ROPE_TAIL     = 1 << 4, // orchestrator-invokes-existing
+        DSV4_LAYER_STAGE_KV_FINALIZER  = 1 << 5, // orchestrator-invokes-existing
     };
 
     enum ggml_unary_op {
@@ -2522,6 +2546,53 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_dsv4_indexer_weighted_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * weights,
+            float                 scale);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_compressor_pair_proj(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_w,
+            struct ggml_tensor  * score_w,
+            struct ggml_tensor  * x);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_decode_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * norm,
+            struct ggml_tensor  * pos,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            float                 norm_eps);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_decode_compress_stage(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * norm,
+            struct ggml_tensor  * pos,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            float                 norm_eps,
+            int                   output_stage);
+
     GGML_API struct ggml_tensor * ggml_dsv4_rope_tail(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2537,6 +2608,142 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow,
             bool                  inverse);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_mixed_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * raw_kv,
+            struct ggml_tensor  * comp_kv,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * sinks,
+            float                 scale);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_attn_out_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * heads,
+            struct ggml_tensor  * wo_a,
+            struct ggml_tensor  * wo_b);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_compressor_update_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_w,
+            struct ggml_tensor  * score_w,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * prev_kv_state,
+            struct ggml_tensor  * prev_score_state,
+            struct ggml_tensor  * ape,
+            struct ggml_tensor  * norm,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            int                   pos,
+            int                   compress_ratio,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            float                 norm_eps);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_compressor_update_decode_v2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_cur,
+            struct ggml_tensor  * score_cur,
+            struct ggml_tensor  * prev_kv_state,
+            struct ggml_tensor  * prev_score_state,
+            struct ggml_tensor  * ape,
+            struct ggml_tensor  * norm,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            int                   pos,
+            int                   compress_ratio,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            float                 norm_eps);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_kv_finalize_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * rows,
+            bool                  dry_run);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_ffn_moe_decode_stage(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * act,
+            struct ggml_tensor  * ids);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_ffn_moe_decode_stage_v2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            float                 clamp);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_routed_moe_one_tensor_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * shared_gate,
+            struct ggml_tensor  * shared_up,
+            struct ggml_tensor  * shared_down,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            bool                  scratch_gate_up,
+            bool                  scratch_down,
+            bool                  scratch_shared,
+            float                 clamp,
+            int                   swiglu_formula_mode);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_routed_moe_pair_preserve_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * shared_gate,
+            struct ggml_tensor  * shared_up,
+            struct ggml_tensor  * shared_down,
+            struct ggml_tensor  * swiglu,
+            struct ggml_tensor  * weighted_swiglu_anchor,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_decode_layer_executor_dryrun(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * layer_input,
+            struct ggml_tensor  * attn_q,
+            struct ggml_tensor  * attn_kv,
+            struct ggml_tensor  * attn_out,
+            struct ggml_tensor  * attn_hc_post,
+            struct ggml_tensor  * ffn_norm,
+            struct ggml_tensor  * routed_moe_out,
+            struct ggml_tensor  * ffn_hc_post,
+            struct ggml_tensor  * pos,
+            int                   layer,
+            int                   token,
+            int                   eligibility_flags);
+
+    // DSV4 hybrid decode-layer orchestrator skeleton (T104 stub).
+    // Output has the same shape/dtype as layer_input. At T104 both CPU and
+    // Metal handlers perform a passthrough copy (src[0] -> dst); T105 will
+    // replace the body with per-stage kernel dispatch driven by stage_mask.
+    GGML_API struct ggml_tensor * ggml_dsv4_decode_layer(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * layer_input,
+            int                   layer_index,
+            uint32_t              stage_mask);
 
     // custom operators
 

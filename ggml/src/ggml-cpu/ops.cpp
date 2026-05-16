@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -11336,6 +11337,285 @@ void ggml_compute_forward_dsv4_hadamard_fp4_quantize(
                 *(float *) (dst_base + (block + i)*dst->nb[0]) = ggml_dsv4_fp4_quant_dequant(q) * scale;
             }
         }
+    }
+}
+
+void ggml_compute_forward_dsv4_indexer_weighted_score(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * score   = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(score->type   == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+    GGML_ASSERT(score->ne[0] == dst->ne[0]);
+    GGML_ASSERT(score->ne[1] == dst->ne[1]);
+    GGML_ASSERT(score->ne[2] == weights->ne[0]);
+    GGML_ASSERT(score->ne[3] == 1);
+    GGML_ASSERT(weights->ne[1] == dst->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(score->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t n_comp   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_heads  = score->ne[2];
+    const int64_t n_elem   = n_comp * n_tokens;
+    const float scale      = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t i0 = (n_elem * params->ith) / params->nth;
+    const int64_t i1 = (n_elem * (params->ith + 1)) / params->nth;
+
+    const char * score_data   = (const char *) score->data;
+    const char * weights_data = (const char *) weights->data;
+          char * dst_data     = (      char *) dst->data;
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t c = i % n_comp;
+        const int64_t t = i / n_comp;
+
+        float acc = 0.0f;
+        for (int64_t h = 0; h < n_heads; ++h) {
+            const float sv = *(const float *) (score_data + c*score->nb[0] + t*score->nb[1] + h*score->nb[2]);
+            const float wv = *(const float *) (weights_data + h*weights->nb[0] + t*weights->nb[1]);
+            acc += std::max(sv, 0.0f) * wv;
+        }
+
+        *(float *) (dst_data + c*dst->nb[0] + t*dst->nb[1]) = acc * scale;
+    }
+}
+
+void ggml_compute_forward_dsv4_mixed_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_MIXED_ATTN CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_compressor_pair_proj(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_COMPRESSOR_PAIR_PROJ CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_attn_out_decode(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_ATTN_OUT_DECODE CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_compressor_update_decode(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_COMPRESSOR_UPDATE_DECODE CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_compressor_update_decode_v2(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_COMPRESSOR_UPDATE_DECODE_V2 CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_kv_finalize_decode(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_KV_FINALIZE_DECODE CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_ffn_moe_decode_stage(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_FFN_MOE_DECODE_STAGE CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_routed_moe_one_tensor_decode(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_UNUSED(dst);
+    GGML_ABORT("fatal error: DSV4_ROUTED_MOE_ONE_TENSOR_DECODE CPU fallback is not implemented");
+}
+
+void ggml_compute_forward_dsv4_decode_layer(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    // T104 stub: passthrough copy from src[0] to dst. T105 replaces this
+    // body with per-stage dispatch driven by op_params[1] (stage_mask).
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0 != NULL);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    memcpy(dst->data, src0->data, ggml_nbytes(dst));
+}
+
+void ggml_compute_forward_dsv4_decode_compress(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * kv    = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * norm  = dst->src[2];
+    const ggml_tensor * pos   = dst->src[3];
+
+    GGML_ASSERT(kv->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm->type  == GGML_TYPE_F32);
+    GGML_ASSERT(pos->type   == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(kv->ne[0] == dst->ne[0]);
+    GGML_ASSERT(kv->ne[0] == score->ne[0]);
+    GGML_ASSERT(kv->ne[1] == score->ne[1]);
+    GGML_ASSERT(kv->ne[2] == 1 && kv->ne[3] == 1);
+    GGML_ASSERT(score->ne[2] == 1 && score->ne[3] == 1);
+    GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(norm->ne[0] >= dst->ne[0]);
+
+    const int n_dims     = ggml_get_op_params_i32(dst, 0);
+    const int mode       = ggml_get_op_params_i32(dst, 1);
+    const int n_ctx_orig = ggml_get_op_params_i32(dst, 2);
+    const bool inverse   = ggml_get_op_params_i32(dst, 3) != 0;
+
+    const float freq_base   = ggml_get_op_params_f32(dst, 4);
+    const float freq_scale  = ggml_get_op_params_f32(dst, 5);
+    const float ext_factor  = ggml_get_op_params_f32(dst, 6);
+    const float attn_factor = ggml_get_op_params_f32(dst, 7);
+    const float beta_fast   = ggml_get_op_params_f32(dst, 8);
+    const float beta_slow   = ggml_get_op_params_f32(dst, 9);
+    const float norm_eps    = ggml_get_op_params_f32(dst, 10);
+
+    GGML_ASSERT(n_dims > 0);
+    GGML_ASSERT(n_dims <= dst->ne[0]);
+    GGML_ASSERT(n_dims % 2 == 0);
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
+
+    const int64_t head_dim = dst->ne[0];
+    const int64_t n_pool   = kv->ne[1];
+    const int64_t n_nope   = head_dim - n_dims;
+
+    std::vector<float> v(head_dim);
+    float ss = 0.0f;
+
+    for (int64_t i = 0; i < head_dim; ++i) {
+        float max_score = -INFINITY;
+        for (int64_t j = 0; j < n_pool; ++j) {
+            const float s = *(const float *) ((const char *) score->data + i*score->nb[0] + j*score->nb[1]);
+            max_score = std::max(max_score, s);
+        }
+
+        float denom = 0.0f;
+        float acc = 0.0f;
+        for (int64_t j = 0; j < n_pool; ++j) {
+            const float s = *(const float *) ((const char *) score->data + i*score->nb[0] + j*score->nb[1]);
+            const float w = std::exp(s - max_score);
+            const float x = *(const float *) ((const char *) kv->data + i*kv->nb[0] + j*kv->nb[1]);
+            denom += w;
+            acc += x*w;
+        }
+
+        const float pooled = acc / denom;
+        v[i] = pooled;
+        ss += pooled*pooled;
+    }
+
+    const float rms = 1.0f / std::sqrt(ss / float(head_dim) + norm_eps);
+    for (int64_t i = 0; i < head_dim; ++i) {
+        const float nw = *(const float *) ((const char *) norm->data + i*norm->nb[0]);
+        v[i] *= rms*nw;
+    }
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+
+    const int32_t p = *(const int32_t *) pos->data;
+    const float inv_ndims = -1.0f / n_dims;
+    const float sin_sign = inverse ? -1.0f : 1.0f;
+
+    char * dst_data = (char *) dst->data;
+    for (int64_t i = 0; i < head_dim; ++i) {
+        float out = v[i];
+        if (i >= n_nope) {
+            const int64_t tail = i - n_nope;
+            int ic;
+            bool first;
+            int64_t off0;
+            int64_t off1;
+
+            if (mode == GGML_ROPE_TYPE_NEOX) {
+                const int n_half = n_dims / 2;
+                ic = (int) (tail % n_half);
+                first = tail < n_half;
+                off0 = n_nope + ic;
+                off1 = off0 + n_half;
+            } else {
+                ic = (int) (tail / 2);
+                first = (tail & 1) == 0;
+                off0 = n_nope + 2*ic;
+                off1 = off0 + 1;
+            }
+
+            const int rope_i0 = 2*ic;
+            const float theta = float(p) * std::pow(freq_base, inv_ndims*rope_i0);
+            float cos_theta;
+            float sin_theta;
+            rope_yarn(theta, freq_scale, corr_dims, rope_i0, ext_factor, attn_factor, &cos_theta, &sin_theta);
+            sin_theta *= sin_sign;
+
+            const float x0 = v[off0];
+            const float x1 = v[off1];
+            out = first ? (x0*cos_theta - x1*sin_theta) : (x0*sin_theta + x1*cos_theta);
+        }
+
+        *(float *) (dst_data + i*dst->nb[0]) = out;
     }
 }
 

@@ -327,6 +327,7 @@ struct completion_token_output {
         llama_token tok;
         std::string txt;
         float prob;
+        float logit = 0.0f;
     };
     std::vector<prob_info> probs;
 

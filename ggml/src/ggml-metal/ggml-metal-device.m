@@ -668,6 +668,8 @@ struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
 };
 
+static uint64_t g_ggml_metal_dispatch_count = 0;
+
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
@@ -722,7 +724,16 @@ void ggml_metal_encoder_use_resource(ggml_metal_encoder_t encoder, struct ggml_m
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    ++g_ggml_metal_dispatch_count;
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+}
+
+uint64_t ggml_metal_encoder_get_dispatch_count(void) {
+    return g_ggml_metal_dispatch_count;
+}
+
+void ggml_metal_encoder_reset_dispatch_count(void) {
+    g_ggml_metal_dispatch_count = 0;
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
@@ -1621,6 +1632,388 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0 &&
                    op->src[0]->ne[0] % 32 == 0 &&
                    op->src[0]->ne[0] <= 256;
+        case GGML_OP_DSV4_INDEXER_WEIGHTED_SCORE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_COMPRESSOR_PAIR_PROJ:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[2] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F16 &&
+                   op->src[1]->type == GGML_TYPE_F16 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                   op->src[2]->ne[0] == op->src[0]->ne[0] &&
+                   op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == 2*op->src[0]->ne[1] &&
+                   op->ne[1] == 1;
+        case GGML_OP_DSV4_MIXED_ATTN:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[2] != NULL &&
+                   op->src[3] != NULL &&
+                   op->src[4] != NULL &&
+                   op->src[5] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F16 &&
+                   op->src[2]->type == GGML_TYPE_F16 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == 512 &&
+                   op->src[0]->ne[2] == 1 &&
+                   op->src[1]->ne[0] == 512 &&
+                   op->src[2]->ne[0] == 512 &&
+                   op->src[1]->ne[1] == 1 &&
+                   op->src[2]->ne[1] == 1;
+        case GGML_OP_DSV4_ATTN_OUT_DECODE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL &&
+                   op->src[1] != NULL &&
+                   op->src[2] != NULL &&
+                   op->src[0]->type == GGML_TYPE_Q8_0 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_Q8_0 &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                   op->src[1]->ne[2] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == op->src[0]->ne[1] * op->src[0]->ne[2] &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == op->src[2]->ne[0] + op->src[2]->ne[1] &&
+                   op->ne[1] == 1;
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE: {
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL ||
+                    op->src[3] == NULL || op->src[4] == NULL || op->src[5] == NULL || op->src[6] == NULL) {
+                return false;
+            }
+
+            const int n_dims = ggml_get_op_params_i32(op, 0);
+            const int mode = ggml_get_op_params_i32(op, 1);
+            const int ratio = ggml_get_op_params_i32(op, 4);
+            const int64_t width = op->src[3]->ne[0];
+            const int64_t rows = op->src[3]->ne[1];
+            const int64_t head_dim = ratio == 4 ? width / 2 : width;
+            const int64_t state_elems = width * rows;
+            const int64_t pool_rows = ratio == 4 ? 2 * ratio : ratio;
+            const int64_t pool_elems = head_dim * pool_rows;
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F16 &&
+                   op->src[1]->type == GGML_TYPE_F16 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_F32 &&
+                   op->src[6]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                   op->src[0]->ne[0] == op->src[2]->ne[0] &&
+                   op->src[0]->ne[1] == width &&
+                   op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->src[4]->ne[0] == width &&
+                   op->src[4]->ne[1] == rows &&
+                   op->src[5]->ne[0] >= width &&
+                   op->src[5]->ne[1] >= ratio &&
+                   op->src[6]->ne[0] >= head_dim &&
+                   ratio > 0 &&
+                   (rows == ratio || rows == 2*ratio) &&
+                   (ratio != 4 || width == 2*head_dim) &&
+                   n_dims > 0 &&
+                   n_dims <= head_dim &&
+                   head_dim <= 1024 &&
+                   n_dims % 2 == 0 &&
+                   (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
+                   op->ne[0] == 2*state_elems + head_dim + 2*width + 2*pool_elems &&
+                   op->ne[1] == 1;
+        }
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE_V2: {
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL ||
+                    op->src[3] == NULL || op->src[4] == NULL || op->src[5] == NULL) {
+                return false;
+            }
+
+            const int n_dims = ggml_get_op_params_i32(op, 0);
+            const int mode = ggml_get_op_params_i32(op, 1);
+            const int ratio = ggml_get_op_params_i32(op, 4);
+            const int64_t width = op->src[2]->ne[0];
+            const int64_t rows = op->src[2]->ne[1];
+            const int64_t head_dim = ratio == 4 ? width / 2 : width;
+            const int64_t state_elems = width * rows;
+            const int64_t pool_rows = ratio == 4 ? 2 * ratio : ratio;
+            const int64_t pool_elems = head_dim * pool_rows;
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == width &&
+                   op->src[1]->ne[0] == width &&
+                   op->src[0]->ne[1] == 1 &&
+                   op->src[1]->ne[1] == 1 &&
+                   op->src[0]->ne[2] == 1 &&
+                   op->src[1]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->src[3]->ne[0] == width &&
+                   op->src[3]->ne[1] == rows &&
+                   op->src[4]->ne[0] >= width &&
+                   op->src[4]->ne[1] >= ratio &&
+                   op->src[5]->ne[0] >= head_dim &&
+                   ratio > 0 &&
+                   (rows == ratio || rows == 2*ratio) &&
+                   (ratio != 4 || width == 2*head_dim) &&
+                   n_dims > 0 &&
+                   n_dims <= head_dim &&
+                   head_dim <= 1024 &&
+                   n_dims % 2 == 0 &&
+                   (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
+                   op->ne[0] == 2*state_elems + head_dim + 2*pool_elems &&
+                   op->ne[1] == 1;
+        }
+        case GGML_OP_DSV4_KV_FINALIZE_DECODE: {
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL) {
+                return false;
+            }
+
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                   (op->src[2]->type == GGML_TYPE_I32 || op->src[2]->type == GGML_TYPE_I64) &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[0]->ne[1] == 1 &&
+                   op->src[0]->ne[2] == op->src[2]->ne[0] &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[0] &&
+                   op->ne[1] == 1 &&
+                   op->ne[2] == op->src[0]->ne[2] &&
+                   op->ne[3] == 1 &&
+                   op->src[0]->ne[0] > 0 &&
+                   op->src[0]->ne[2] > 0;
+        }
+        case GGML_OP_DSV4_FFN_MOE_DECODE_STAGE: {
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL) {
+                return false;
+            }
+
+            if (op->src[3] != NULL) {
+                if (op->src[4] == NULL || op->src[5] == NULL) {
+                    return false;
+                }
+
+                const int64_t n_slot = MAX(op->src[2]->ne[0], op->src[2]->ne[1]);
+                return op->type == GGML_TYPE_F32 &&
+                       op->src[0]->type == GGML_TYPE_IQ2_XXS &&
+                       op->src[1]->type == GGML_TYPE_IQ2_XXS &&
+                       op->src[2]->type == GGML_TYPE_Q2_K &&
+                       op->src[3]->type == GGML_TYPE_F32 &&
+                       op->src[4]->type == GGML_TYPE_I32 &&
+                       op->src[5]->type == GGML_TYPE_F32 &&
+                       op->src[0]->ne[0] == op->src[3]->ne[0] &&
+                       op->src[1]->ne[0] == op->src[3]->ne[0] &&
+                       op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                       op->src[0]->ne[1] == op->src[2]->ne[0] &&
+                       op->src[0]->ne[2] == op->src[1]->ne[2] &&
+                       op->src[0]->ne[2] == op->src[2]->ne[2] &&
+                       op->src[3]->ne[1] == 1 &&
+                       op->src[3]->ne[2] == 1 &&
+                       op->src[3]->ne[3] == 1 &&
+                       op->src[4]->ne[0] == 6 &&
+                       op->src[4]->ne[1] == 1 &&
+                       op->src[4]->ne[2] == 1 &&
+                       op->src[4]->ne[3] == 1 &&
+                       (op->src[5]->ne[1] == 6 || op->src[5]->ne[0] == 6) &&
+                       op->src[5]->ne[2] == 1 &&
+                       op->src[5]->ne[3] == 1 &&
+                       op->ne[0] == n_slot &&
+                       op->ne[1] == 24 &&
+                       op->ne[2] == 1 &&
+                       op->ne[3] == 1;
+            }
+
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_Q2_K &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->src[1]->ne[0] == op->src[0]->ne[0] &&
+                   op->src[1]->ne[1] == 6 &&
+                   op->src[1]->ne[2] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == 6 &&
+                   op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[1] &&
+                   op->ne[1] == 6 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1 &&
+                   op->ne[0] > 0;
+        }
+        case GGML_OP_DSV4_ROUTED_MOE_ONE_TENSOR_DECODE: {
+            for (int i = 0; i < 9; ++i) {
+                if (op->src[i] == NULL) {
+                    return false;
+                }
+            }
+
+            const int scratch_mode = ggml_get_op_params_i32(op, 0);
+            const bool pair_preserve_mode = ggml_get_op_params_i32(op, 5) != 0;
+            if (pair_preserve_mode) {
+                if (op->src[9] == NULL) {
+                    return false;
+                }
+                const bool common =
+                    op->type == GGML_TYPE_F32 &&
+                    scratch_mode == 1 &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[2]->type == GGML_TYPE_Q2_K &&
+                    op->src[3]->type == GGML_TYPE_Q8_0 &&
+                    op->src[4]->type == GGML_TYPE_Q8_0 &&
+                    op->src[5]->type == GGML_TYPE_Q8_0 &&
+                    op->src[7]->type == GGML_TYPE_I32 &&
+                    op->src[8]->type == GGML_TYPE_F32 &&
+                    op->src[9]->type == GGML_TYPE_F32 &&
+                    op->src[9]->ne[0] == op->src[2]->ne[0] &&
+                    op->src[9]->ne[1] == 6 &&
+                    op->src[9]->ne[2] == 1 &&
+                    op->src[9]->ne[3] == 1 &&
+                    op->src[1]->ne[0] == op->src[3]->ne[0] &&
+                    op->src[1]->ne[0] == op->src[4]->ne[0] &&
+                    op->src[1]->ne[1] == 1 &&
+                    op->src[1]->ne[2] == 1 &&
+                    op->src[1]->ne[3] == 1 &&
+                    op->src[3]->ne[1] == op->src[4]->ne[1] &&
+                    op->src[3]->ne[1] == op->src[5]->ne[0] &&
+                    op->src[5]->ne[1] == op->src[2]->ne[1] &&
+                    op->src[7]->ne[0] == 6 &&
+                    op->src[7]->ne[1] == 1 &&
+                    op->src[7]->ne[2] == 1 &&
+                    op->src[7]->ne[3] == 1 &&
+                    (op->src[8]->ne[0] == 6 || op->src[8]->ne[1] == 6) &&
+                    op->src[8]->ne[2] == 1 &&
+                    op->src[8]->ne[3] == 1;
+                if (!common) {
+                    return false;
+                }
+                const int scratch_down = ggml_get_op_params_i32(op, 2);
+                const int scratch_shared = ggml_get_op_params_i32(op, 3);
+                const int64_t n_slot = MAX(op->src[2]->ne[0], op->src[2]->ne[1]);
+                return scratch_down == 1 &&
+                       scratch_shared == 1 &&
+                       op->ne[0] == n_slot &&
+                       op->ne[1] == 35 &&
+                       op->ne[2] == 1 &&
+                       op->ne[3] == 1;
+            }
+
+            const bool common =
+                op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_IQ2_XXS &&
+                op->src[1]->type == GGML_TYPE_IQ2_XXS &&
+                op->src[2]->type == GGML_TYPE_Q2_K &&
+                op->src[3]->type == GGML_TYPE_Q8_0 &&
+                op->src[4]->type == GGML_TYPE_Q8_0 &&
+                op->src[5]->type == GGML_TYPE_Q8_0 &&
+                op->src[6]->type == GGML_TYPE_F32 &&
+                op->src[7]->type == GGML_TYPE_I32 &&
+                op->src[8]->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == op->src[6]->ne[0] &&
+                op->src[1]->ne[0] == op->src[6]->ne[0] &&
+                op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                op->src[0]->ne[1] == op->src[2]->ne[0] &&
+                op->src[0]->ne[2] == op->src[1]->ne[2] &&
+                op->src[0]->ne[2] == op->src[2]->ne[2] &&
+                op->src[3]->ne[0] == op->src[6]->ne[0] &&
+                op->src[4]->ne[0] == op->src[6]->ne[0] &&
+                op->src[3]->ne[1] == op->src[4]->ne[1] &&
+                op->src[3]->ne[1] == op->src[5]->ne[0] &&
+                op->src[5]->ne[1] == op->src[2]->ne[1] &&
+                op->src[6]->ne[1] == 1 &&
+                op->src[6]->ne[2] == 1 &&
+                op->src[6]->ne[3] == 1 &&
+                op->src[7]->ne[0] == 6 &&
+                op->src[7]->ne[1] == 1 &&
+                op->src[7]->ne[2] == 1 &&
+                op->src[7]->ne[3] == 1 &&
+                (op->src[8]->ne[0] == 6 || op->src[8]->ne[1] == 6) &&
+                op->src[8]->ne[2] == 1 &&
+                op->src[8]->ne[3] == 1;
+            if (!common) {
+                return false;
+            }
+            if (scratch_mode == 1) {
+                const int scratch_down = ggml_get_op_params_i32(op, 2);
+                const int scratch_shared = ggml_get_op_params_i32(op, 3);
+                const int64_t n_slot = MAX(op->src[2]->ne[0], op->src[2]->ne[1]);
+                return op->ne[0] == n_slot &&
+                       op->ne[1] == (scratch_shared ? 35 : (scratch_down ? 30 : 24)) &&
+                       op->ne[2] == 1 &&
+                       op->ne[3] == 1;
+            }
+            return op->ne[0] == op->src[2]->ne[1] &&
+                   op->ne[1] == 1 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1;
+        }
+        case GGML_OP_DSV4_DECODE_LAYER_EXECUTOR_DRYRUN: {
+            for (int i = 0; i < 9; ++i) {
+                if (op->src[i] == NULL) {
+                    return false;
+                }
+            }
+
+            return op->type == GGML_TYPE_F32 &&
+                   op->ne[0] >= 4 &&
+                   op->ne[1] == 1 &&
+                   op->ne[2] == 1 &&
+                   op->ne[3] == 1;
+        }
+        case GGML_OP_DSV4_DECODE_LAYER: {
+            // T104 stub: passthrough f32 copy from src[0] to dst.
+            // Requires src[0] present, f32, contiguous, and same shape as dst.
+            if (op->src[0] == NULL) {
+                return false;
+            }
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op->src[0], op);
+        }
+        case GGML_OP_DSV4_DECODE_COMPRESS: {
+            if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL || op->src[3] == NULL) {
+                return false;
+            }
+
+            const int mode = ggml_get_op_params_i32(op, 1);
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_I32 &&
+                   op->src[0]->ne[0] == op->ne[0] &&
+                   op->src[1]->ne[0] == op->ne[0] &&
+                   op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                   op->ne[0] <= 1024 &&
+                   op->src[0]->ne[1] <= 128 &&
+                   (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
+        }
         case GGML_OP_DSV4_ROPE_TAIL: {
             if (op->src[0] == NULL || op->src[1] == NULL) {
                 return false;

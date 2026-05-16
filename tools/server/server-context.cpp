@@ -1645,7 +1645,8 @@ private:
                 result.probs.push_back({
                     cur_p->data[i].id,
                     common_token_to_piece(ctx, cur_p->data[i].id, special),
-                    cur_p->data[i].p
+                    cur_p->data[i].p,
+                    cur_p->data[i].logit
                 });
             }
         } else {
@@ -1669,7 +1670,8 @@ private:
                 result.probs.push_back({
                     cur[i].id,
                     common_token_to_piece(ctx, cur[i].id, special),
-                    cur[i].p
+                    cur[i].p,
+                    cur[i].logit
                 });
             }
         }

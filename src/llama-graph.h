@@ -855,7 +855,11 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+             ggml_tensor ** ffn_gate_proj_out = nullptr,
+             ggml_tensor ** ffn_up_proj_out = nullptr,
+             ggml_tensor ** ffn_swiglu_out = nullptr,
+             ggml_tensor ** ffn_down_out = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
@@ -877,7 +881,16 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** topk_weights_out = nullptr,
+             ggml_tensor ** topk_ids_out = nullptr,
+             ggml_tensor ** expert_gate_proj_out = nullptr,
+             ggml_tensor ** expert_up_proj_out = nullptr,
+             ggml_tensor ** expert_swiglu_out = nullptr,
+             ggml_tensor ** expert_down_out = nullptr,
+             ggml_tensor ** routed_sum_out = nullptr,
+             ggml_tensor ** routed_partials_out = nullptr,
+                       bool route_only = false) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -903,7 +916,16 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** topk_weights_out = nullptr,
+             ggml_tensor ** topk_ids_out = nullptr,
+             ggml_tensor ** expert_gate_proj_out = nullptr,
+             ggml_tensor ** expert_up_proj_out = nullptr,
+             ggml_tensor ** expert_swiglu_out = nullptr,
+             ggml_tensor ** expert_down_out = nullptr,
+             ggml_tensor ** routed_sum_out = nullptr,
+             ggml_tensor ** routed_partials_out = nullptr,
+                       bool route_only = false) const;
 
     //
     // inputs

@@ -12,10 +12,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -29,6 +31,390 @@ static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
         enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
     }
     return enabled == 1;
+}
+
+static bool llama_dsv4_rmoe_generic_lowering_parity_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_GENERIC_LOWERING_PARITY");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static const char * llama_dsv4_rmoe_generic_lowering_parity_mode() {
+    const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_GENERIC_LOWERING_PARITY_MODE");
+    return value != nullptr && value[0] != '\0' ? value : "normal";
+}
+
+static bool llama_dsv4_rmoe_generic_lowering_parity_mode_is(const char * mode, const char * expected) {
+    return mode != nullptr && expected != nullptr && strcmp(mode, expected) == 0;
+}
+
+static int64_t llama_dsv4_rmoe_env_i64(const char * name, int64_t fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 10);
+    return end != value ? (int64_t) parsed : fallback;
+}
+
+static int64_t llama_dsv4_rmoe_decode_index_for_token(int64_t token) {
+    static int64_t last_token = std::numeric_limits<int64_t>::min();
+    static int64_t decode_index = 0;
+    if (token <= 0) {
+        return token;
+    }
+    if (token != last_token) {
+        last_token = token;
+        decode_index++;
+    }
+    return decode_index;
+}
+
+static bool llama_dsv4_rmoe_generic_lowering_parity_site(int il, int64_t token, int64_t n_tokens) {
+    if (!llama_dsv4_rmoe_generic_lowering_parity_enabled() || n_tokens != 1 || token <= 0) {
+        return false;
+    }
+    const int64_t layer = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_GENERIC_LOWERING_PARITY_LAYER", -1);
+    if (layer >= 0 && il != layer) {
+        return false;
+    }
+    const int64_t decode_index = llama_dsv4_rmoe_decode_index_for_token(token);
+    const int64_t token_min = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_GENERIC_LOWERING_PARITY_TOKEN_MIN",
+            std::numeric_limits<int64_t>::min());
+    const int64_t token_max = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_GENERIC_LOWERING_PARITY_TOKEN_MAX",
+            std::numeric_limits<int64_t>::max());
+    return decode_index >= token_min && decode_index <= token_max;
+}
+
+static bool llama_dsv4_rmoe_pair_preserve_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_BACKEND_OP_PAIR_PRESERVE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_rmoe_pair_preserve_mode_down_shared_from_generic_swiglu() {
+    const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_BACKEND_OP_PAIR_PRESERVE_MODE");
+    return value != nullptr && strcmp(value, "down_shared_from_generic_swiglu") == 0;
+}
+
+static bool llama_dsv4_rmoe_pair_preserve_site(int il, int64_t token, int64_t n_tokens) {
+    if (!llama_dsv4_rmoe_pair_preserve_enabled() ||
+            !llama_dsv4_rmoe_pair_preserve_mode_down_shared_from_generic_swiglu() ||
+            n_tokens != 1 || token <= 0) {
+        return false;
+    }
+    const int64_t layer = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_BACKEND_OP_CONSUME_LAYER", -1);
+    if (layer < 0 || il != layer) {
+        return false;
+    }
+    const int64_t decode_index = llama_dsv4_rmoe_decode_index_for_token(token);
+    const int64_t token_min = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_BACKEND_OP_CONSUME_TOKEN_MIN",
+            std::numeric_limits<int64_t>::min());
+    const int64_t token_max = llama_dsv4_rmoe_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_BACKEND_OP_CONSUME_TOKEN_MAX",
+            std::numeric_limits<int64_t>::max());
+    return decode_index >= token_min && decode_index <= token_max;
+}
+
+static ggml_tensor * llama_dsv4_rmoe_break_moe_pair_with_view(
+        ggml_context * ctx,
+        ggml_tensor * t) {
+    if (t == nullptr || t->ne[2] <= 0) {
+        return t;
+    }
+
+    return ggml_view_3d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->nb[1], t->nb[2], 0);
+}
+
+static bool llama_dsv4_ffn_moe_stage_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_ffn_moe_stage_compare_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_COMPARE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_ffn_moe_stage_compare_consume_fused() {
+    static int consume_fused = -1;
+    if (consume_fused == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_COMPARE_CONSUME");
+        consume_fused = (value != nullptr && strcmp(value, "fused") == 0) ? 1 : 0;
+    }
+    return consume_fused == 1;
+}
+
+static bool llama_dsv4_ffn_moe_stage_full_consume_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_FULL_CONSUME");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_ffn_moe_stage_trace_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_TRACE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_routed_moe_internal_probe_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_INTERNAL_PROBE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static bool llama_dsv4_routed_moe_internal_trace_enabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_INTERNAL_TRACE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static int llama_dsv4_ffn_moe_stage_env_int(const char * name, int fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    long parsed = strtol(value, &end, 10);
+    return end != value ? (int) parsed : fallback;
+}
+
+static int64_t llama_dsv4_env_i64(const char * name, int64_t fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value ? (int64_t) parsed : fallback;
+}
+
+static bool llama_dsv4_ffn_moe_stage_layer_allowed(int il) {
+    static int layer_min = llama_dsv4_ffn_moe_stage_env_int("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_LAYER_MIN", -1);
+    static int layer_max = llama_dsv4_ffn_moe_stage_env_int("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_FFN_MOE_STAGE_LAYER_MAX", 1 << 20);
+    return il >= 0 && il >= layer_min && il <= layer_max;
+}
+
+struct llama_dsv4_moe_internal_probe_state {
+    std::mutex mutex;
+    bool atexit_registered = false;
+    uint64_t cases = 0;
+    uint64_t ffn_input = 0;
+    uint64_t router = 0;
+    uint64_t topk = 0;
+    uint64_t weights = 0;
+    uint64_t gate_proj = 0;
+    uint64_t up_proj = 0;
+    uint64_t swiglu = 0;
+    uint64_t down = 0;
+    uint64_t weighted_down = 0;
+    uint64_t shared_gate = 0;
+    uint64_t shared_up = 0;
+    uint64_t shared_swiglu = 0;
+    uint64_t shared_down = 0;
+    uint64_t shared_output = 0;
+    uint64_t final = 0;
+    int first_layer = -1;
+    int64_t first_token = -1;
+};
+
+static llama_dsv4_moe_internal_probe_state & llama_dsv4_moe_internal_probe_summary() {
+    static llama_dsv4_moe_internal_probe_state state;
+    return state;
+}
+
+static void llama_dsv4_moe_internal_probe_print_summary() {
+    auto & state = llama_dsv4_moe_internal_probe_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.cases == 0 && !llama_dsv4_routed_moe_internal_probe_enabled()) {
+        return;
+    }
+    fprintf(stderr,
+            "dsv4_moe_internal_probe_summary: enabled=%d cases=%" PRIu64
+            " first_layer=%d first_token=%lld"
+            " ffn_input=%" PRIu64 " router=%" PRIu64 " topk=%" PRIu64 " topk_weights=%" PRIu64
+            " expert_gate_proj=%" PRIu64 " expert_up_proj=%" PRIu64 " expert_swiglu=%" PRIu64
+            " expert_down=%" PRIu64 " expert_weighted_down=%" PRIu64
+            " shared_gate_proj=%" PRIu64 " shared_up_proj=%" PRIu64
+            " shared_swiglu=%" PRIu64 " shared_down=%" PRIu64
+            " shared_output=%" PRIu64 " final_ffn=%" PRIu64
+            " consume_path=disabled\n",
+            llama_dsv4_routed_moe_internal_probe_enabled() ? 1 : 0,
+            state.cases,
+            state.first_layer,
+            (long long) state.first_token,
+            state.ffn_input,
+            state.router,
+            state.topk,
+            state.weights,
+            state.gate_proj,
+            state.up_proj,
+            state.swiglu,
+            state.down,
+            state.weighted_down,
+            state.shared_gate,
+            state.shared_up,
+            state.shared_swiglu,
+            state.shared_down,
+            state.shared_output,
+            state.final);
+}
+
+static bool llama_dsv4_moe_name_has(const char * name, const char * needle) {
+    return name != nullptr && needle != nullptr && strstr(name, needle) != nullptr;
+}
+
+static const char * llama_dsv4_moe_internal_stage(const char * name) {
+    if (name == nullptr) {
+        return nullptr;
+    }
+    if (strcmp(name, "ffn_norm") == 0 || strcmp(name, "ffn_input") == 0) {
+        return "ffn_input";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_moe_logits") ||
+            llama_dsv4_moe_name_has(name, "ffn_moe_probs")) {
+        return "router";
+    }
+    if (llama_dsv4_moe_name_has(name, "topk") || llama_dsv4_moe_name_has(name, "argsort")) {
+        return "topk_ids";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_moe_weights")) {
+        return "topk_weights";
+    }
+    if (strcmp(name, "ffn_gate") == 0 || llama_dsv4_moe_name_has(name, "ffn_gate-")) {
+        return "shared_gate_proj";
+    }
+    if (strcmp(name, "ffn_up") == 0 || llama_dsv4_moe_name_has(name, "ffn_up-")) {
+        return "shared_up_proj";
+    }
+    if (strcmp(name, "ffn_swiglu") == 0 || llama_dsv4_moe_name_has(name, "ffn_swiglu-")) {
+        return "shared_swiglu";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_shexp")) {
+        return "shared_down";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_moe_gate")) {
+        return "expert_gate_proj";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_moe_up")) {
+        return "expert_up_proj";
+    }
+    if (llama_dsv4_moe_name_has(name, "swiglu") || llama_dsv4_moe_name_has(name, "silu")) {
+        return "expert_swiglu";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_moe_down") || llama_dsv4_moe_name_has(name, "ffn_moe_out")) {
+        return "expert_down";
+    }
+    if (llama_dsv4_moe_name_has(name, "weighted")) {
+        return "expert_weighted_down";
+    }
+    if (llama_dsv4_moe_name_has(name, "shared")) {
+        return "shared_output";
+    }
+    if (llama_dsv4_moe_name_has(name, "ffn_out")) {
+        return "final_ffn_output";
+    }
+    return nullptr;
+}
+
+static void llama_dsv4_moe_internal_note(const char * stage, int il, int64_t token) {
+    auto & state = llama_dsv4_moe_internal_probe_summary();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.atexit_registered) {
+        atexit(llama_dsv4_moe_internal_probe_print_summary);
+        state.atexit_registered = true;
+    }
+    state.cases++;
+    if (state.first_layer < 0) {
+        state.first_layer = il;
+        state.first_token = token;
+    }
+    if (strcmp(stage, "ffn_input") == 0) state.ffn_input++;
+    else if (strcmp(stage, "router") == 0) state.router++;
+    else if (strcmp(stage, "topk_ids") == 0) state.topk++;
+    else if (strcmp(stage, "topk_weights") == 0) state.weights++;
+    else if (strcmp(stage, "expert_gate_proj") == 0) state.gate_proj++;
+    else if (strcmp(stage, "expert_up_proj") == 0) state.up_proj++;
+    else if (strcmp(stage, "expert_swiglu") == 0) state.swiglu++;
+    else if (strcmp(stage, "expert_down") == 0) state.down++;
+    else if (strcmp(stage, "expert_weighted_down") == 0) state.weighted_down++;
+    else if (strcmp(stage, "shared_gate_proj") == 0) state.shared_gate++;
+    else if (strcmp(stage, "shared_up_proj") == 0) state.shared_up++;
+    else if (strcmp(stage, "shared_swiglu") == 0) state.shared_swiglu++;
+    else if (strcmp(stage, "shared_down") == 0) state.shared_down++;
+    else if (strcmp(stage, "shared_output") == 0) state.shared_output++;
+    else if (strcmp(stage, "final_ffn_output") == 0) state.final++;
+}
+
+static int64_t llama_dsv4_routed_moe_decode_index_for_pos(int64_t pos) {
+    static std::mutex mutex;
+    static int64_t last_pos = std::numeric_limits<int64_t>::min();
+    static int64_t decode_index = 0;
+    if (pos <= 0) {
+        return pos;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pos != last_pos) {
+        last_pos = pos;
+        decode_index++;
+    }
+    return decode_index;
+}
+
+static bool llama_dsv4_routed_moe_internal_site_enabled(int il, int64_t pos, int64_t n_tokens, int64_t * decode_index_out) {
+    if (!llama_dsv4_routed_moe_internal_probe_enabled() || n_tokens != 1 || pos <= 0) {
+        return false;
+    }
+    const char * layer_filter = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_LAYER");
+    if (layer_filter != nullptr && layer_filter[0] != '\0' && strtoll(layer_filter, nullptr, 10) != il) {
+        return false;
+    }
+    const int64_t decode_index = llama_dsv4_routed_moe_decode_index_for_pos(pos);
+    const int64_t token_min = llama_dsv4_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_TOKEN_MIN",
+            std::numeric_limits<int64_t>::min());
+    const int64_t token_max = llama_dsv4_env_i64(
+            "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DSV4_ROUTED_MOE_TOKEN_MAX",
+            std::numeric_limits<int64_t>::max());
+    if (decode_index < token_min || decode_index > token_max) {
+        return false;
+    }
+    if (decode_index_out != nullptr) {
+        *decode_index_out = decode_index;
+    }
+    return true;
 }
 
 static bool llama_flash_attn_debug_enabled() {
@@ -1010,6 +1396,32 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+    if (arch == LLM_ARCH_DEEPSEEK4 && cur != nullptr) {
+        int64_t decode_index = -1;
+        const int64_t pos = ubatch.pos != nullptr ? (int64_t) ubatch.pos[0] : 0;
+        if (llama_dsv4_routed_moe_internal_site_enabled(il, pos, ubatch.n_tokens, &decode_index)) {
+            const char * stage = llama_dsv4_moe_internal_stage(name);
+            if (stage != nullptr) {
+                llama_dsv4_moe_internal_note(stage, il, decode_index);
+                if (llama_dsv4_routed_moe_internal_trace_enabled()) {
+                    fprintf(stderr,
+                            "dsv4_moe_internal_probe: layer=%d token=%lld tensor=%s"
+                            " shape=[%lld,%lld,%lld,%lld] dtype=%s op=%s"
+                            " source=generic stage_bucket=%s exact_self_compare=1 consume_path=disabled\n",
+                            il,
+                            (long long) decode_index,
+                            name != nullptr ? name : "",
+                            (long long) cur->ne[0],
+                            (long long) cur->ne[1],
+                            (long long) cur->ne[2],
+                            (long long) cur->ne[3],
+                            ggml_type_name(cur->type),
+                            ggml_op_name(cur->op),
+                            stage);
+                }
+            }
+        }
+    }
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
@@ -1139,7 +1551,23 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor ** ffn_gate_proj_out,
+         ggml_tensor ** ffn_up_proj_out,
+         ggml_tensor ** ffn_swiglu_out,
+         ggml_tensor ** ffn_down_out) const {
+    if (ffn_gate_proj_out) {
+        *ffn_gate_proj_out = nullptr;
+    }
+    if (ffn_up_proj_out) {
+        *ffn_up_proj_out = nullptr;
+    }
+    if (ffn_swiglu_out) {
+        *ffn_swiglu_out = nullptr;
+    }
+    if (ffn_down_out) {
+        *ffn_down_out = nullptr;
+    }
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 
@@ -1151,6 +1579,9 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (up_s) {
         tmp = ggml_mul(ctx0, tmp, up_s);
         cb(tmp, "ffn_up_s", il);
+    }
+    if (ffn_up_proj_out) {
+        *ffn_up_proj_out = tmp;
     }
 
     if (gate) {
@@ -1175,6 +1606,9 @@ ggml_tensor * llm_graph_context::build_ffn(
         if (gate_s) {
             cur = ggml_mul(ctx0, cur, gate_s);
             cb(cur, "ffn_gate_s", il);
+        }
+        if (ffn_gate_proj_out) {
+            *ffn_gate_proj_out = cur;
         }
 
     } else {
@@ -1206,6 +1640,9 @@ ggml_tensor * llm_graph_context::build_ffn(
 
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
+                if (ffn_swiglu_out) {
+                    *ffn_swiglu_out = cur;
+                }
                 type_gate = LLM_FFN_SEQ;
             } else {
                 cur = ggml_silu(ctx0, cur);
@@ -1267,6 +1704,9 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down) {
         cur = build_lora_mm(down, cur);
+        if (ffn_down_out) {
+            *ffn_down_out = cur;
+        }
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -1308,7 +1748,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** topk_weights_out,
+         ggml_tensor ** topk_ids_out,
+         ggml_tensor ** expert_gate_proj_out,
+         ggml_tensor ** expert_up_proj_out,
+         ggml_tensor ** expert_swiglu_out,
+         ggml_tensor ** expert_down_out,
+         ggml_tensor ** routed_sum_out,
+         ggml_tensor ** routed_partials_out,
+                  bool route_only) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1329,7 +1778,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        topk_weights_out,
+        topk_ids_out,
+        expert_gate_proj_out,
+        expert_up_proj_out,
+        expert_swiglu_out,
+        expert_down_out,
+        routed_sum_out,
+        routed_partials_out,
+        route_only
     );
 }
 
@@ -1357,11 +1815,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** topk_weights_out,
+         ggml_tensor ** topk_ids_out,
+         ggml_tensor ** expert_gate_proj_out,
+         ggml_tensor ** expert_up_proj_out,
+         ggml_tensor ** expert_swiglu_out,
+         ggml_tensor ** expert_down_out,
+         ggml_tensor ** routed_sum_out,
+         ggml_tensor ** routed_partials_out,
+                  bool route_only) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
     const bool weight_before_down = arch == LLM_ARCH_DEEPSEEK4; // DeepSeek V4 applies routed weights after SwiGLU and before w2
+    if (topk_weights_out != nullptr) {
+        *topk_weights_out = nullptr;
+    }
+    if (topk_ids_out != nullptr) {
+        *topk_ids_out = nullptr;
+    }
+    if (expert_gate_proj_out != nullptr) {
+        *expert_gate_proj_out = nullptr;
+    }
+    if (expert_up_proj_out != nullptr) {
+        *expert_up_proj_out = nullptr;
+    }
+    if (expert_swiglu_out != nullptr) {
+        *expert_swiglu_out = nullptr;
+    }
+    if (expert_down_out != nullptr) {
+        *expert_down_out = nullptr;
+    }
+    if (routed_sum_out != nullptr) {
+        *routed_sum_out = nullptr;
+    }
+    if (routed_partials_out != nullptr) {
+        for (int i = 0; i < 6; ++i) {
+            routed_partials_out[i] = nullptr;
+        }
+    }
 
     if (cparams.moe_shared_only) {
         ggml_tensor * moe_out = ggml_cast(ctx0, cur, GGML_TYPE_F32);
@@ -1512,6 +2005,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(selected_experts, "ffn_moe_topk", il);
+    if (topk_ids_out != nullptr) {
+        *topk_ids_out = selected_experts;
+    }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
@@ -1556,6 +2052,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_forced_weights", il);
     }
 
+    if (topk_weights_out != nullptr) {
+        *topk_weights_out = weights;
+    }
+
+    if (route_only) {
+        return weights;
+    }
+
     if (cparams.moe_router_only) {
         ggml_tensor * moe_out = ggml_cast(ctx0, cur, GGML_TYPE_F32);
         moe_out = ggml_cont(ctx0, ggml_scale(ctx0, moe_out, 0.0f));
@@ -1586,6 +2090,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * selected_experts_mm = selected_experts;
+    const int64_t dsv4_rmoe_lowering_parity_pos =
+            (ubatch.pos != nullptr && n_tokens == 1) ? (int64_t) ubatch.pos[0] : -1;
+    const bool dsv4_rmoe_lowering_parity_here =
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            llama_dsv4_rmoe_generic_lowering_parity_site(il, dsv4_rmoe_lowering_parity_pos, n_tokens);
+    const char * dsv4_rmoe_lowering_parity_mode =
+            dsv4_rmoe_lowering_parity_here ? llama_dsv4_rmoe_generic_lowering_parity_mode() : "normal";
+    const bool dsv4_rmoe_lowering_parity_force_order =
+            llama_dsv4_rmoe_generic_lowering_parity_mode_is(dsv4_rmoe_lowering_parity_mode, "force_replace_like_node_order");
+    const bool dsv4_rmoe_lowering_parity_disable_pair =
+            llama_dsv4_rmoe_generic_lowering_parity_mode_is(dsv4_rmoe_lowering_parity_mode, "disable_pair_for_layer") ||
+            llama_dsv4_rmoe_generic_lowering_parity_mode_is(dsv4_rmoe_lowering_parity_mode, "disable_pair_and_use_unpaired_swiglu");
+    const bool dsv4_rmoe_pair_preserve_here =
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            llama_dsv4_rmoe_pair_preserve_site(il, dsv4_rmoe_lowering_parity_pos, n_tokens);
+
+    if (dsv4_rmoe_lowering_parity_force_order) {
+        ggml_build_forward_expand(gf, selected_experts);
+        ggml_build_forward_expand(gf, weights);
+    }
     if (flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->uses_layer(il)) {
         if (flash_moe_slot_runtime->uses_native_slot_map(il)) {
             selected_experts_mm = flash_moe_slot_runtime->build_slot_ids_tensor(ctx0, selected_experts, il);
@@ -1626,17 +2150,104 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * dsv4_ffnmoe_stage_input = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+        dsv4_ffnmoe_stage_input = nullptr;
     }
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
     ggml_tensor * gate_up_merged = nullptr;
+    ggml_tensor * dsv4_ffnmoe_stage_gate_ref = nullptr;
+    ggml_tensor * dsv4_ffnmoe_stage_up_ref = nullptr;
+    ggml_tensor * dsv4_ffnmoe_stage_mid_ref = nullptr;
+
+    const bool dsv4_ffnmoe_stage_v2_candidate =
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            llama_dsv4_ffn_moe_stage_enabled() &&
+            llama_dsv4_ffn_moe_stage_layer_allowed(il) &&
+            n_tokens == 1 &&
+            n_expert_used == 6 &&
+            !weight_before_ffn &&
+            weight_before_down &&
+            gate_up_exps == nullptr &&
+            gate_exps_mm != nullptr &&
+            up_exps_mm != nullptr &&
+            down_exps_mm != nullptr &&
+            gate_exps_mm->type == GGML_TYPE_IQ2_XXS &&
+            up_exps_mm->type == GGML_TYPE_IQ2_XXS &&
+            down_exps_mm->type == GGML_TYPE_Q2_K &&
+            gate_exps_b == nullptr &&
+            up_exps_b == nullptr &&
+            down_exps_b == nullptr &&
+            gate_exps_s == nullptr &&
+            up_exps_s == nullptr &&
+            down_exps_s == nullptr &&
+            dsv4_ffnmoe_stage_input != nullptr &&
+            dsv4_ffnmoe_stage_input->type == GGML_TYPE_F32 &&
+            dsv4_ffnmoe_stage_input->ne[0] == n_embd &&
+            dsv4_ffnmoe_stage_input->ne[1] == 1 &&
+            dsv4_ffnmoe_stage_input->ne[2] == 1 &&
+            selected_experts_mm != nullptr &&
+            selected_experts_mm->type == GGML_TYPE_I32 &&
+            selected_experts_mm->ne[0] == 6 &&
+            selected_experts_mm->ne[1] == 1 &&
+            weights != nullptr &&
+            weights->type == GGML_TYPE_F32 &&
+            (weights->ne[1] == 6 || weights->ne[0] == 6) &&
+            weights->ne[2] == 1;
+
+    if (dsv4_ffnmoe_stage_v2_candidate &&
+            llama_dsv4_ffn_moe_stage_full_consume_enabled() &&
+            !llama_dsv4_ffn_moe_stage_compare_enabled()) {
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        ggml_tensor * stage = ggml_dsv4_ffn_moe_decode_stage_v2(
+                ctx0, gate_exps_mm, up_exps_mm, down_exps_mm,
+                dsv4_ffnmoe_stage_input, selected_experts_mm, weights, limit);
+        cb(stage, "dsv4_ffnmoe_stage_v2", il);
+
+        if (llama_dsv4_ffn_moe_stage_trace_enabled()) {
+            LLAMA_LOG_INFO("%s: dsv4_ffnmoe_stage full_stage=true layer=%d owns_router=false owns_gate_up=true owns_swiglu=true owns_down=true owns_weighted_sum=true owns_shared=false\n",
+                    __func__, il);
+        }
+
+        // Full consume uses the V2 selected gate/up projection but keeps the
+        // generic elementwise rounding point before the exact down/sum stage.
+        // The pure one-op V2 path compares within ~1e-6, but that is enough to
+        // drift deterministic n400 text.
+        ggml_tensor * fused_gate = ggml_view_3d(ctx0, stage,
+                down_exps_mm->ne[0], 6, n_tokens,
+                stage->nb[1], 6*stage->nb[1], 0);
+        cb(fused_gate, "dsv4_ffnmoe_stage_gate_exact", il);
+
+        ggml_tensor * fused_up = ggml_view_3d(ctx0, stage,
+                down_exps_mm->ne[0], 6, n_tokens,
+                stage->nb[1], 6*stage->nb[1], 6*stage->nb[1]);
+        cb(fused_up, "dsv4_ffnmoe_stage_up_exact", il);
+
+        ggml_tensor * fused_gate_act = ggml_silu(ctx0, fused_gate);
+        cb(fused_gate_act, "dsv4_ffnmoe_stage_silu_exact", il);
+
+        ggml_tensor * fused_act = ggml_mul(ctx0, fused_gate_act, fused_up);
+        cb(fused_act, "dsv4_ffnmoe_stage_swiglu_exact", il);
+
+        fused_act = ggml_mul(ctx0, fused_act, weights);
+        cb(fused_act, "dsv4_ffnmoe_stage_weighted_exact", il);
+
+        ggml_tensor * stage_down = ggml_dsv4_ffn_moe_decode_stage(
+                ctx0, down_exps_mm, fused_act, selected_experts_mm);
+        cb(stage_down, "dsv4_ffnmoe_stage_down_exact", il);
+
+        ggml_tensor * fused_final = ggml_view_2d(ctx0, stage_down, n_embd, n_tokens, stage_down->nb[2], 5*stage_down->nb[1]);
+        fused_final = ggml_cont(ctx0, fused_final);
+        cb(fused_final, "ffn_moe_out", il);
+        return fused_final;
+    }
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
@@ -1681,7 +2292,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up_scaled", il);
         }
 
+        if (dsv4_rmoe_lowering_parity_disable_pair) {
+            up = llama_dsv4_rmoe_break_moe_pair_with_view(ctx0, up);
+            cb(up, "ffn_moe_up_lowering_parity_unpaired", il);
+            ggml_build_forward_expand(gf, up);
+        }
+
         if (gate_exps) {
+            if (dsv4_rmoe_lowering_parity_disable_pair) {
+                cur = llama_dsv4_rmoe_break_moe_pair_with_view(ctx0, cur);
+                cb(cur, "ffn_moe_input_lowering_parity_unpaired", il);
+                ggml_build_forward_expand(gf, cur);
+            }
             cur = build_lora_mm_id(gate_exps_mm, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -1700,6 +2322,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
             cur = ggml_mul(ctx0, cur, s);
             cb(cur, "ffn_moe_gate_scaled", il);
+        }
+
+        dsv4_ffnmoe_stage_gate_ref = cur;
+        dsv4_ffnmoe_stage_up_ref = up;
+        if (expert_gate_proj_out != nullptr) {
+            *expert_gate_proj_out = cur;
+        }
+        if (expert_up_proj_out != nullptr) {
+            *expert_up_proj_out = up;
         }
     }
 
@@ -1794,13 +2425,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    if (expert_swiglu_out != nullptr) {
+        *expert_swiglu_out = cur;
+    }
+
+    if (dsv4_rmoe_pair_preserve_here) {
+        cb(cur, "ffn_moe_pair_preserve_swiglu_out", il);
+        return cur;
+    }
+
     if (weight_before_down) {
         cur = ggml_mul(ctx0, cur, weights);
         cb(cur, "ffn_moe_weighted_swiglu", il);
+        dsv4_ffnmoe_stage_mid_ref = cur;
     }
+
+    const bool dsv4_ffnmoe_stage_candidate =
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            llama_dsv4_ffn_moe_stage_enabled() &&
+            llama_dsv4_ffn_moe_stage_layer_allowed(il) &&
+            n_tokens == 1 &&
+            n_expert_used == 6 &&
+            down_exps_mm != nullptr &&
+            down_exps_mm->type == GGML_TYPE_Q2_K &&
+            down_exps_b == nullptr &&
+            down_exps_s == nullptr &&
+            cur != nullptr &&
+            cur->type == GGML_TYPE_F32 &&
+            cur->ne[0] == down_exps_mm->ne[0] &&
+            cur->ne[1] == 6 &&
+            cur->ne[2] == 1 &&
+            selected_experts_mm != nullptr &&
+            selected_experts_mm->type == GGML_TYPE_I32 &&
+            selected_experts_mm->ne[0] == 6 &&
+            selected_experts_mm->ne[1] == 1;
 
     experts = build_lora_mm_id(down_exps_mm, cur, selected_experts_mm); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+    if (expert_down_out != nullptr) {
+        *expert_down_out = experts;
+    }
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts_mm);
@@ -1839,9 +2503,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //       instead of expanding to all experts, which keeps the graph size bounded while
     //       matching the runtime override path.
     ggml_tensor * moe_out = cur_experts[0];
+    ggml_tensor * ref_partials[6] = { nullptr };
+    if (dsv4_ffnmoe_stage_candidate && n_expert_aggregate == 6) {
+        ref_partials[0] = moe_out;
+    }
+    if (routed_partials_out != nullptr && n_expert_aggregate == 6) {
+        routed_partials_out[0] = moe_out;
+    }
 
     for (uint32_t i = 1; i < n_expert_aggregate; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (dsv4_ffnmoe_stage_candidate && n_expert_aggregate == 6 && i < 6) {
+            ref_partials[i] = moe_out;
+        }
+        if (routed_partials_out != nullptr && n_expert_aggregate == 6 && i < 6) {
+            routed_partials_out[i] = moe_out;
+        }
     }
 
     if (n_expert_aggregate == 1) {
@@ -1850,6 +2527,126 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+    if (routed_sum_out != nullptr) {
+        *routed_sum_out = moe_out;
+    }
+
+    if (dsv4_ffnmoe_stage_v2_candidate && n_expert_aggregate == 6 &&
+            llama_dsv4_ffn_moe_stage_compare_enabled() &&
+            dsv4_ffnmoe_stage_gate_ref != nullptr &&
+            dsv4_ffnmoe_stage_up_ref != nullptr &&
+            dsv4_ffnmoe_stage_mid_ref != nullptr) {
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        ggml_tensor * stage = ggml_dsv4_ffn_moe_decode_stage_v2(
+                ctx0, gate_exps_mm, up_exps_mm, down_exps_mm,
+                dsv4_ffnmoe_stage_input, selected_experts_mm, weights, limit);
+        cb(stage, "dsv4_ffnmoe_stage_v2", il);
+
+        ggml_tensor * fused_gate[6] = { nullptr };
+        ggml_tensor * fused_up[6] = { nullptr };
+        ggml_tensor * fused_mid[6] = { nullptr };
+        ggml_tensor * fused_partials[6] = { nullptr };
+        for (int i = 0; i < 6; ++i) {
+            fused_gate[i] = ggml_view_2d(ctx0, stage, down_exps_mm->ne[0], n_tokens, stage->nb[1], (0 + i)*stage->nb[1]);
+            fused_up[i] = ggml_view_2d(ctx0, stage, down_exps_mm->ne[0], n_tokens, stage->nb[1], (6 + i)*stage->nb[1]);
+            fused_mid[i] = ggml_view_2d(ctx0, stage, down_exps_mm->ne[0], n_tokens, stage->nb[1], (12 + i)*stage->nb[1]);
+            fused_partials[i] = ggml_view_2d(ctx0, stage, n_embd, n_tokens, stage->nb[1], (18 + i)*stage->nb[1]);
+        }
+
+        for (int i = 0; i < 6; ++i) {
+            GGML_ASSERT(ref_partials[i] != nullptr);
+
+            ggml_tensor * ref_gate_slot = ggml_view_2d(ctx0, dsv4_ffnmoe_stage_gate_ref, down_exps_mm->ne[0], n_tokens, dsv4_ffnmoe_stage_gate_ref->nb[2], i*dsv4_ffnmoe_stage_gate_ref->nb[1]);
+            ggml_tensor * ref_up_slot = ggml_view_2d(ctx0, dsv4_ffnmoe_stage_up_ref, down_exps_mm->ne[0], n_tokens, dsv4_ffnmoe_stage_up_ref->nb[2], i*dsv4_ffnmoe_stage_up_ref->nb[1]);
+            ggml_tensor * ref_mid_slot = ggml_view_2d(ctx0, dsv4_ffnmoe_stage_mid_ref, down_exps_mm->ne[0], n_tokens, dsv4_ffnmoe_stage_mid_ref->nb[2], i*dsv4_ffnmoe_stage_mid_ref->nb[1]);
+
+            struct probe_pair {
+                ggml_tensor * ref;
+                ggml_tensor * fused;
+                const char  * kind;
+            } probes[] = {
+                { ref_gate_slot, fused_gate[i], "gate" },
+                { ref_up_slot, fused_up[i], "up" },
+                { ref_mid_slot, fused_mid[i], "mid" },
+                { ref_partials[i], fused_partials[i], "partial" },
+            };
+
+            for (const probe_pair & probe : probes) {
+                ggml_tensor * ref_zero = ggml_sub(ctx0, probe.fused, probe.fused);
+                ggml_tensor * ref_probe = ggml_add(ctx0, probe.ref, ref_zero);
+                char ref_name[64];
+                snprintf(ref_name, sizeof(ref_name), "dsv4_ffnmoe_%s_ref-s%d", probe.kind, i);
+                cb(ref_probe, ref_name, il);
+                ggml_build_forward_expand(gf, ref_probe);
+
+                ggml_tensor * fused_zero = ggml_sub(ctx0, probe.ref, probe.ref);
+                ggml_tensor * fused_probe = ggml_add(ctx0, probe.fused, fused_zero);
+                char fused_name[64];
+                snprintf(fused_name, sizeof(fused_name), "dsv4_ffnmoe_%s_fused-s%d", probe.kind, i);
+                cb(fused_probe, fused_name, il);
+                ggml_build_forward_expand(gf, fused_probe);
+            }
+        }
+
+        ggml_tensor * ref_final_zero = ggml_sub(ctx0, fused_partials[5], fused_partials[5]);
+        ggml_tensor * ref_final = ggml_add(ctx0, moe_out, ref_final_zero);
+        cb(ref_final, "dsv4_ffnmoe_final_ref", il);
+        ggml_build_forward_expand(gf, ref_final);
+
+        ggml_tensor * fused_final_zero = ggml_sub(ctx0, moe_out, moe_out);
+        ggml_tensor * fused_final = ggml_add(ctx0, fused_partials[5], fused_final_zero);
+        cb(fused_final, "dsv4_ffnmoe_final_fused", il);
+        ggml_build_forward_expand(gf, fused_final);
+
+        if (llama_dsv4_ffn_moe_stage_compare_consume_fused()) {
+            ggml_tensor * fused_out = ggml_add(ctx0, fused_final, ggml_sub(ctx0, ref_final, ref_final));
+            cb(fused_out, "ffn_moe_out", il);
+            return fused_out;
+        }
+    } else if (dsv4_ffnmoe_stage_candidate && n_expert_aggregate == 6 &&
+            llama_dsv4_ffn_moe_stage_compare_enabled()) {
+        ggml_tensor * stage = ggml_dsv4_ffn_moe_decode_stage(ctx0, down_exps_mm, cur, selected_experts_mm);
+        cb(stage, "dsv4_ffnmoe_stage", il);
+
+        ggml_tensor * fused_partials[6] = { nullptr };
+        for (int i = 0; i < 6; ++i) {
+            fused_partials[i] = ggml_view_2d(ctx0, stage, n_embd, n_tokens, stage->nb[2], i*stage->nb[1]);
+        }
+
+        for (int i = 0; i < 6; ++i) {
+            GGML_ASSERT(ref_partials[i] != nullptr);
+
+            ggml_tensor * ref_zero = ggml_sub(ctx0, fused_partials[i], fused_partials[i]);
+            ggml_tensor * ref_probe = ggml_add(ctx0, ref_partials[i], ref_zero);
+            char ref_name[64];
+            snprintf(ref_name, sizeof(ref_name), "dsv4_ffnmoe_partial_ref-s%d", i);
+            cb(ref_probe, ref_name, il);
+            ggml_build_forward_expand(gf, ref_probe);
+
+            ggml_tensor * fused_zero = ggml_sub(ctx0, ref_partials[i], ref_partials[i]);
+            ggml_tensor * fused_probe = ggml_add(ctx0, fused_partials[i], fused_zero);
+            char fused_name[64];
+            snprintf(fused_name, sizeof(fused_name), "dsv4_ffnmoe_partial_fused-s%d", i);
+            cb(fused_probe, fused_name, il);
+            ggml_build_forward_expand(gf, fused_probe);
+        }
+
+        ggml_tensor * ref_final_zero = ggml_sub(ctx0, fused_partials[5], fused_partials[5]);
+        ggml_tensor * ref_final = ggml_add(ctx0, moe_out, ref_final_zero);
+        cb(ref_final, "dsv4_ffnmoe_final_ref", il);
+        ggml_build_forward_expand(gf, ref_final);
+
+        ggml_tensor * fused_final_zero = ggml_sub(ctx0, moe_out, moe_out);
+        ggml_tensor * fused_final = ggml_add(ctx0, fused_partials[5], fused_final_zero);
+        cb(fused_final, "dsv4_ffnmoe_final_fused", il);
+        ggml_build_forward_expand(gf, fused_final);
+
+        if (llama_dsv4_ffn_moe_stage_compare_consume_fused()) {
+            ggml_tensor * fused_out = ggml_add(ctx0, fused_final, ggml_sub(ctx0, ref_final, ref_final));
+            cb(fused_out, "ffn_moe_out", il);
+            return fused_out;
+        }
+    }
 
     return moe_out;
 }

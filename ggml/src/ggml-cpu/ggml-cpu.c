@@ -2077,9 +2077,53 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hadamard_fp4_quantize(params, tensor);
             } break;
+        case GGML_OP_DSV4_INDEXER_WEIGHTED_SCORE:
+            {
+                ggml_compute_forward_dsv4_indexer_weighted_score(params, tensor);
+            } break;
+        case GGML_OP_DSV4_COMPRESSOR_PAIR_PROJ:
+            {
+                ggml_compute_forward_dsv4_compressor_pair_proj(params, tensor);
+            } break;
+        case GGML_OP_DSV4_MIXED_ATTN:
+            {
+                ggml_compute_forward_dsv4_mixed_attn(params, tensor);
+            } break;
+        case GGML_OP_DSV4_DECODE_COMPRESS:
+            {
+                ggml_compute_forward_dsv4_decode_compress(params, tensor);
+            } break;
         case GGML_OP_DSV4_ROPE_TAIL:
             {
                 ggml_compute_forward_dsv4_rope_tail(params, tensor);
+            } break;
+        case GGML_OP_DSV4_ATTN_OUT_DECODE:
+            {
+                ggml_compute_forward_dsv4_attn_out_decode(params, tensor);
+            } break;
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE:
+            {
+                ggml_compute_forward_dsv4_compressor_update_decode(params, tensor);
+            } break;
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE_V2:
+            {
+                ggml_compute_forward_dsv4_compressor_update_decode_v2(params, tensor);
+            } break;
+        case GGML_OP_DSV4_KV_FINALIZE_DECODE:
+            {
+                ggml_compute_forward_dsv4_kv_finalize_decode(params, tensor);
+            } break;
+        case GGML_OP_DSV4_FFN_MOE_DECODE_STAGE:
+            {
+                ggml_compute_forward_dsv4_ffn_moe_decode_stage(params, tensor);
+            } break;
+        case GGML_OP_DSV4_ROUTED_MOE_ONE_TENSOR_DECODE:
+            {
+                ggml_compute_forward_dsv4_routed_moe_one_tensor_decode(params, tensor);
+            } break;
+        case GGML_OP_DSV4_DECODE_LAYER:
+            {
+                ggml_compute_forward_dsv4_decode_layer(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2266,8 +2310,22 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_EXPAND:
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:
         case GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE:
+        case GGML_OP_DSV4_INDEXER_WEIGHTED_SCORE:
+        case GGML_OP_DSV4_MIXED_ATTN:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_DSV4_COMPRESSOR_PAIR_PROJ:
+        case GGML_OP_DSV4_DECODE_COMPRESS:
+        case GGML_OP_DSV4_ATTN_OUT_DECODE:
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE:
+        case GGML_OP_DSV4_COMPRESSOR_UPDATE_DECODE_V2:
+        case GGML_OP_DSV4_KV_FINALIZE_DECODE:
+        case GGML_OP_DSV4_FFN_MOE_DECODE_STAGE:
+        case GGML_OP_DSV4_ROUTED_MOE_ONE_TENSOR_DECODE:
+        case GGML_OP_DSV4_DECODE_LAYER:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:

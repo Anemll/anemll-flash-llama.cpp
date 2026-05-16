@@ -288,3 +288,12 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build(export-graph-ops.cpp)
 target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+add_executable(dsv4-layer-executor-harness dsv4_layer_executor_harness.cpp)
+target_compile_features(dsv4-layer-executor-harness PRIVATE cxx_std_17)
+if (APPLE)
+    target_sources(dsv4-layer-executor-harness PRIVATE dsv4_layer_executor_metal.m)
+    target_compile_options(dsv4-layer-executor-harness PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
+    target_compile_definitions(dsv4-layer-executor-harness PRIVATE DSV4_LAYER_EXECUTOR_HARNESS_METAL=1)
+    target_link_libraries(dsv4-layer-executor-harness PRIVATE "-framework Foundation" "-framework Metal")
+endif()

@@ -7,6 +7,7 @@
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -562,6 +563,19 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * value = getenv("GGML_METAL_N_CB");
+    if (value == NULL || value[0] == '\0') {
+        value = getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_N_CB");
+    }
+    if (value == NULL || value[0] == '\0') {
+        return 1;
+    }
+
+    const int parsed = atoi(value);
+    return parsed > 0 ? parsed : 1;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -603,7 +617,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -697,7 +711,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 
