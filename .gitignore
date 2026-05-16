@@ -152,3 +152,5 @@ tools/flashmoe-sidecar/prompts/coding/prefill-log.txt
 flashmoe-results/dsv4-topk-prompt-sweep/20260430-122237/summary.csv
 flashmoe-results/dsv4-topk-prompt-sweep/20260430-140117/summary.csv
 tools/flashmoe-sidecar/logs/
+exports/session-export-*
+relay/
