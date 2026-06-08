@@ -276,7 +276,8 @@ ggml_tensor * llm_build_gemma4_iswa::get_per_layer_inputs() {
 
         // Extract and dequantize padding token embedding (row 0)
         ggml_tensor * padding = ggml_view_1d(ctx0, model.tok_embd_per_layer, embd_size, 0);
-        inp_per_layer = ggml_cast(ctx0, padding, GGML_TYPE_F32);
+        inp_per_layer = ggml_cast (ctx0, padding, GGML_TYPE_F32);
+        inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float) n_embd_per_layer));
 
         // Reshape to [n_embd_per_layer, n_layer, 1]
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, 1);

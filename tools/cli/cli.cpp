@@ -952,6 +952,48 @@ int main(int argc, char ** argv) {
                 cur_msg += marker;
             }
             buffer = params.prompt;
+            // Scan for inline <filename.ext> image patterns in -p text and replace with media markers
+            if (inf.has_inp_image) {
+                static const std::vector<std::string> img_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"};
+                std::string result;
+                size_t pos = 0;
+                while (pos < buffer.size()) {
+                    size_t open = buffer.find('<', pos);
+                    if (open == std::string::npos) {
+                        result += buffer.substr(pos);
+                        break;
+                    }
+                    result += buffer.substr(pos, open - pos);
+                    size_t close = buffer.find('>', open);
+                    if (close == std::string::npos) {
+                        result += buffer.substr(open);
+                        break;
+                    }
+                    std::string candidate = buffer.substr(open + 1, close - open - 1);
+                    bool is_image = false;
+                    for (const auto & ext : img_exts) {
+                        if (candidate.size() > ext.size() &&
+                                candidate.substr(candidate.size() - ext.size()) == ext) {
+                            is_image = true;
+                            break;
+                        }
+                    }
+                    if (is_image) {
+                        std::string marker = ctx_cli.load_input_file(candidate, true);
+                        if (!marker.empty()) {
+                            console::log("Loaded inline media from '%s'\n", candidate.c_str());
+                            result += marker;
+                        } else {
+                            console::error("inline image not found: '%s'\n", candidate.c_str());
+                            result += buffer.substr(open, close - open + 1);
+                        }
+                    } else {
+                        result += buffer.substr(open, close - open + 1);
+                    }
+                    pos = close + 1;
+                }
+                buffer = result;
+            }
             if (buffer.size() > 500) {
                 console::log("\n> %s ... (truncated)\n", buffer.substr(0, 500).c_str());
             } else {

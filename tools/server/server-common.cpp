@@ -694,7 +694,7 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), false));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
