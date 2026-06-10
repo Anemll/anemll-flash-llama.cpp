@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cmath>
 #include <filesystem>
+#include <set>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -471,6 +472,11 @@ struct llama_model::impl {
     int32_t flash_moe_slot_bank_size = 0;
     int32_t flash_moe_cache_io_split = 4;
     int32_t moe_n_expert_used = 0;
+    bool flash_moe_sweep_prefill_enabled = false;
+    int32_t flash_moe_sweep_min_tokens = 32;
+    // routed expert tensors whose data is verified to lie inside a file-backed
+    // mmap region (safe for madvise WILLNEED/DONTNEED streaming)
+    std::set<const ggml_tensor *> flash_moe_sweep_tensors;
     std::string flash_moe_trace_file;
     std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
     std::vector<llama_flash_moe_sparse_mapping> flash_moe_sparse_mappings;
@@ -558,6 +564,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
             pimpl->flash_moe_resident_source_enabled ||
             pimpl->flash_moe_oracle_all_hit_enabled ||
             pimpl->flash_moe_oracle_prefetch_enabled;
+    pimpl->flash_moe_sweep_prefill_enabled = llama_flash_moe_mode_is(params, "sweep-prefill");
+    pimpl->flash_moe_sweep_min_tokens = std::max<int32_t>(1, params.moe_sweep_min_tokens);
     pimpl->flash_moe_trace_file = params.moe_trace_file ? params.moe_trace_file : "";
 }
 
@@ -8691,6 +8699,62 @@ const char * llama_model::flash_moe_trace_file() const {
     return pimpl->flash_moe_trace_file.empty() ? nullptr : pimpl->flash_moe_trace_file.c_str();
 }
 
+bool llama_model::flash_moe_sweep_prefill_enabled() const {
+    return pimpl->flash_moe_sweep_prefill_enabled;
+}
+
+int32_t llama_model::flash_moe_sweep_min_tokens() const {
+    return pimpl->flash_moe_sweep_min_tokens;
+}
+
+bool llama_model::flash_moe_sweep_tensor(const struct ggml_tensor * t) const {
+    return pimpl->flash_moe_sweep_tensors.count(t) > 0;
+}
+
+void llama_model::flash_moe_register_sweep_tensors() {
+    if (!pimpl->flash_moe_sweep_prefill_enabled) {
+        return;
+    }
+
+    // note: by the time load_tensors() returns, mapping ownership has moved
+    // from the loader into pimpl->mappings, so consult those
+    auto in_mapping = [&](const void * data, size_t size) {
+        for (const auto & mapping : pimpl->mappings) {
+            if (!mapping) {
+                continue;
+            }
+            const char * base = (const char *) mapping->addr();
+            if ((const char *) data >= base && (const char *) data + size <= base + mapping->size()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t registered = 0;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+            // only tensors backed by the file mmap are safe to stream with
+            // madvise; repacked or heap-allocated tensors must stay untouched
+            if (t != nullptr && t->data != nullptr && in_mapping(t->data, ggml_nbytes(t))) {
+                // mark the weight leaf itself: op_params is unused on leaf
+                // tensors, and the CPU mul_mat_id reads this marker to engage
+                // the sweep (WILLNEED readahead + lagged DONTNEED)
+                t->op_params[0] = 0x53574550; // 'SWEP'
+                t->op_params[1] = pimpl->flash_moe_sweep_min_tokens;
+                pimpl->flash_moe_sweep_tensors.insert(t);
+                registered++;
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: sweep-prefill: %zu routed expert tensors eligible for streaming (min ubatch tokens: %d)\n",
+            __func__, registered, pimpl->flash_moe_sweep_min_tokens);
+    if (registered == 0) {
+        LLAMA_LOG_WARN("%s: sweep-prefill requested but no mmap-backed expert tensors found (is --no-mmap set?); falling back to stock behavior\n", __func__);
+    }
+}
+
 const llama_flash_moe_sidecar_entry * llama_model::flash_moe_sidecar_entry_for(const char * name) const {
     const auto it = pimpl->flash_moe_sidecar_entries.find(name);
     if (it == pimpl->flash_moe_sidecar_entries.end()) {
@@ -9426,6 +9490,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_predict_prev_token      =*/ false,
         /*.moe_predict_top1_prev       =*/ false,
         /*.moe_slot_bank               =*/ 0,
+        /*.moe_sweep_min_tokens        =*/ 32,
         /*.moe_topk_override           =*/ 0,
         /*.moe_cache_io_split          =*/ 4,
     };

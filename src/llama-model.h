@@ -596,6 +596,10 @@ struct llama_model {
     int32_t flash_moe_cache_io_split() const;
     int32_t moe_n_expert_used() const;
     const char * flash_moe_trace_file() const;
+    bool flash_moe_sweep_prefill_enabled() const;
+    int32_t flash_moe_sweep_min_tokens() const;
+    bool flash_moe_sweep_tensor(const struct ggml_tensor * t) const;
+    void flash_moe_register_sweep_tensors();
     const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

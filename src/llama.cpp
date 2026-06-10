@@ -897,13 +897,18 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
         const bool use_oracle_all_hit = moe_mode == "oracle-all-hit";
         const bool use_oracle_prefetch = moe_mode == "oracle-prefetch";
         const bool use_stock_resident = moe_mode == "stock" || moe_mode == "resident";
+        const bool use_sweep_prefill = moe_mode == "sweep-prefill";
         const bool use_slot_runtime = use_resident_slot_bank || use_slot_bank || use_oracle_all_hit || use_oracle_prefetch;
         const bool use_flash_moe_sidecar_runtime = use_resident_bank || use_slot_runtime;
 
-        if (!use_stock_resident && !use_resident_bank && !use_slot_runtime) {
+        if (!use_stock_resident && !use_sweep_prefill && !use_resident_bank && !use_slot_runtime) {
             throw std::runtime_error(format(
-                "Flash-MoE mode '%s' is not implemented in this build; supported modes are stock, resident, resident-bank, resident-slot-bank, slot-bank, oracle-all-hit, oracle-prefetch",
+                "Flash-MoE mode '%s' is not implemented in this build; supported modes are stock, resident, resident-bank, resident-slot-bank, slot-bank, sweep-prefill, oracle-all-hit, oracle-prefetch",
                 moe_mode.c_str()));
+        }
+
+        if (use_sweep_prefill && !params.use_mmap) {
+            throw std::runtime_error("Flash-MoE sweep-prefill mode requires mmap (remove --no-mmap)");
         }
 
         if ((use_resident_bank || use_slot_runtime) && (params.moe_sidecar_path == nullptr || params.moe_sidecar_path[0] == '\0')) {
@@ -983,6 +988,8 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
         if (!model.load_tensors(ml)) {
             return -2;
         }
+
+        model.flash_moe_register_sweep_tensors();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;

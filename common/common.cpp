@@ -1357,6 +1357,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_predict_prev_token = params.moe_predict_prev_token;
     mparams.moe_predict_top1_prev = params.moe_predict_top1_prev;
     mparams.moe_slot_bank      = params.moe_slot_bank;
+    mparams.moe_sweep_min_tokens = params.moe_sweep_min_tokens;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
 

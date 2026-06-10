@@ -2234,7 +2234,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SIDECAR"));
     add_opt(common_arg(
-        {"--moe-mode"}, "{stock,resident,resident-bank,resident-slot-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
+        {"--moe-mode"}, "{stock,resident,resident-bank,resident-slot-bank,slot-bank,sweep-prefill,oracle-all-hit,oracle-prefetch}",
         "Flash-MoE runtime mode",
         [](common_params & params, const std::string & value) {
             static const std::set<std::string> valid = {
@@ -2243,6 +2243,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 "resident-bank",
                 "resident-slot-bank",
                 "slot-bank",
+                "sweep-prefill",
                 "oracle-all-hit",
                 "oracle-prefetch",
             };
@@ -2252,6 +2253,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_mode = value;
         }
     ).set_env("LLAMA_ARG_MOE_MODE"));
+    add_opt(common_arg(
+        {"--moe-sweep-min-tokens"}, "N",
+        string_format("minimum ubatch tokens to engage sweep-prefill expert streaming (default: %d)", params.moe_sweep_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_sweep_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SWEEP_MIN_TOKENS"));
     add_opt(common_arg(
         {"--moe-slot-bank"}, "N",
         "Flash-MoE slot-bank resident expert capacity per routed MoE layer",
