@@ -2,6 +2,8 @@
 
 #include "llama-memory-recurrent.h"
 
+#include <cstring>
+
 static bool qwen35moe_experimental_metal_split_glu_enabled() {
     static int enabled = -1;
     if (enabled == -1) {
