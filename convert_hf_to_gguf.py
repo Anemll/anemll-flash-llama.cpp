@@ -9455,6 +9455,22 @@ class GlmMoeDsaModel(DeepseekV2Model):
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
+        # Optional GLM-5.2 IndexShare/indexer metadata. The runtime parses these
+        # fields for schedule awareness; full DSA sparse-mask/cache execution is
+        # handled separately from conversion.
+        if (index_topk_freq := self.hparams.get("index_topk_freq")) is not None:
+            self.gguf_writer.add_indexer_top_k_freq(int(index_topk_freq))
+        if (index_topk_pattern := self.hparams.get("index_topk_pattern")) is not None:
+            self.gguf_writer.add_indexer_top_k_pattern(index_topk_pattern)
+        if (indexer_types := self.hparams.get("indexer_types")) is not None:
+            self.gguf_writer.add_indexer_types([str(indexer_type) for indexer_type in indexer_types])
+        if (index_share_for_mtp_iteration := self.hparams.get("index_share_for_mtp_iteration")) is not None:
+            self.gguf_writer.add_indexer_share_for_mtp_iteration(bool(index_share_for_mtp_iteration))
+        if (index_skip_topk_offset := self.hparams.get("index_skip_topk_offset")) is not None:
+            self.gguf_writer.add_indexer_skip_top_k_offset(int(index_skip_topk_offset))
+        if (indexer_rope_interleave := self.hparams.get("indexer_rope_interleave")) is not None:
+            self.gguf_writer.add_indexer_rope_interleave(bool(indexer_rope_interleave))
+
 
 @ModelBase.register("GlmForCausalLM", "ChatGLMModel", "ChatGLMForConditionalGeneration")
 class ChatGLMModel(TextModel):

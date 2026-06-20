@@ -2417,6 +2417,68 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+                const bool found_indexer_freq =
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQ, hparams.indexer_top_k_freq, false);
+                const bool found_indexer_offset =
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, hparams.indexer_skip_top_k_offset, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_SHARE_FOR_MTP_ITERATION, hparams.indexer_share_for_mtp_iteration, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_ROPE_INTERLEAVE,         hparams.indexer_rope_interleave, false);
+
+                bool found_indexer_types = false;
+                std::vector<std::string> indexer_types;
+                if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types, false)) {
+                    if (indexer_types.size() != hparams.n_layer) {
+                        throw std::runtime_error(format("invalid GLM DSA indexer_types length %zu, expected %u",
+                                    indexer_types.size(), hparams.n_layer));
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        if (indexer_types[il] == "full" || indexer_types[il] == "F") {
+                            hparams.indexer_is_full[il] = true;
+                        } else if (indexer_types[il] == "shared" || indexer_types[il] == "S") {
+                            hparams.indexer_is_full[il] = false;
+                        } else {
+                            throw std::runtime_error(format("invalid GLM DSA indexer type '%s' at layer %u",
+                                        indexer_types[il].c_str(), il));
+                        }
+                    }
+                    found_indexer_types = true;
+                }
+
+                if (!found_indexer_types) {
+                    std::vector<std::string> indexer_pattern;
+                    if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TOP_K_PATTERN, indexer_pattern, false)) {
+                        if (indexer_pattern.size() != hparams.n_layer) {
+                            throw std::runtime_error(format("invalid GLM DSA indexer top-k pattern length %zu, expected %u",
+                                        indexer_pattern.size(), hparams.n_layer));
+                        }
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            if (indexer_pattern[il] == "full" || indexer_pattern[il] == "F") {
+                                hparams.indexer_is_full[il] = true;
+                            } else if (indexer_pattern[il] == "shared" || indexer_pattern[il] == "S") {
+                                hparams.indexer_is_full[il] = false;
+                            } else {
+                                throw std::runtime_error(format("invalid GLM DSA indexer top-k pattern '%s' at layer %u",
+                                            indexer_pattern[il].c_str(), il));
+                            }
+                        }
+                        found_indexer_types = true;
+                    }
+                }
+
+                if (!found_indexer_types) {
+                    if (!found_indexer_freq && !found_indexer_offset &&
+                            hparams.n_layer == 78 &&
+                            hparams.n_ctx_train >= 1048576 &&
+                            hparams.rope_freq_base_train > 7000000.0f) {
+                        // Backfill the official GLM-5.2 schedule for older GGUFs
+                        // converted before IndexShare metadata was preserved.
+                        hparams.indexer_top_k_freq = 4;
+                        hparams.indexer_skip_top_k_offset = 3;
+                        hparams.indexer_share_for_mtp_iteration = true;
+                        hparams.indexer_rope_interleave = true;
+                    }
+                    hparams.set_indexer_pattern(hparams.indexer_top_k_freq, hparams.indexer_skip_top_k_offset);
+                }
 
                 // Expert gating function (GLM-4.5 uses sigmoid)
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
@@ -9396,6 +9458,33 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: expert_weights_scale  = %.1f\n",   __func__, hparams.expert_weights_scale);
         LLAMA_LOG_INFO("%s: expert_weights_norm   = %d\n",     __func__, hparams.expert_weights_norm);
         LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
+    }
+
+    if (!hparams.vocab_only && arch == LLM_ARCH_GLM_DSA) {
+        uint32_t indexer_full = 0;
+        std::string indexer_pattern;
+        const uint32_t n_preview = std::min<uint32_t>(hparams.n_layer, 32);
+        indexer_pattern.reserve(n_preview + (hparams.n_layer > n_preview ? 3 : 0));
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            const bool is_full = hparams.is_indexer_full(il);
+            indexer_full += is_full ? 1 : 0;
+            if (il < n_preview) {
+                indexer_pattern.push_back(is_full ? 'F' : 'S');
+            }
+        }
+        if (hparams.n_layer > n_preview) {
+            indexer_pattern += "...";
+        }
+
+        LLAMA_LOG_INFO("%s: indexer_n_head       = %u\n",     __func__, hparams.indexer_n_head);
+        LLAMA_LOG_INFO("%s: indexer_head_size    = %u\n",     __func__, hparams.indexer_head_size);
+        LLAMA_LOG_INFO("%s: indexer_top_k        = %u\n",     __func__, hparams.indexer_top_k);
+        LLAMA_LOG_INFO("%s: indexer_top_k_freq   = %u\n",     __func__, hparams.indexer_top_k_freq);
+        LLAMA_LOG_INFO("%s: indexer_skip_offset  = %u\n",     __func__, hparams.indexer_skip_top_k_offset);
+        LLAMA_LOG_INFO("%s: indexer_rope_inter   = %d\n",     __func__, hparams.indexer_rope_interleave);
+        LLAMA_LOG_INFO("%s: indexer_share_mtp    = %d\n",     __func__, hparams.indexer_share_for_mtp_iteration);
+        LLAMA_LOG_INFO("%s: indexer_full_layers  = %u/%u pattern=%s\n",
+                __func__, indexer_full, hparams.n_layer, indexer_pattern.c_str());
     }
 
     if (arch == LLM_ARCH_QWEN2MOE) {

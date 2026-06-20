@@ -185,9 +185,15 @@ class Keys:
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
 
         class Indexer:
-            HEAD_COUNT = "{arch}.attention.indexer.head_count"
-            KEY_LENGTH = "{arch}.attention.indexer.key_length"
-            TOP_K      = "{arch}.attention.indexer.top_k"
+            HEAD_COUNT                  = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH                  = "{arch}.attention.indexer.key_length"
+            TOP_K                       = "{arch}.attention.indexer.top_k"
+            TOP_K_FREQ                  = "{arch}.attention.indexer.top_k_freq"
+            TOP_K_PATTERN               = "{arch}.attention.indexer.top_k_pattern"
+            TYPES                       = "{arch}.attention.indexer.types"
+            SHARE_FOR_MTP_ITERATION     = "{arch}.attention.indexer.share_for_mtp_iteration"
+            SKIP_TOP_K_OFFSET           = "{arch}.attention.indexer.skip_top_k_offset"
+            ROPE_INTERLEAVE             = "{arch}.attention.indexer.rope_interleave"
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"

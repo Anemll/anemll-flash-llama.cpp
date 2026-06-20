@@ -17,6 +17,24 @@ void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     }
 }
 
+void llama_hparams::set_indexer_pattern(uint32_t freq, uint32_t skip_offset) {
+    indexer_top_k_freq = std::max<uint32_t>(freq, 1);
+    indexer_skip_top_k_offset = skip_offset;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const uint32_t shifted = il + 1 > skip_offset ? il - skip_offset + 1 : 0;
+        indexer_is_full[il] = shifted % indexer_top_k_freq == 0;
+    }
+}
+
+bool llama_hparams::is_indexer_full(uint32_t il) const {
+    if (il < n_layer) {
+        return indexer_is_full[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (swa_layers[il]) {

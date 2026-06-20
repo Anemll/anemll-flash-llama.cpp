@@ -209,6 +209,11 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_top_k_freq        = 1;
+    uint32_t indexer_skip_top_k_offset = 2;
+    bool     indexer_share_for_mtp_iteration = false;
+    bool     indexer_rope_interleave         = false;
+    std::array<bool, LLAMA_MAX_LAYERS> indexer_is_full;
 
     // DeepSeek V4 hyper-connections and sparse KV compression
     uint32_t n_hc                    = 1;
@@ -258,6 +263,10 @@ struct llama_hparams {
     //   il == 3: swa
     //   etc ...
     void set_swa_pattern(uint32_t n_pattern, bool dense_first = false);
+
+    void set_indexer_pattern(uint32_t freq, uint32_t skip_offset);
+
+    bool is_indexer_full(uint32_t il) const;
 
     // return true if one of the layers is SWA
     bool is_swa_any() const;

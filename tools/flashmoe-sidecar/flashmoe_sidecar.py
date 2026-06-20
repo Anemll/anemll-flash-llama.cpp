@@ -192,6 +192,36 @@ def reader_scalar(reader: GGUFReader, key: str, default: Any = None) -> Any:
     return field.contents() if field is not None else default
 
 
+def json_safe_metadata_value(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (list, tuple)):
+        return [json_safe_metadata_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_safe_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def collect_sidecar_model_metadata(reader: GGUFReader, arch: str) -> dict[str, Any]:
+    prefixes = (
+        f"{arch}.rope.",
+        f"{arch}.attention.indexer.",
+    )
+    keys = [f"{arch}.context_length"]
+    metadata: dict[str, Any] = {}
+
+    for key, field in reader.fields.items():
+        if key not in keys and not any(key.startswith(prefix) for prefix in prefixes):
+            continue
+        metadata[key] = json_safe_metadata_value(field.contents())
+
+    return dict(sorted(metadata.items()))
+
+
 def parse_layer_spec(spec: str | None) -> set[int] | None:
     if spec is None or spec.strip() == "":
         return None
@@ -296,6 +326,7 @@ def build_tensor_index(
         "expert_count": int(expert_count) if expert_count is not None else None,
         "expert_used_count": int(expert_used_count) if expert_used_count is not None else None,
         "leading_dense_block_count": int(leading_dense) if leading_dense is not None else None,
+        "gguf_metadata": collect_sidecar_model_metadata(first_reader, arch),
     }
     return tensors, metadata
 

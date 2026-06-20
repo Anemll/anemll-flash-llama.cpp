@@ -29,6 +29,7 @@ Per-model extract + run recipes in this document:
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
+| **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
 
 ## Current scope
 
@@ -76,6 +77,26 @@ PYTHON=python3 \
 ```
 
 The sidecar is roughly 177 GiB at IQ1_M/IQ2_XXS (76 MoE layers × 256 experts × gate/up/down). Make sure the target SSD has the room.
+
+## Extract a GLM-5.2 sidecar
+
+GLM-5.2 is the same `glm-dsa` model family as GLM-5.1, but the config is not identical.
+The checked GGUF stores GLM-5.2 long-context RoPE values (`context_length = 1048576`, `rope.freq_base = 8000000`) and core DSA indexer values (`indexer.head_count = 32`, `indexer.key_length = 128`, `indexer.top_k = 2048`).
+The sidecar exporter keeps those fields in the manifest metadata and removes only routed expert tensors; DSA/indexer tensors remain in the dense GGUF path.
+GLM-5.2 config conversion also preserves the newer IndexShare fields (`index_topk_freq`, `index_topk_pattern`, `indexer_types`, `index_share_for_mtp_iteration`, `index_skip_topk_offset`, `indexer_rope_interleave`) when they are present in the HF config. Older GGUFs that lack those keys can still be identified by the GLM-5.2 long-context shape and get the standard `FFFSSSF...` IndexShare schedule at load time.
+
+```bash
+PYTHON=python3 \
+./tools/flashmoe-sidecar/flashmoe_sidecar.py extract \
+  --model /Volumes/TB36/Models/GLM-5.2/UD-IQ1_M/GLM-5.2-UD-IQ1_M-00001-of-00006.gguf \
+  --out-dir /Volumes/TB36/Models/GLM-5.2/Flash-UD-IQ1_M
+```
+
+Expected routed sidecar payload for the checked `UD-IQ1_M` shards:
+
+- `228` routed tensors
+- `76` routed MoE layers (`blk.3` through `blk.78`)
+- `212,902,871,040` exact routed bytes
 
 ## Export a MiniMax M2.7 Flash package
 
@@ -159,6 +180,18 @@ Run the compact dense GGUF with the same sidecar:
 ```
 
 Compared with the full GLM shard set, the compact dense GGUF is about 14 GiB on disk while routed expert bytes continue to come from the sidecar.
+
+GLM-5.2 example:
+
+```bash
+python3 ./tools/flashmoe-sidecar/export_dense_gguf.py \
+  --model /Volumes/TB36/Models/GLM-5.2/UD-IQ1_M/GLM-5.2-UD-IQ1_M-00001-of-00006.gguf \
+  --sidecar /Volumes/TB36/Models/GLM-5.2/Flash-UD-IQ1_M \
+  --out-dir /Volumes/TB36/Models/GLM-5.2/GLM-5.2-IQ1-Dense \
+  --force
+```
+
+The dense GLM-5.2 GGUF should still contain all DSA/indexer tensors (`blk.*.indexer.*`); only `ffn_gate_exps`, `ffn_up_exps`, and `ffn_down_exps` belong in the sidecar. On the checked IQ1_M package this produced a 15 GiB dense GGUF plus a 198 GiB sidecar.
 
 ## Run MiniMax M2.7 with Flash-MoE
 
@@ -438,6 +471,38 @@ GLM-5.1 specific notes:
   ```bash
   LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1 ./build/bin/llama-cli ...
   ```
+
+## Run GLM-5.2 with the sidecar
+
+Use the same GLM-DSA slot-bank path as GLM-5.1. Start with a compact context for smoke tests because the checked GLM-5.2 GGUF advertises a 1M-token context window.
+
+```bash
+./build/bin/llama-cli --perf \
+  -m /Volumes/SN8100/flash/GLM/GLM-5.2-IQ1-Dense/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /Volumes/SN8100/flash/GLM/GLM-5.2-sidecar \
+  --moe-verify-sidecar \
+  --moe-slot-bank 64 \
+  --moe-topk 4 \
+  --moe-cache-io-split 4 \
+  --moe-prefetch-temporal \
+  -fit on \
+  -ub 1 -b 16 \
+  -ngl 999 \
+  -c 512 \
+  --seed 123 --temp 0 \
+  -p "What is Apple Neural Engine? Answer in one sentence." \
+  -n 8 -st
+```
+
+For tuning on this 96 GB M3 Ultra, sweep `--moe-slot-bank 64`, `72`, `76`, then `80`; `64` is the tested safe point and `80` is near the memory edge for this GLM-5.2 package.
+
+GLM-5.2 notes:
+
+- DSA/indexer weights (`blk.N.indexer.*`) are dense-path tensors and must remain in `model-dense.gguf`; only `blk.N.ffn_{gate,up,down}_exps.weight` tensors belong in the sidecar.
+- `--moe-topk 4` is the currently smoke-tested speed path. Native routed K=8 is the model-default path, but it needs a separate performance pass on this branch.
+- Long-context DSA IndexShare metadata is preserved and logged, including the GLM-5.2 `FFFSSSF...` schedule. Full sparse DSA mask execution with persistent indexer-key cache is still separate runtime work; short prompts below `indexer.top_k = 2048` remain equivalent to full causal attention.
+- A fast local copy of the sidecar needs roughly `213 GB` free, before filesystem overhead. The checked local copy is `/Volumes/SN8100/flash/GLM/GLM-5.2-sidecar`.
 
 ## Benchmark weighted 3-drive stripe splits
 

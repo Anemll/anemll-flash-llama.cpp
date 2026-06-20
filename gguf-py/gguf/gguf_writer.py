@@ -790,6 +790,28 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_indexer_top_k_freq(self, freq: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.TOP_K_FREQ.format(arch=self.arch), freq)
+
+    def add_indexer_top_k_pattern(self, pattern: int | Sequence[int] | Sequence[str]) -> None:
+        key = Keys.Attention.Indexer.TOP_K_PATTERN.format(arch=self.arch)
+        if isinstance(pattern, int):
+            self.add_uint32(key, pattern)
+        else:
+            self.add_array(key, list(pattern))
+
+    def add_indexer_types(self, types: Sequence[str]) -> None:
+        self.add_array(Keys.Attention.Indexer.TYPES.format(arch=self.arch), list(types))
+
+    def add_indexer_share_for_mtp_iteration(self, enabled: bool) -> None:
+        self.add_bool(Keys.Attention.Indexer.SHARE_FOR_MTP_ITERATION.format(arch=self.arch), enabled)
+
+    def add_indexer_skip_top_k_offset(self, offset: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.SKIP_TOP_K_OFFSET.format(arch=self.arch), offset)
+
+    def add_indexer_rope_interleave(self, enabled: bool) -> None:
+        self.add_bool(Keys.Attention.Indexer.ROPE_INTERLEAVE.format(arch=self.arch), enabled)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
