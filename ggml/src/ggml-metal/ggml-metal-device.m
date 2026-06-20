@@ -1651,6 +1651,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     (op->src[1]->type == GGML_TYPE_F16 &&
                      ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_IN_MEMORY_FP16_ACTIVATIONS"))) &&
                    op->src[1]->ne[1] > 8;
+        case GGML_OP_FLASHMOE_SLOT8_FFN: {
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL && op->src[2] != NULL &&
+                   op->src[3] != NULL && op->src[4] != NULL && op->src[5] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&            // x
+                   op->src[1]->type == op->src[2]->type &&         // gate/up same quant
+                   op->src[4]->type == GGML_TYPE_I32 &&            // slot ids
+                   op->src[5]->type == GGML_TYPE_F32 &&            // routing weights
+                   op->src[0]->ne[1] == 1 && op->src[0]->ne[2] == 1 && // single-token decode
+                   op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1;
+        }
         case GGML_OP_FLASHMOE_SPLIT_GLU: {
             if (ggml_metal_experimental_env_enabled("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_OP_MUL_MAT")) {
                 return false;

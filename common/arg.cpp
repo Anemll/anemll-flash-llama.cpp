@@ -2373,6 +2373,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXCLUSIVE_DRIVES"));
     add_opt(common_arg(
+        {"--slot8"},
+        {"--no-slot8"},
+        string_format("Flash-MoE: collapse a top-8 routed-expert FFN into a single fused Metal kernel (gate/up/swiglu/down/weighted-sum over all 8 experts), bypassing the per-expert decode replay/ICB cache; only engages on eligible layers, otherwise falls back to the normal slot-bank path (default: %s)", params.slot8 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot8 = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT8"));
+    add_opt(common_arg(
         {"--moe-topk"}, "N",
         "experimental runtime reduction-only override for routed experts per token (0 = model metadata, must be <= GGUF MoE top-k)",
         [](common_params & params, int value) {

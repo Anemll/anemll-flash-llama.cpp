@@ -217,6 +217,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_flashmoe_split_glu_extra_tmp(tensor);
             } break;
+        case GGML_OP_FLASHMOE_SLOT8_FFN:
+            {
+                res += ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);

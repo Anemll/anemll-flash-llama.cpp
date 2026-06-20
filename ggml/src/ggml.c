@@ -1077,9 +1077,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_FP8_KV_QUANTIZE",
     "DSV4_HADAMARD_FP4_QUANTIZE",
     "DSV4_ROPE_TAIL",
+    "FLASHMOE_SLOT8_FFN",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1195,9 +1196,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_fp8_kv_quantize(x)",
     "dsv4_hadamard_fp4_quantize(x)",
     "dsv4_rope_tail(x)",
+    "flashmoe_slot8_ffn(x,g,u,d)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6324,6 +6326,47 @@ struct ggml_tensor * ggml_dsv4_hc_expand(
     return result;
 }
 
+// ggml_flashmoe_slot8_ffn
+
+struct ggml_tensor * ggml_flashmoe_slot8_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate_exps,
+        struct ggml_tensor  * up_exps,
+        struct ggml_tensor  * down_exps,
+        struct ggml_tensor  * slot_ids,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(slot_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type  == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t n_ff   = gate_exps->ne[1];
+    const int64_t n_used = slot_ids->ne[0];
+
+    // single-token decode fast path only
+    GGML_ASSERT(x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(slot_ids->ne[1] == 1);
+    GGML_ASSERT(gate_exps->ne[0] == n_embd);
+    GGML_ASSERT(up_exps->ne[0]   == n_embd);
+    GGML_ASSERT(ggml_are_same_shape(gate_exps, up_exps));
+    GGML_ASSERT(down_exps->ne[0] == n_ff);
+    GGML_ASSERT(down_exps->ne[1] == n_embd);
+    GGML_ASSERT(weights->ne[1] == n_used); // [1, n_expert_used, 1]
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+
+    result->op     = GGML_OP_FLASHMOE_SLOT8_FFN;
+    result->src[0] = x;
+    result->src[1] = gate_exps;
+    result->src[2] = up_exps;
+    result->src[3] = down_exps;
+    result->src[4] = slot_ids;
+    result->src[5] = weights;
+
+    return result;
+}
+
 // ggml_dsv4_fp8_kv_quantize
 
 struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
@@ -7030,6 +7073,9 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_FLASHMOE_SPLIT_GLU: {
             GGML_ABORT("backward pass not implemented for FLASHMOE_SPLIT_GLU");
+        } break;
+        case GGML_OP_FLASHMOE_SLOT8_FFN: {
+            GGML_ABORT("backward pass not implemented for FLASHMOE_SLOT8_FFN");
         } break;
         case GGML_OP_NONE: {
             // noop

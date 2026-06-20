@@ -883,6 +883,7 @@ public:
               resident_bank_source(!transient_shared_scratch && model.flash_moe_resident_source_enabled()),
               oracle_all_hit(!transient_shared_scratch && model.flash_moe_oracle_all_hit_enabled()),
               oracle_prefetch(!transient_shared_scratch && model.flash_moe_oracle_prefetch_enabled()),
+              slot8_enabled(model.flash_moe_slot8_enabled()),
               temporal_prefetch(!transient_shared_scratch && model.flash_moe_temporal_prefetch_enabled()),
               temporal_prefetch_sparse(!transient_shared_scratch && model.flash_moe_temporal_prefetch_sparse_enabled()),
               predict_prev_token(!transient_shared_scratch && model.flash_moe_predict_prev_token_enabled()),
@@ -1180,6 +1181,12 @@ public:
         return uses_layer(layer) &&
                 (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2) &&
                 !native_slot_map_disabled();
+    }
+
+    bool uses_slot8_fused(int layer) const override {
+        // Runtime-level opt-in only; build_moe_ffn checks the graph-shape requirements
+        // (merged gate_up, swiglu, top-8, weight-after-down, no expert bias/scale).
+        return slot8_enabled && uses_layer(layer);
     }
 
     bool uses_dedicated_prefill_moe(int layer) const override {
@@ -2261,6 +2268,7 @@ private:
     bool resident_full_bank_pending = false;
     bool oracle_all_hit = false;
     bool oracle_prefetch = false;
+    bool slot8_enabled = false;
     bool temporal_prefetch = false;
     bool temporal_prefetch_sparse = false;
     bool temporal_prefetch_sparse_even_layers = true;

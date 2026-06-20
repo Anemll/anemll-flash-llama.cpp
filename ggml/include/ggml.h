@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_FP8_KV_QUANTIZE,
         GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE,
         GGML_OP_DSV4_ROPE_TAIL,
+        GGML_OP_FLASHMOE_SLOT8_FFN,
 
         GGML_OP_COUNT,
     };
@@ -2512,6 +2513,19 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // --slot8: fused single-token routed MoE FFN over all selected experts.
+    //   gate_exps/up_exps: [n_embd, n_ff, n_slots], down_exps: [n_ff, n_embd, n_slots]
+    //   slot_ids: [n_expert_used, 1] I32 (resident slot indices), weights: [1, n_expert_used, 1] F32
+    //   result:  [n_embd, 1] F32  =  sum_e weights[e] * down_e( silu(gate_e . x) * (up_e . x) )
+    GGML_API struct ggml_tensor * ggml_flashmoe_slot8_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate_exps,
+            struct ggml_tensor  * up_exps,
+            struct ggml_tensor  * down_exps,
+            struct ggml_tensor  * slot_ids,
+            struct ggml_tensor  * weights);
 
     GGML_API struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
             struct ggml_context * ctx,

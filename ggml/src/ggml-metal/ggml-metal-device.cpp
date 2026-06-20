@@ -2007,6 +2007,42 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_split_si
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_phaseA(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flashmoe_slot8_phaseA");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_phaseB(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flashmoe_slot8_phaseB");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_weighted_sum(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_DSV4_HC_WEIGHTED_SUM);
     GGML_UNUSED(op);

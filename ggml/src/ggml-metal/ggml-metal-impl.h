@@ -344,6 +344,20 @@ typedef struct {
 
 typedef struct {
     int64_t  n_embd;
+    int64_t  n_ff;
+    int64_t  n_used;
+    uint64_t gate_nb1;
+    uint64_t gate_nb2;
+    uint64_t up_nb1;
+    uint64_t up_nb2;
+    uint64_t down_nb1;
+    uint64_t down_nb2;
+    uint64_t w_nb1;
+    uint64_t slot_nb0;
+} ggml_metal_kargs_flashmoe_slot8;
+
+typedef struct {
+    int64_t  n_embd;
     int64_t  n_hc;
     int64_t  n_tokens;
     int64_t  n_elem;

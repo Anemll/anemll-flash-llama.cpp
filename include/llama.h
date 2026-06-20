@@ -394,6 +394,7 @@ extern "C" {
         const char * moe_predictor_path; // optional raw Flash-MoE hidden-state predictor directory
         int32_t moe_predictor_prefetch_topk; // max predicted experts to prefetch per layer (0 = predictor topk)
         bool moe_demand_concurrent; // race demand reads between primary and secondary sidecars; first complete read wins
+        bool slot8; // fuse a top-8 routed-expert FFN into a single Metal kernel (gate/up/swiglu/down/weighted-sum)
     };
 
     struct llama_sampler_seq_config {

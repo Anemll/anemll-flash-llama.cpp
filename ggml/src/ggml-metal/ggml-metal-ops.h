@@ -56,6 +56,9 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 // temporary activation buffer for internal split-GLU -> down fusion
 size_t ggml_metal_op_flashmoe_split_glu_extra_tmp(const struct ggml_tensor * op);
 
+// temporary buffers for the fused single-token routed MoE FFN (--slot8)
+size_t ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 
@@ -87,6 +90,7 @@ int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_f16       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flashmoe_split_glu(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flashmoe_slot8_ffn(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);

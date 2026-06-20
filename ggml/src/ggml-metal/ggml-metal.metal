@@ -9912,6 +9912,135 @@ kernel void kernel_mul_mv_iq1_m_f32(
     kernel_mul_mv_iq1_m_f32_impl<N_R0_IQ1_M, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// --slot8 fused routed MoE FFN (IQ1_M weights).
+//
+// iq1m_dot_row: dot product of one IQ1_M weight row (ne00 elements = ne00/QK_K blocks) with an
+// f32 activation vector y[ne00], reduced across one simdgroup. Mirrors the per-block dequant of
+// kernel_mul_mv_iq1_m_f32_impl but for a single row. The 32 simd lanes split the row's blocks.
+static inline float iq1m_dot_row(
+        device const block_iq1_m * xrow,
+        device const float       * y,
+        int                        ne00,
+        ushort                     tiisg) {
+    const int nb   = ne00 / QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    float yl[32];
+    float sumf = 0.f;
+
+    const short ix = tiisg;
+    device const float * y4 = y + 32 * ix;
+
+    iq1m_scale_t scale;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        float4 sumy = {0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+            yl[i+ 8] = y4[i+ 8]; sumy[1] += yl[i+ 8];
+            yl[i+16] = y4[i+16]; sumy[2] += yl[i+16];
+            yl[i+24] = y4[i+24]; sumy[3] += yl[i+24];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq1_m * xr = xrow + ibl;
+        device const uint8_t  * qs = xr->qs + 4 * ib;
+        device const uint8_t  * qh = xr->qh + 2 * ib;
+        device const uint16_t * sc = (device const uint16_t *)xr->scales;
+
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+
+        constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((qh[0] << 8) & 0x700)));
+        constant uint8_t * grid2 = (constant uint8_t *)(iq1s_grid_gpu + (qs[1] | ((qh[0] << 4) & 0x700)));
+        constant uint8_t * grid3 = (constant uint8_t *)(iq1s_grid_gpu + (qs[2] | ((qh[1] << 8) & 0x700)));
+        constant uint8_t * grid4 = (constant uint8_t *)(iq1s_grid_gpu + (qs[3] | ((qh[1] << 4) & 0x700)));
+
+        float2 sum = {0.f};
+        for (short j = 0; j < 4; ++j) {
+            sum[0] += yl[j+ 0] * (grid1[j] & 0xf) + yl[j+ 4] * (grid1[j] >> 4)
+                    + yl[j+ 8] * (grid2[j] & 0xf) + yl[j+12] * (grid2[j] >> 4);
+            sum[1] += yl[j+16] * (grid3[j] & 0xf) + yl[j+20] * (grid3[j] >> 4)
+                    + yl[j+24] * (grid4[j] & 0xf) + yl[j+28] * (grid4[j] >> 4);
+        }
+        const float delta1 = sumy[0] * (qh[0] & 0x08 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[1] * (qh[0] & 0x80 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+        const float delta2 = sumy[2] * (qh[1] & 0x08 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[3] * (qh[1] & 0x80 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+
+        sumf += (float)scale.f16 * ((sum[0] + delta1) * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 7) + 1) +
+                                    (sum[1] + delta2) * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 7) + 1));
+
+        y4 += 32 * 32;
+    }
+
+    return simd_sum(sumf);
+}
+
+// Phase A: for every (row j in n_ff, expert e), compute h[j,e] = silu(gate_e . x) * (up_e . x).
+// One simdgroup per (j, e). Grid = (n_ff, 1, n_used), 32 threads/threadgroup.
+kernel void kernel_flashmoe_slot8_phaseA(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,        // [n_embd] f32
+        device const char * gate,     // IQ1_M [n_embd, n_ff, n_slots]
+        device const char * up,       // IQ1_M [n_embd, n_ff, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device       char * h,        // f32 [n_ff, n_used]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int j = tgpig.x;
+    const int e = tgpig.z;
+    if (j >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+
+    const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+    device const float       * y     = (device const float       *) x;
+    device const block_iq1_m * grow  = (device const block_iq1_m *)(gate + slot*args.gate_nb2 + (uint64_t)j*args.gate_nb1);
+    device const block_iq1_m * urow  = (device const block_iq1_m *)(up   + slot*args.up_nb2   + (uint64_t)j*args.up_nb1);
+
+    const float g = iq1m_dot_row(grow, y, args.n_embd, tiisg);
+    const float u = iq1m_dot_row(urow, y, args.n_embd, tiisg);
+
+    if (tiisg == 0) {
+        const float act = (g / (1.0f + exp(-g))) * u; // silu(g) * u
+        ((device float *) h)[(uint64_t)e*args.n_ff + j] = act;
+    }
+}
+
+// Phase B: moe_out[r] = sum_e weights[e] * (down_e[r] . h[:,e]) for r in n_embd.
+// One simdgroup per output row r, looping over experts. Grid = (n_embd, 1, 1), 32 threads/tg.
+kernel void kernel_flashmoe_slot8_phaseB(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * h,        // f32 [n_ff, n_used]
+        device const char * down,     // IQ1_M [n_ff, n_embd, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device const char * weights,  // f32 [1, n_used, 1]
+        device       char * dst,      // f32 [n_embd]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int r = tgpig.x;
+    if (r >= args.n_embd) {
+        return;
+    }
+
+    float acc = 0.f;
+    for (int e = 0; e < args.n_used; ++e) {
+        const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+        device const block_iq1_m * drow = (device const block_iq1_m *)(down + slot*args.down_nb2 + (uint64_t)r*args.down_nb1);
+        device const float       * he   = (device const float       *) h + (uint64_t)e*args.n_ff;
+
+        const float d = iq1m_dot_row(drow, he, args.n_ff, tiisg);
+        const float w = *(device const float *)(weights + (uint64_t)e*args.w_nb1);
+        acc += w * d;
+    }
+
+    if (tiisg == 0) {
+        ((device float *) dst)[r] = acc;
+    }
+}
+
 template<int NR0, typename args_t>
 void kernel_mul_mv_iq4_nl_f32_impl(
         args_t args,

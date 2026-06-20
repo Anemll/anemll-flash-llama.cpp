@@ -548,6 +548,7 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
     bool flash_moe_slot_bank_enabled = false;
+    bool flash_moe_slot8_enabled = false;
     bool flash_moe_resident_source_enabled = false;
     bool flash_moe_oracle_all_hit_enabled = false;
     bool flash_moe_oracle_prefetch_enabled = false;
@@ -816,6 +817,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
             pimpl->flash_moe_oracle_all_hit_enabled ||
             pimpl->flash_moe_oracle_prefetch_enabled;
     pimpl->flash_moe_trace_file = params.moe_trace_file ? params.moe_trace_file : "";
+    // --slot8 only has meaning when the routed slot-bank runtime is active; the fused
+    // kernel consumes slot-mapped expert weights, and per-layer eligibility is checked
+    // later in build_moe_ffn (top-8 + merged gate_up + swiglu, etc.).
+    pimpl->flash_moe_slot8_enabled = params.slot8 && pimpl->flash_moe_slot_bank_enabled;
 }
 
 llama_model::~llama_model() {
@@ -9619,6 +9624,10 @@ bool llama_model::flash_moe_slot_bank_enabled() const {
     return pimpl->flash_moe_slot_bank_enabled;
 }
 
+bool llama_model::flash_moe_slot8_enabled() const {
+    return pimpl->flash_moe_slot8_enabled;
+}
+
 bool llama_model::flash_moe_resident_source_enabled() const {
     return pimpl->flash_moe_resident_source_enabled;
 }
@@ -10579,6 +10588,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_predictor_path          =*/ nullptr,
         /*.moe_predictor_prefetch_topk =*/ 0,
         /*.moe_demand_concurrent       =*/ false,
+        /*.slot8                       =*/ false,
     };
 
     return result;

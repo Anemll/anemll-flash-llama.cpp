@@ -2762,6 +2762,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_flashmoe_split_glu(ctx, idx);
             } break;
+        case GGML_OP_FLASHMOE_SLOT8_FFN:
+            {
+                n_fuse = ggml_metal_op_flashmoe_slot8_ffn(ctx, idx);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 n_fuse = ggml_metal_op_mul_mat_id(ctx, idx);
@@ -4752,6 +4756,221 @@ int ggml_metal_op_flashmoe_split_glu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encode_mul_mat_from_tensors(ctx, op->src[2], &act_tmp, op, false);
 
     return 1;
+}
+
+size_t ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
+
+    const int64_t n_embd = op->ne[0];
+    const int64_t n_ff   = op->src[1]->ne[1];
+    const int64_t n_used = op->src[4]->ne[0];
+
+    const size_t ff_bytes      = GGML_PAD(size_t(n_ff)   * sizeof(float), TENSOR_ALIGNMENT);
+    const size_t experts_bytes = GGML_PAD(size_t(n_embd) * size_t(n_used) * sizeof(float), TENSOR_ALIGNMENT);
+
+    // gate_tmp + up_tmp + act_tmp (each [n_ff]) + per-expert down outputs [n_embd, n_used]
+    return 3 * ff_bytes + experts_bytes;
+}
+
+static bool ggml_metal_slot8_use_reference(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("LLAMA_FLASH_MOE_SLOT8_REFERENCE");
+        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+// --slot8 reference encode (Stage 3a): orchestrate the existing mul_mat / GLU / weighted-sum
+// kernels for the 8 experts as ONE graph op. Removes the per-expert graph nodes and the
+// mul_mat_id decode replay/ICB cache. Used as the correctness oracle and the fallback when the
+// weights are not IQ1_M or dims are not a multiple of the super-block.
+static int ggml_metal_op_flashmoe_slot8_ffn_reference(ggml_metal_op_t ctx, ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
+
+    const ggml_tensor * x         = op->src[0];
+    const ggml_tensor * gate_exps = op->src[1];
+    const ggml_tensor * up_exps   = op->src[2];
+    const ggml_tensor * down_exps = op->src[3];
+    const ggml_tensor * slot_ids  = op->src[4];
+    const ggml_tensor * weights   = op->src[5];
+
+    const int64_t n_embd = op->ne[0];
+    const int64_t n_ff   = gate_exps->ne[1];
+    const int64_t n_used = slot_ids->ne[0];
+
+    GGML_ASSERT(n_used > 0 && n_used <= 32);
+
+    int32_t slots[32] = {};
+    const bool ok = ggml_metal_mul_mat_id_get_decode_expert_ids(slot_ids, slots, n_used, 0);
+    GGML_ASSERT(ok && "slot8: slot ids must be host-readable at decode-time encode");
+
+    const size_t ff_bytes = GGML_PAD(size_t(n_ff) * sizeof(float), TENSOR_ALIGNMENT);
+
+    char * scratch      = static_cast<char *>(op->data) + ggml_nbytes(op);
+    char * gate_base    = scratch;
+    char * up_base      = scratch + 1*ff_bytes;
+    char * act_base     = scratch + 2*ff_bytes;
+    char * experts_base = scratch + 3*ff_bytes;
+
+    ggml_tensor gate_tmp = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_ff,   1,      gate_base,    "slot8_gate");
+    ggml_tensor up_tmp   = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_ff,   1,      up_base,      "slot8_up");
+    ggml_tensor act_tmp  = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_ff,   1,      act_base,     "slot8_act");
+    ggml_tensor experts  = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_embd, n_used, experts_base, "slot8_experts");
+
+    // swiglu activation descriptor: act_tmp = swiglu(gate_tmp, up_tmp)
+    ggml_tensor act_op = act_tmp;
+    act_op.op = GGML_OP_GLU;
+    act_op.src[0] = &gate_tmp;
+    act_op.src[1] = &up_tmp;
+    ggml_set_op_params_i32(&act_op, 0, GGML_GLU_OP_SWIGLU);
+    ggml_set_op_params_i32(&act_op, 1, 0);
+
+    for (int64_t e = 0; e < n_used; ++e) {
+        const int32_t slot = slots[e];
+        GGML_ASSERT(slot >= 0 && slot < gate_exps->ne[2]);
+
+        // per-expert 2D weight slices at the resident slot (gate/up: [n_embd,n_ff]; down: [n_ff,n_embd])
+        ggml_tensor gate_w = *gate_exps;
+        ggml_tensor up_w   = *up_exps;
+        ggml_tensor down_w = *down_exps;
+        gate_w.ne[2] = gate_w.ne[3] = 1; gate_w.data = static_cast<char *>(gate_exps->data) + size_t(slot)*gate_exps->nb[2];
+        up_w.ne[2]   = up_w.ne[3]   = 1; up_w.data   = static_cast<char *>(up_exps->data)   + size_t(slot)*up_exps->nb[2];
+        down_w.ne[2] = down_w.ne[3] = 1; down_w.data = static_cast<char *>(down_exps->data) + size_t(slot)*down_exps->nb[2];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) { gate_w.src[s] = up_w.src[s] = down_w.src[s] = nullptr; }
+        gate_w.op = up_w.op = down_w.op = GGML_OP_NONE;
+        gate_w.view_src = up_w.view_src = down_w.view_src = nullptr;
+
+        ggml_metal_encode_mul_mat_from_tensors(ctx, &gate_w, x, &gate_tmp, false);
+        ggml_metal_encode_mul_mat_from_tensors(ctx, &up_w,   x, &up_tmp,   false);
+        ggml_metal_op_concurrency_reset(ctx);
+
+        ggml_metal_encode_glu_from_sources(ctx, &act_op, &gate_tmp, &up_tmp);
+        ggml_metal_op_concurrency_reset(ctx);
+
+        // experts[:, e] = down_e . act
+        ggml_tensor down_out = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_embd, 1,
+                experts_base + size_t(e) * size_t(n_embd) * sizeof(float), "slot8_down");
+        ggml_metal_encode_mul_mat_from_tensors(ctx, &down_w, &act_tmp, &down_out, false);
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    // moe_out[d] = sum_e weights[e] * experts[d, e]   (reuse the dsv4 weighted-sum kernel)
+    {
+        const int64_t n_elem = n_embd;
+        ggml_metal_kargs_dsv4_hc_weighted_sum args = {
+            /*.n_embd   =*/ n_embd,
+            /*.n_hc     =*/ n_used,
+            /*.n_tokens =*/ 1,
+            /*.n_elem   =*/ n_elem,
+            /*.x_nb0    =*/ experts.nb[0],
+            /*.x_nb1    =*/ experts.nb[1],
+            /*.x_nb2    =*/ experts.nb[2],
+            /*.w_nb0    =*/ weights->nb[1], // weights is [1, n_used, 1] -> stride per expert
+            /*.w_nb1    =*/ weights->nb[2],
+            /*.dst_nb0  =*/ op->nb[0],
+            /*.dst_nb1  =*/ op->nb[1],
+        };
+
+        ggml_tensor ws_op = {};
+        ws_op.op = GGML_OP_DSV4_HC_WEIGHTED_SUM;
+        auto pipeline = ggml_metal_library_get_pipeline_dsv4_hc_weighted_sum(ctx->lib, &ws_op);
+        const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) n_elem);
+        const int ntg = (n_elem + nth - 1) / nth;
+
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(&experts), 1);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(weights),  2);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op),       3);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, ntg, 1, 1, nth, 1, 1);
+    }
+
+    return 1;
+}
+
+// --slot8 fused encode (Stage 3b): two purpose-built IQ1_M kernels that collapse all 8 experts
+// and the 3 projections into 2 dispatches.
+//   Phase A: h[j,e] = silu(gate_e . x) * (up_e . x)        for j in n_ff, e in n_used  -> h scratch
+//   Phase B: moe_out[r] = sum_e weights[e] * (down_e[r] . h[:,e])  for r in n_embd     -> dst
+static int ggml_metal_op_flashmoe_slot8_ffn_fused(ggml_metal_op_t ctx, ggml_tensor * op) {
+    const ggml_tensor * x         = op->src[0];
+    const ggml_tensor * gate_exps = op->src[1];
+    const ggml_tensor * up_exps   = op->src[2];
+    const ggml_tensor * down_exps = op->src[3];
+    const ggml_tensor * slot_ids  = op->src[4];
+    const ggml_tensor * weights   = op->src[5];
+
+    const int64_t n_embd = op->ne[0];
+    const int64_t n_ff   = gate_exps->ne[1];
+    const int64_t n_used = slot_ids->ne[0];
+
+    char * scratch = static_cast<char *>(op->data) + ggml_nbytes(op);
+    ggml_tensor h = ggml_metal_make_buffer_tensor_2d(op->buffer, GGML_TYPE_F32, n_ff, n_used, scratch, "slot8_h");
+
+    ggml_metal_kargs_flashmoe_slot8 args = {
+        /*.n_embd   =*/ n_embd,
+        /*.n_ff     =*/ n_ff,
+        /*.n_used   =*/ n_used,
+        /*.gate_nb1 =*/ gate_exps->nb[1],
+        /*.gate_nb2 =*/ gate_exps->nb[2],
+        /*.up_nb1   =*/ up_exps->nb[1],
+        /*.up_nb2   =*/ up_exps->nb[2],
+        /*.down_nb1 =*/ down_exps->nb[1],
+        /*.down_nb2 =*/ down_exps->nb[2],
+        /*.w_nb1    =*/ weights->nb[1],
+        /*.slot_nb0 =*/ slot_ids->nb[0],
+    };
+
+    // Phase A: gate/up/swiglu -> h[n_ff, n_used].  One simdgroup per (j, e).
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_flashmoe_slot8_phaseA(ctx->lib, op);
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(x),         1);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(gate_exps), 2);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(up_exps),   3);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(slot_ids),  4);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(&h),        5);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) n_ff, 1, (int) n_used, 32, 1, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // Phase B: down + weighted sum -> moe_out[n_embd].  One simdgroup per output row.
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_flashmoe_slot8_phaseB(ctx->lib, op);
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(&h),        1);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(down_exps), 2);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(slot_ids),  3);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(weights),   4);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op),        5);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) n_embd, 1, 1, 32, 1, 1);
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_flashmoe_slot8_ffn(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
+
+    // The fused IQ1_M kernels handle only IQ1_M gate/up/down with super-block-aligned dims.
+    // Anything else (or the explicit A/B toggle) uses the mul_mat reference path.
+    constexpr int64_t kSuperBlock = 256; // QK_K
+    const bool all_iq1m =
+            op->src[1]->type == GGML_TYPE_IQ1_M &&
+            op->src[2]->type == GGML_TYPE_IQ1_M &&
+            op->src[3]->type == GGML_TYPE_IQ1_M;
+    const bool dims_ok = (op->ne[0] % kSuperBlock == 0) && (op->src[1]->ne[1] % kSuperBlock == 0);
+
+    if (all_iq1m && dims_ok && !ggml_metal_slot8_use_reference()) {
+        return ggml_metal_op_flashmoe_slot8_ffn_fused(ctx, op);
+    }
+
+    return ggml_metal_op_flashmoe_slot8_ffn_reference(ctx, op);
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
