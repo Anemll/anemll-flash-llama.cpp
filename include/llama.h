@@ -336,6 +336,7 @@ extern "C" {
         bool moe_predict_top1_prev; // prefetch only the first previous-token same-layer routed expert for the next token
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
+        int32_t moe_sweep_min_tokens; // min ubatch tokens to engage sweep-prefill expert streaming
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
     };

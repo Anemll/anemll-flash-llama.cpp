@@ -37,6 +37,10 @@
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -1506,6 +1510,20 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+#if defined(__linux__)
+// Flash-MoE sweep-prefill: advise the kernel about the mmap'd slice of one
+// expert (page-aligned superset of [data + expert*nb02, +nb02))
+static void ggml_mmid_sweep_advise(const struct ggml_tensor * src0, int64_t expert, size_t nb02, int advice) {
+    static long page_size = 0;
+    if (page_size == 0) {
+        page_size = sysconf(_SC_PAGESIZE);
+    }
+    const uintptr_t addr    = (uintptr_t) src0->data + (uintptr_t) expert * nb02;
+    const uintptr_t aligned = addr & ~((uintptr_t) page_size - 1);
+    madvise((void *) aligned, (size_t) (addr - aligned) + nb02, advice);
+}
+#endif
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1632,6 +1650,45 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+#if defined(__linux__)
+    // Flash-MoE sweep-prefill: eligible mmap-backed expert tensors carry a
+    // marker in their (otherwise unused) leaf op_params, written at model
+    // load after verifying the data lies inside the file mapping. The
+    // expert-major loop below is already a physical-order sweep; thread 0
+    // additionally streams the supply: readahead the next used expert slices
+    // (WILLNEED) and drop slices a few experts behind (DONTNEED). DONTNEED on
+    // the file-backed mapping is correctness-safe (clean pages refault), the
+    // lag only avoids refaults for threads still finishing earlier experts.
+    enum {
+        MMID_SWEEP_MAGIC       = 0x53574550, // 'SWEP'
+        MMID_SWEEP_AHEAD       = 2,
+        MMID_SWEEP_LAG         = 2,
+        MMID_SWEEP_MAX_EXPERTS = 1024,
+    };
+    const bool sweep_active = ith == 0 &&
+        dst->src[0]->op_params[0] == MMID_SWEEP_MAGIC &&
+        ids->ne[1] >= dst->src[0]->op_params[1] &&
+        n_as <= MMID_SWEEP_MAX_EXPERTS;
+
+    int32_t sweep_used[MMID_SWEEP_MAX_EXPERTS];
+    int     sweep_n_used  = 0;
+    int     sweep_pos     = 0; // index into sweep_used tracking the current expert
+    int     sweep_advised = 0; // count of used experts already WILLNEED'd
+    int64_t sweep_t0      = 0;
+
+    if (sweep_active) {
+        for (int a = 0; a < n_as; ++a) {
+            if (matrix_row_counts[a] > 0) {
+                sweep_used[sweep_n_used++] = a;
+            }
+        }
+        sweep_t0 = ggml_time_us();
+        for (; sweep_advised < sweep_n_used && sweep_advised < MMID_SWEEP_AHEAD; ++sweep_advised) {
+            ggml_mmid_sweep_advise(src0, sweep_used[sweep_advised], nb02, MADV_WILLNEED);
+        }
+    }
+#endif
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1640,6 +1697,21 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+#if defined(__linux__)
+        if (sweep_active) {
+            while (sweep_pos < sweep_n_used && sweep_used[sweep_pos] < cur_a) {
+                sweep_pos++;
+            }
+            while (sweep_advised < sweep_n_used && sweep_advised <= sweep_pos + MMID_SWEEP_AHEAD) {
+                ggml_mmid_sweep_advise(src0, sweep_used[sweep_advised], nb02, MADV_WILLNEED);
+                sweep_advised++;
+            }
+            if (sweep_pos >= MMID_SWEEP_LAG + 1) {
+                ggml_mmid_sweep_advise(src0, sweep_used[sweep_pos - MMID_SWEEP_LAG - 1], nb02, MADV_DONTNEED);
+            }
+        }
+#endif
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1692,6 +1764,22 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+#if defined(__linux__)
+    if (sweep_active) {
+        static int sweep_stats = -1;
+        if (sweep_stats == -1) {
+            const char * val = getenv("GGML_SWEEP_STATS");
+            sweep_stats = (val != NULL && val[0] != '\0' && strcmp(val, "0") != 0) ? 1 : 0;
+        }
+        if (sweep_stats) {
+            const double dt = (double) (ggml_time_us() - sweep_t0) / 1e6;
+            const double gb = (double) sweep_n_used * (double) nb02 / 1e9;
+            GGML_LOG_INFO("sweep: %s used=%d/%d bytes=%.3fGB wall=%.3fs bw_lb=%.2fGB/s\n",
+                    dst->name, sweep_n_used, n_as, gb, dt, dt > 0.0 ? gb / dt : 0.0);
+        }
+    }
+#endif
 }
 
 /////////////////////////////////

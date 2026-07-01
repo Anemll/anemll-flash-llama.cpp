@@ -642,6 +642,7 @@ struct common_params {
     std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
     std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
+    int32_t     moe_sweep_min_tokens = 32; // min ubatch tokens to engage sweep-prefill streaming      // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
     int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
