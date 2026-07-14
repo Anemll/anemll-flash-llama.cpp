@@ -1136,6 +1136,16 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+uint32_t llama_memory_recurrent_context::get_ubatch_index() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return uint32_t(i_next);
+}
+
+uint32_t llama_memory_recurrent_context::get_ubatch_count() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return uint32_t(ubatches.size());
+}
+
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
 }

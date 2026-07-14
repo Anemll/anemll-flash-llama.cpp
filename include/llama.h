@@ -154,6 +154,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -291,6 +292,19 @@ extern "C" {
         // Optional Flash-MoE sidecar directory or manifest path used to override routed expert tensors.
         const char * moe_sidecar_path;
 
+        // Optional Flash-MoE sidecar directory or manifest path used only for prefetch loads.
+        // Falls back to moe_sidecar_path when unset.
+        const char * moe_prefetch_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used only for the last
+        // miss in a 4-miss routed call experiment. Falls back to moe_sidecar_path when unset.
+        const char * moe_secondary_sidecar_path;
+
+        // Optional Flash-MoE sidecar directory or manifest path used as the third
+        // lane for experimental weighted demand striping tests. Falls back to
+        // moe_sidecar_path when unset.
+        const char * moe_tertiary_sidecar_path;
+
         // Optional Flash-MoE execution mode.
         // Supported in this build: "stock", "resident", "resident-bank", "slot-bank", "oracle-all-hit", "oracle-prefetch".
         const char * moe_mode;
@@ -300,6 +314,36 @@ extern "C" {
 
         // Optional dynamic-quant policy file reserved for future bank selection work.
         const char * moe_quant_map;
+
+        // Optional experimental weighted demand striping ratio across
+        // primary:secondary:tertiary sidecars, for example "5:1:1".
+        const char * moe_demand_stripe;
+
+        // Optional experimental weighted whole-expert demand distribution
+        // across primary:secondary:tertiary sidecars, for example "1:1:1" or
+        // "2:1:1". Unlike moe_demand_stripe, each expert is read entirely from
+        // one chosen sidecar.
+        const char * moe_demand_distribute;
+
+        // Optional experimental weighted prefill-only striping ratio across
+        // primary:secondary:tertiary sidecars for dedicated layer-major prompt
+        // reads, for example "3:2:2".
+        const char * moe_prefill_stripe;
+
+        // Optional experimental weighted whole-expert prefill-only
+        // distribution across primary:secondary:tertiary sidecars for
+        // dedicated layer-major prompt reads, for example "1:1:1" or "2:1:1".
+        const char * moe_prefill_distribute;
+
+        // Optional experimental weighted prefetch striping ratio across
+        // prefetch:secondary:tertiary sidecars, for example "0:1:1".
+        const char * moe_prefetch_stripe;
+
+        // Optional experimental weighted whole-expert prefetch distribution
+        // across prefetch:secondary:tertiary sidecars, for example "1:1:1" or
+        // "2:1:1". Unlike moe_prefetch_stripe, each expert is read entirely
+        // from one chosen sidecar.
+        const char * moe_prefetch_distribute;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -331,13 +375,27 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool moe_verify_sidecar; // validate sidecar metadata parity during model load
+        bool moe_prefill_layer_major; // enable shared scratch-bank routed prefill for multi-token prompt batches
         bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
+        bool moe_prefetch_temporal_sparse; // alternate even/odd layers for temporal prefetch on slow media
         bool moe_predict_prev_token; // prefetch previous token's same-layer routed experts for the next token
         bool moe_predict_top1_prev; // prefetch only the first previous-token same-layer routed expert for the next token
 
         int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
+        int32_t moe_prefill_banks; // in-flight prefill expert staging banks / read-batch depth
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
+        int32_t moe_prefill_cache_io_split; // prefill-only split override; 0 follows moe_cache_io_split
+        int32_t moe_prefetch_cache_io_split; // prefetch-only split override; 0 follows moe_cache_io_split
+
+        // NOTE: new fields must be appended at the end to preserve ABI for out-of-tree consumers.
+        bool moe_prefill_next_hot_exclusive_drives; // pin prefill next-hot host staging to secondary/tertiary sidecars
+        int32_t moe_prefill_next_hot_experts; // prototype one-lookahead prefill hot-expert host staging budget
+        const char * moe_predictor_path; // optional raw Flash-MoE hidden-state predictor directory
+        int32_t moe_predictor_prefetch_topk; // max predicted experts to prefetch per layer (0 = predictor topk)
+        bool moe_demand_concurrent; // race demand reads between primary and secondary sidecars; first complete read wins
+        bool slot8; // fuse a top-8 routed-expert FFN into a single Metal kernel (gate/up/swiglu/down/weighted-sum)
+        bool slot4; // fuse a top-4 routed-expert FFN into the width-generic Metal operator
     };
 
     struct llama_sampler_seq_config {
@@ -351,6 +409,8 @@ extern "C" {
         uint32_t n_ctx;             // text context, 0 = from model
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
+        uint32_t moe_prefill_batch; // prefill-only logical batch override for layer-major MoE prompt processing
+        uint32_t moe_prefill_micro_batch; // prefill-only expert compute micro-batch inside the prefill batch
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
@@ -396,6 +456,8 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool moe_shared_only; // bypass routed experts during graph build and keep shared experts only
         bool moe_router_only; // keep routed gating/top-k active but bypass routed expert matmuls
+        bool moe_sort_decode_expert_ids; // sort single-token Flash-MoE routed decode experts by ascending expert id before routed MLP
+        bool moe_force_prefill_batch; // accept large moe_prefill_batch values; model memory may still split internally while DSv4 true-slab sizing stays behind explicit envs
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -567,6 +629,9 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    // Returns a pointer to the most recent backend/context error for this context, or NULL if none.
+    // The returned pointer remains valid until the next call that mutates the context.
+    LLAMA_API const char *               llama_get_last_error(const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -1543,9 +1608,27 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
+    struct llama_flash_moe_progress_stats {
+        bool     available;
+        bool     prefill_profile;
+        bool     replay_available;
+        double   cache_hit_pct;
+        double   replay_hit_pct;
+        double   reload_bw_gbps;
+        double   dedup_saved_pct;
+        double   reuse_factor;
+        uint64_t unique_experts;
+        uint64_t miss_experts;
+        uint64_t token_refs;
+        uint64_t bytes_loaded;
+    };
+
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+    LLAMA_API bool                           llama_flash_moe_progress_get(const struct llama_context * ctx, bool prefill, struct llama_flash_moe_progress_stats * out);
+    LLAMA_API void                           llama_flash_moe_prefill_progress_set(struct llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens);
+    LLAMA_API void                           llama_flash_moe_prefill_progress_set_ext(struct llama_context * ctx, uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens, uint32_t tokens_before_batch);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

@@ -14,6 +14,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS   = 4,
 };
 
 enum llama_swa_type {
@@ -75,6 +76,8 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+    uint32_t n_lora_o           = 0;
+    uint32_t n_attn_out_groups  = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
@@ -91,6 +94,7 @@ struct llama_hparams {
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
     uint32_t nextn_predict_layers = 0;
+    uint32_t n_hash_layers        = 0;
 
     float f_norm_eps;
     float f_norm_rms_eps;
@@ -205,6 +209,19 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_top_k_freq        = 1;
+    uint32_t indexer_skip_top_k_offset = 2;
+    bool     indexer_share_for_mtp_iteration = false;
+    bool     indexer_rope_interleave         = false;
+    std::array<bool, LLAMA_MAX_LAYERS> indexer_is_full;
+
+    // DeepSeek V4 hyper-connections and sparse KV compression
+    uint32_t n_hc                    = 1;
+    uint32_t hc_sinkhorn_iters       = 0;
+    float    hc_eps                  = 0.0f;
+    float    compress_rope_freq_base = 0.0f;
+    uint32_t dsv4_state_size         = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> attn_compress_ratio;
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
@@ -246,6 +263,10 @@ struct llama_hparams {
     //   il == 3: swa
     //   etc ...
     void set_swa_pattern(uint32_t n_pattern, bool dense_first = false);
+
+    void set_indexer_pattern(uint32_t freq, uint32_t skip_offset);
+
+    bool is_indexer_full(uint32_t il) const;
 
     // return true if one of the layers is SWA
     bool is_swa_any() const;

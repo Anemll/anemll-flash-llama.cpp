@@ -15,6 +15,7 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct llama_flash_moe_progress_stats;
 
 struct llama_cparams;
 
@@ -30,8 +31,38 @@ struct llm_flash_moe_slot_runtime_i {
     virtual ~llm_flash_moe_slot_runtime_i() = default;
     virtual bool uses_layer(int layer) const = 0;
     virtual bool uses_native_slot_map(int layer) const = 0;
+    // Returns the requested fused routed width (4 or 8) for a slot-bank layer.
+    // Graph-shape and exact effective top-K eligibility are checked in build_moe_ffn.
+    virtual int32_t fused_slot_expert_count(int layer) const { (void) layer; return 0; }
+    virtual bool uses_dedicated_prefill_moe(int layer) const = 0;
     virtual void bind_slot_ids_input(int layer, ggml_tensor * slot_ids) = 0;
     virtual ggml_tensor * build_slot_ids_tensor(ggml_context * ctx0, ggml_tensor * selected_experts, int layer) = 0;
+    virtual ggml_tensor * build_prefill_moe_tensor(
+            ggml_context * ctx0,
+            ggml_tensor * cur,
+            ggml_tensor * selected_experts,
+            ggml_tensor * weights,
+            int layer) = 0;
+    virtual ggml_tensor * select_routed_weight_tensor(int layer, ggml_tensor * tensor) = 0;
+    virtual bool wants_tensor(const ggml_tensor * tensor) const = 0;
+    virtual bool handle_tensor(ggml_tensor * tensor) = 0;
+    virtual bool progress_get_data(llama_flash_moe_progress_stats & out) const = 0;
+    virtual void set_prefill_batch_progress(
+            uint32_t current_batch,
+            uint32_t total_batches,
+            uint32_t batch_tokens,
+            uint32_t total_tokens,
+            uint32_t sub_batch_index = 0,
+            uint32_t sub_batch_total = 0,
+            uint32_t tokens_before_batch = 0) {
+        (void) current_batch;
+        (void) total_batches;
+        (void) batch_tokens;
+        (void) total_tokens;
+        (void) sub_batch_index;
+        (void) sub_batch_total;
+        (void) tokens_before_batch;
+    }
 };
 
 // certain models (typically multi-modal) can produce different types of graphs
@@ -642,6 +673,7 @@ struct llm_graph_params {
             cparams.moe_force_expert == other.cparams.moe_force_expert &&
             cparams.moe_shared_only == other.cparams.moe_shared_only &&
             cparams.moe_router_only == other.cparams.moe_router_only &&
+            cparams.moe_sort_decode_expert_ids == other.cparams.moe_sort_decode_expert_ids &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -847,7 +879,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -872,7 +905,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
 
     //
     // inputs

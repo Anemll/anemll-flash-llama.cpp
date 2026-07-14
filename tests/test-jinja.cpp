@@ -1197,6 +1197,12 @@ static void test_string_methods(testing & t) {
         "no"
     );
 
+    test_template(t, "string.format() auto numbering",
+        "{{ '<{}|{}>'.format(s, 42) }}",
+        {{"s", "hello"}},
+        "<hello|42>"
+    );
+
     test_template(t, "string.split() with sep",
         "{{ s.split(',')|join('-') }}",
         {{"s", "a,b,c"}},

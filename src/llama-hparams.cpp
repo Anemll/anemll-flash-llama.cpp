@@ -17,6 +17,24 @@ void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     }
 }
 
+void llama_hparams::set_indexer_pattern(uint32_t freq, uint32_t skip_offset) {
+    indexer_top_k_freq = std::max<uint32_t>(freq, 1);
+    indexer_skip_top_k_offset = skip_offset;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const uint32_t shifted = il + 1 > skip_offset ? il - skip_offset + 1 : 0;
+        indexer_is_full[il] = shifted % indexer_top_k_freq == 0;
+    }
+}
+
+bool llama_hparams::is_indexer_full(uint32_t il) const {
+    if (il < n_layer) {
+        return indexer_is_full[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (swa_layers[il]) {
@@ -153,6 +171,10 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
+    if (dsv4_state_size != 0) {
+        return dsv4_state_size;
+    }
+
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
@@ -177,6 +199,10 @@ uint32_t llama_hparams::n_embd_r() const {
 }
 
 uint32_t llama_hparams::n_embd_s() const {
+    if (dsv4_state_size != 0) {
+        return dsv4_state_size;
+    }
+
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;

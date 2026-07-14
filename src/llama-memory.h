@@ -57,6 +57,10 @@ struct llama_memory_context_i {
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
+    // get the current ubatch index and total ubatch count for the active batch split
+    virtual uint32_t get_ubatch_index() const = 0;
+    virtual uint32_t get_ubatch_count() const = 0;
+
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 };

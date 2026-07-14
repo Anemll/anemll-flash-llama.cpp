@@ -11,6 +11,9 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_ubatch_prefill; // internal layer-major prefill capacity; does not change the user decode ubatch
+    uint32_t moe_prefill_batch;
+    uint32_t moe_prefill_micro_batch;
     uint32_t n_expert_used;   // effective routed experts per token during inference
     uint32_t n_seq_max;
     int32_t  n_threads;       // number of threads to use for generation
@@ -42,6 +45,8 @@ struct llama_cparams {
     bool kv_unified;
     bool moe_shared_only;
     bool moe_router_only;
+    bool moe_sort_decode_expert_ids;
+    bool moe_force_prefill_batch;
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;

@@ -30,15 +30,98 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/mman.h>
 #include <unistd.h>
 
 static bool llama_flash_moe_mode_is(const llama_model_params & params, const char * mode) {
     return params.moe_mode != nullptr && mode != nullptr && strcmp(params.moe_mode, mode) == 0;
+}
+
+static bool llama_flash_moe_keep_input_cpu_enabled() {
+    const char * value = getenv("LLAMA_FLASH_MOE_KEEP_INPUT_CPU");
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_stripe_weights(
+        const char * value,
+        const char * label,
+        bool require_primary_weight) {
+    std::array<int32_t, 3> weights = { 1, 0, 0 };
+    if (value == nullptr || value[0] == '\0') {
+        return weights;
+    }
+
+    std::stringstream stream(value);
+    std::string item;
+    for (size_t idx = 0; idx < weights.size(); ++idx) {
+        if (!std::getline(stream, item, ':')) {
+            throw std::runtime_error(format(
+                "invalid Flash-MoE %s '%s' (expected A:B:C, e.g. %s)",
+                label, value, require_primary_weight ? "5:1:1" : "0:1:1"));
+        }
+        try {
+            weights[idx] = std::stoi(item);
+        } catch (const std::exception &) {
+            throw std::runtime_error(format(
+                "invalid Flash-MoE %s '%s' (expected integer weights like %s)",
+                label, value, require_primary_weight ? "5:1:1" : "0:1:1"));
+        }
+        if (weights[idx] < 0) {
+            throw std::runtime_error(format(
+                "invalid Flash-MoE %s '%s' (weights must be non-negative)",
+                label, value));
+        }
+    }
+    if (std::getline(stream, item, ':')) {
+        throw std::runtime_error(format(
+            "invalid Flash-MoE %s '%s' (expected exactly three weights)",
+            label, value));
+    }
+    if (weights[0] + weights[1] + weights[2] <= 0) {
+        throw std::runtime_error(format(
+            "invalid Flash-MoE %s '%s' (at least one weight must be > 0)",
+            label, value));
+    }
+    if (require_primary_weight && weights[0] <= 0) {
+        throw std::runtime_error(format(
+            "invalid Flash-MoE %s '%s' (primary weight must be > 0)",
+            label, value));
+    }
+    return weights;
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_demand_stripe(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "demand stripe", true);
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_demand_distribute(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "demand distribute", true);
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_prefill_stripe(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "prefill stripe", false);
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_prefill_distribute(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "prefill distribute", false);
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_prefetch_stripe(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "prefetch stripe", false);
+}
+
+static std::array<int32_t, 3> llama_flash_moe_parse_prefetch_distribute(const char * value) {
+    return llama_flash_moe_parse_stripe_weights(value, "prefetch distribute", false);
+}
+
+static bool llama_flash_moe_demand_stripe_enabled(const std::array<int32_t, 3> & weights) {
+    return weights[1] > 0 || weights[2] > 0;
 }
 
 static int64_t llama_flash_moe_slot_bank_size_for(const llama_model_params & params, int64_t fallback) {
@@ -288,6 +371,8 @@ static const char * llama_expert_gating_func_name(llama_expert_gating_func_type 
     switch (type) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS: return "sqrtsoftplus";
         default:                                    return "unknown";
     }
 }
@@ -449,6 +534,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    buft_list_t cpu_buft_list_no_extra;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -462,19 +548,165 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
     bool flash_moe_slot_bank_enabled = false;
+    int32_t flash_moe_fused_slot_expert_count = 0;
     bool flash_moe_resident_source_enabled = false;
     bool flash_moe_oracle_all_hit_enabled = false;
     bool flash_moe_oracle_prefetch_enabled = false;
     bool flash_moe_temporal_prefetch_enabled = false;
+    bool flash_moe_temporal_prefetch_sparse_enabled = false;
     bool flash_moe_predict_prev_token_enabled = false;
     bool flash_moe_predict_top1_prev_enabled = false;
+    std::string flash_moe_predictor_path;
+    int32_t flash_moe_predictor_prefetch_topk = 0;
+    bool flash_moe_prefill_layer_major_enabled = false;
+    bool flash_moe_prefill_next_hot_exclusive_drives_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
+    int32_t flash_moe_prefill_banks = 1;
+    int32_t flash_moe_prefill_next_hot_experts = 0;
     int32_t flash_moe_cache_io_split = 4;
+    int32_t flash_moe_prefill_cache_io_split = 4;
+    int32_t flash_moe_prefetch_cache_io_split = 4;
+    bool flash_moe_demand_stripe_enabled = false;
+    bool flash_moe_demand_distribute_enabled = false;
+    bool flash_moe_demand_concurrent_enabled = false;
+    bool flash_moe_prefill_stripe_enabled = false;
+    bool flash_moe_prefill_distribute_enabled = false;
+    bool flash_moe_prefetch_stripe_enabled = false;
+    bool flash_moe_prefetch_distribute_enabled = false;
+    std::array<int32_t, 3> flash_moe_demand_stripe_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> flash_moe_demand_distribute_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> flash_moe_prefill_stripe_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> flash_moe_prefill_distribute_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> flash_moe_prefetch_stripe_weights = { 1, 0, 0 };
+    std::array<int32_t, 3> flash_moe_prefetch_distribute_weights = { 1, 0, 0 };
     int32_t moe_n_expert_used = 0;
     std::string flash_moe_trace_file;
     std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
+    std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_prefetch_sidecar_entries;
+    std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_secondary_sidecar_entries;
+    std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_tertiary_sidecar_entries;
     std::vector<llama_flash_moe_sparse_mapping> flash_moe_sparse_mappings;
 };
+
+struct llama_flash_moe_sidecar_manifest_summary {
+    size_t bytes_all_layers_per_slot = 0;
+    int32_t layer_count = 0;
+};
+
+static std::pair<std::filesystem::path, std::filesystem::path> llama_flash_moe_resolve_manifest_paths(
+        const std::filesystem::path & sidecar_input) {
+    const std::filesystem::path manifest_path = std::filesystem::is_directory(sidecar_input) ? sidecar_input / "manifest.json" : sidecar_input;
+    return { manifest_path, manifest_path.parent_path() };
+}
+
+static llama_flash_moe_sidecar_manifest_summary llama_flash_moe_load_slot_bank_sidecar_entries(
+        const std::filesystem::path & sidecar_input,
+        std::unordered_map<std::string, llama_flash_moe_sidecar_entry> & entries_out) {
+    const auto [manifest_path, manifest_dir] = llama_flash_moe_resolve_manifest_paths(sidecar_input);
+
+    std::ifstream manifest_file(manifest_path);
+    if (!manifest_file.is_open()) {
+        throw std::runtime_error(format("failed to open Flash-MoE manifest: %s", manifest_path.string().c_str()));
+    }
+
+    nlohmann::json manifest;
+    manifest_file >> manifest;
+
+    const auto sidecar_format = llama_flash_moe_parse_sidecar_format(
+            manifest.value("sidecar_kind", std::string("flashmoe_gguf")));
+    const std::string layout = manifest.value("layout", std::string("layer_major_whole_tensor"));
+    const bool expert_major_layout =
+            layout == "layer_major_expert" ||
+            layout == "expert_major";
+    if (!expert_major_layout && layout != "layer_major_whole_tensor") {
+        throw std::runtime_error(format("unknown Flash-MoE sidecar layout '%s' in sidecar manifest", layout.c_str()));
+    }
+    const auto & entries = manifest.at("entries");
+
+    entries_out.clear();
+
+    size_t bytes_all_layers_per_slot = 0;
+    std::unordered_set<int32_t> layer_set;
+
+    for (const auto & item : entries) {
+        const std::string tensor_name = item.at("tensor_name").get<std::string>();
+        const std::string tensor_family = item.at("tensor_family").get<std::string>();
+
+        if (tensor_family != "ffn_gate_exps" &&
+            tensor_family != "ffn_up_exps" &&
+            tensor_family != "ffn_down_exps" &&
+            tensor_family != "ffn_gate_up_exps") {
+            continue;
+        }
+
+        llama_flash_moe_sidecar_entry entry;
+        entry.layer             = item.at("layer").get<int32_t>();
+        entry.tensor_name       = tensor_name;
+        entry.tensor_family     = tensor_family;
+        entry.repacked_path     = (manifest_dir / item.at("repacked_file").get<std::string>()).string();
+        entry.quant_type        = llama_flash_moe_parse_quant_type(item.value("quant_type", std::string()));
+        entry.source_format     = sidecar_format;
+        entry.repacked_offset   = item.at("repacked_offset").get<size_t>();
+        entry.exact_byte_length = item.at("exact_byte_length").get<size_t>();
+        entry.bytes_per_expert  = item.at("bytes_per_expert").get<size_t>();
+        entry.expert_major      = item.value("expert_major", expert_major_layout);
+        entry.expert_stride     = item.value("expert_stride", entry.bytes_per_expert);
+        const size_t expert_count = item.value("expert_count",
+                entry.bytes_per_expert == 0 ? size_t(0) : entry.exact_byte_length / entry.bytes_per_expert);
+
+        if (entry.bytes_per_expert == 0) {
+            throw std::runtime_error(format("Flash-MoE manifest entry '%s' has invalid bytes_per_expert = 0", tensor_name.c_str()));
+        }
+        if (expert_count == 0) {
+            throw std::runtime_error(format("Flash-MoE manifest entry '%s' has invalid expert_count = 0", tensor_name.c_str()));
+        }
+        if (entry.expert_stride == 0) {
+            entry.expert_stride = entry.bytes_per_expert;
+        }
+        if (entry.expert_major) {
+            if (entry.repacked_offset > std::numeric_limits<size_t>::max() - entry.bytes_per_expert) {
+                throw std::runtime_error(format(
+                        "Flash-MoE expert-major manifest entry '%s' overflows family slice end computation",
+                        tensor_name.c_str()));
+            }
+            const size_t last_expert = expert_count - 1;
+            const size_t family_slice_end = entry.repacked_offset + entry.bytes_per_expert;
+            if (entry.expert_stride < family_slice_end) {
+                throw std::runtime_error(format(
+                        "Flash-MoE expert-major manifest entry '%s' has expert_stride=%zu smaller than family slice end=%zu",
+                        tensor_name.c_str(), entry.expert_stride, family_slice_end));
+            }
+            if (last_expert > 0 && entry.expert_stride > (std::numeric_limits<size_t>::max() - family_slice_end) / last_expert) {
+                throw std::runtime_error(format(
+                        "Flash-MoE expert-major manifest entry '%s' overflows file extent computation",
+                        tensor_name.c_str()));
+            }
+
+            const size_t required_size = last_expert * entry.expert_stride + family_slice_end;
+            std::error_code ec;
+            const size_t file_size = (size_t) std::filesystem::file_size(entry.repacked_path, ec);
+            if (ec) {
+                throw std::runtime_error(format(
+                        "failed to stat Flash-MoE sidecar file '%s' for manifest entry '%s': %s",
+                        entry.repacked_path.c_str(), tensor_name.c_str(), ec.message().c_str()));
+            }
+            if (required_size > file_size) {
+                throw std::runtime_error(format(
+                        "Flash-MoE expert-major manifest entry '%s' requires byte range end=%zu but file '%s' is only %zu bytes",
+                        tensor_name.c_str(), required_size, entry.repacked_path.c_str(), file_size));
+            }
+        }
+
+        bytes_all_layers_per_slot += entry.bytes_per_expert;
+        layer_set.insert(entry.layer);
+        entries_out.emplace(entry.tensor_name, std::move(entry));
+    }
+
+    return {
+        /*.bytes_all_layers_per_slot =*/ bytes_all_layers_per_slot,
+        /*.layer_count               =*/ (int32_t) layer_set.size(),
+    };
+}
 
 static ggml_backend_buffer_t llama_flash_moe_alloc_sparse_ctx_buffer(
         ggml_context * ctx,
@@ -550,15 +782,49 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->flash_moe_resident_source_enabled = llama_flash_moe_mode_is(params, "resident-slot-bank");
     pimpl->flash_moe_oracle_all_hit_enabled = llama_flash_moe_mode_is(params, "oracle-all-hit");
     pimpl->flash_moe_oracle_prefetch_enabled = llama_flash_moe_mode_is(params, "oracle-prefetch");
-    pimpl->flash_moe_temporal_prefetch_enabled = params.moe_prefetch_temporal;
+    pimpl->flash_moe_temporal_prefetch_enabled = params.moe_prefetch_temporal || params.moe_prefetch_temporal_sparse;
+    pimpl->flash_moe_temporal_prefetch_sparse_enabled = params.moe_prefetch_temporal_sparse;
     pimpl->flash_moe_predict_prev_token_enabled = params.moe_predict_prev_token;
     pimpl->flash_moe_predict_top1_prev_enabled = params.moe_predict_top1_prev;
+    pimpl->flash_moe_predictor_path = params.moe_predictor_path ? params.moe_predictor_path : "";
+    pimpl->flash_moe_predictor_prefetch_topk = std::max<int32_t>(0, params.moe_predictor_prefetch_topk);
+    pimpl->flash_moe_prefill_layer_major_enabled = params.moe_prefill_layer_major;
+    pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled = params.moe_prefill_next_hot_exclusive_drives;
+    pimpl->flash_moe_prefill_banks = std::max<int32_t>(1, params.moe_prefill_banks);
+    pimpl->flash_moe_prefill_next_hot_experts = std::max<int32_t>(0, params.moe_prefill_next_hot_experts);
     pimpl->flash_moe_cache_io_split = std::max<int32_t>(1, params.moe_cache_io_split);
+    pimpl->flash_moe_prefill_cache_io_split = params.moe_prefill_cache_io_split > 0 ?
+            std::max<int32_t>(1, params.moe_prefill_cache_io_split) :
+            pimpl->flash_moe_cache_io_split;
+    pimpl->flash_moe_prefetch_cache_io_split = params.moe_prefetch_cache_io_split > 0 ?
+            std::max<int32_t>(1, params.moe_prefetch_cache_io_split) :
+            pimpl->flash_moe_cache_io_split;
+    pimpl->flash_moe_demand_stripe_weights = llama_flash_moe_parse_demand_stripe(params.moe_demand_stripe);
+    pimpl->flash_moe_demand_stripe_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_demand_stripe_weights);
+    pimpl->flash_moe_demand_distribute_weights = llama_flash_moe_parse_demand_distribute(params.moe_demand_distribute);
+    pimpl->flash_moe_demand_distribute_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_demand_distribute_weights);
+    pimpl->flash_moe_demand_concurrent_enabled = params.moe_demand_concurrent;
+    pimpl->flash_moe_prefill_stripe_weights = llama_flash_moe_parse_prefill_stripe(params.moe_prefill_stripe);
+    pimpl->flash_moe_prefill_stripe_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_prefill_stripe_weights);
+    pimpl->flash_moe_prefill_distribute_weights = llama_flash_moe_parse_prefill_distribute(params.moe_prefill_distribute);
+    pimpl->flash_moe_prefill_distribute_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_prefill_distribute_weights);
+    pimpl->flash_moe_prefetch_stripe_weights = llama_flash_moe_parse_prefetch_stripe(params.moe_prefetch_stripe);
+    pimpl->flash_moe_prefetch_stripe_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_prefetch_stripe_weights);
+    pimpl->flash_moe_prefetch_distribute_weights = llama_flash_moe_parse_prefetch_distribute(params.moe_prefetch_distribute);
+    pimpl->flash_moe_prefetch_distribute_enabled = llama_flash_moe_demand_stripe_enabled(pimpl->flash_moe_prefetch_distribute_weights);
     pimpl->flash_moe_slot_bank_enabled = llama_flash_moe_mode_is(params, "slot-bank") ||
             pimpl->flash_moe_resident_source_enabled ||
             pimpl->flash_moe_oracle_all_hit_enabled ||
             pimpl->flash_moe_oracle_prefetch_enabled;
     pimpl->flash_moe_trace_file = params.moe_trace_file ? params.moe_trace_file : "";
+    if (params.slot4 && params.slot8) {
+        throw std::invalid_argument("Flash-MoE --slot4 and --slot8 are mutually exclusive");
+    }
+    // The fused operator consumes slot-mapped expert weights. Graph-shape and exact
+    // effective top-K eligibility are checked later in build_moe_ffn.
+    if (pimpl->flash_moe_slot_bank_enabled) {
+        pimpl->flash_moe_fused_slot_expert_count = params.slot4 ? 4 : (params.slot8 ? 8 : 0);
+    }
 }
 
 llama_model::~llama_model() {
@@ -576,6 +842,16 @@ void llama_model::load_arch(llama_model_loader & ml) {
     arch = ml.get_arch();
     if (arch == LLM_ARCH_UNKNOWN) {
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
+    }
+
+    const bool has_dsv4_kv =
+            ml.get_tensor_meta("blk.0.attn_kv.weight") != nullptr ||
+            ml.get_tensor_meta("blk.0.attn.wkv.weight") != nullptr;
+    if (arch == LLM_ARCH_DEEPSEEK2 &&
+            ml.get_tensor_meta("hc_head_base") != nullptr &&
+            has_dsv4_kv) {
+        arch = LLM_ARCH_DEEPSEEK4;
+        LLAMA_LOG_WARN("%s: DeepSeek V4 Flash tensors detected in GGUF tagged as deepseek2; using deepseek4 loader\n", __func__);
     }
 }
 
@@ -1911,6 +2187,138 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,  hparams.n_lora_o, false);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,hparams.n_attn_out_groups, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+
+                if (auto * t = ml.get_tensor_meta("blk.0.attn.q_norm.weight")) {
+                    hparams.n_lora_q = t->ne[0];
+                } else if (auto * t = ml.get_tensor_meta("blk.0.attn_q_a_norm.weight")) {
+                    hparams.n_lora_q = t->ne[0];
+                }
+                if (hparams.n_attn_out_groups == 0) {
+                    hparams.n_attn_out_groups = 8;
+                }
+                if (hparams.n_lora_o == 0) {
+                    if (auto * t = ml.get_tensor_meta("blk.0.attn.wo_b.weight")) {
+                        hparams.n_lora_o = t->ne[0] / hparams.n_attn_out_groups;
+                    } else if (auto * t = ml.get_tensor_meta("blk.0.attn_wo_b.weight")) {
+                        hparams.n_lora_o = t->ne[0] / hparams.n_attn_out_groups;
+                    }
+                }
+                if (hparams.n_lora_o == 0) {
+                    hparams.n_lora_o = 1024;
+                }
+
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa == 0) {
+                    hparams.n_swa = 128;
+                }
+                if (hparams.n_swa > 0) {
+                    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                    hparams.set_swa_pattern(0, false);
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.compress_rope_freq_base, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k, false);
+                ml.get_key(LLM_KV_HASH_LAYER_COUNT,                  hparams.n_hash_layers, false);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,            hparams.n_hc, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   hparams.hc_sinkhorn_iters, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,              hparams.hc_eps, false);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,           hparams.swiglu_clamp_exp, hparams.n_layer, false);
+
+                if (hparams.compress_rope_freq_base == 0.0f) {
+                    hparams.compress_rope_freq_base = 160000.0f;
+                }
+                if (hparams.indexer_n_head == 0) {
+                    hparams.indexer_n_head = 64;
+                }
+                if (hparams.indexer_head_size == 0) {
+                    hparams.indexer_head_size = 128;
+                }
+                if (hparams.indexer_top_k == 0) {
+                    hparams.indexer_top_k = 512;
+                }
+                if (hparams.n_hash_layers == 0) {
+                    hparams.n_hash_layers = 3;
+                }
+                if (hparams.n_hc == 1) {
+                    if (auto * t = ml.get_tensor_meta("hc_head_fn")) {
+                        hparams.n_hc = t->ne[1];
+                    } else {
+                        hparams.n_hc = 4;
+                    }
+                }
+                if (hparams.hc_sinkhorn_iters == 0) {
+                    hparams.hc_sinkhorn_iters = 20;
+                }
+                if (hparams.hc_eps == 0.0f) {
+                    hparams.hc_eps = 1.0e-6f;
+                }
+
+                std::fill(hparams.attn_compress_ratio.begin(), hparams.attn_compress_ratio.end(), 0);
+                std::vector<uint32_t> dsv4_compress_ratios;
+                if (ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, dsv4_compress_ratios, false)) {
+                    if (dsv4_compress_ratios.size() == hparams.n_layer + 1 && dsv4_compress_ratios.back() == 0) {
+                        LLAMA_LOG_WARN("%s: DeepSeek V4 compress ratios has one trailing zero beyond n_layer; ignoring it\n", __func__);
+                        dsv4_compress_ratios.pop_back();
+                    }
+                    if (dsv4_compress_ratios.size() != hparams.n_layer) {
+                        throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u",
+                                    ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(),
+                                    hparams.n_layer,
+                                    (uint32_t) dsv4_compress_ratios.size()));
+                    }
+                    std::copy(dsv4_compress_ratios.begin(), dsv4_compress_ratios.end(), hparams.attn_compress_ratio.begin());
+                } else if (!ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.attn_compress_ratio, hparams.n_layer, false)) {
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        const std::string local_name = format("blk.%u.attn.compressor.ape", il);
+                        const std::string canon_name = format("blk.%u.attn_compressor_ape.weight", il);
+                        const std::string native_name = format("blk.%u.attn_compress_ape", il);
+                        ggml_tensor * ape = ml.get_tensor_meta(local_name.c_str());
+                        if (ape == nullptr) {
+                            ape = ml.get_tensor_meta(canon_name.c_str());
+                        }
+                        if (ape == nullptr) {
+                            ape = ml.get_tensor_meta(native_name.c_str());
+                        }
+                        hparams.attn_compress_ratio[il] = ape != nullptr ? (uint32_t) ape->ne[1] : 0;
+                    }
+                }
+
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    const uint32_t ratio = hparams.attn_compress_ratio[il];
+                    if (ratio == 0) {
+                        continue;
+                    }
+
+                    const uint32_t coff = ratio == 4 ? 2 : 1;
+                    uint32_t state_size = coff * ratio * coff * hparams.n_embd_head_k(il);
+                    if (ratio == 4) {
+                        state_size += coff * ratio * coff * hparams.indexer_head_size;
+                    }
+                    hparams.dsv4_state_size = std::max(hparams.dsv4_state_size, state_size);
+                }
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_PLM:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -2018,6 +2426,68 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+                const bool found_indexer_freq =
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQ, hparams.indexer_top_k_freq, false);
+                const bool found_indexer_offset =
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, hparams.indexer_skip_top_k_offset, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_SHARE_FOR_MTP_ITERATION, hparams.indexer_share_for_mtp_iteration, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_ROPE_INTERLEAVE,         hparams.indexer_rope_interleave, false);
+
+                bool found_indexer_types = false;
+                std::vector<std::string> indexer_types;
+                if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types, false)) {
+                    if (indexer_types.size() != hparams.n_layer) {
+                        throw std::runtime_error(format("invalid GLM DSA indexer_types length %zu, expected %u",
+                                    indexer_types.size(), hparams.n_layer));
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        if (indexer_types[il] == "full" || indexer_types[il] == "F") {
+                            hparams.indexer_is_full[il] = true;
+                        } else if (indexer_types[il] == "shared" || indexer_types[il] == "S") {
+                            hparams.indexer_is_full[il] = false;
+                        } else {
+                            throw std::runtime_error(format("invalid GLM DSA indexer type '%s' at layer %u",
+                                        indexer_types[il].c_str(), il));
+                        }
+                    }
+                    found_indexer_types = true;
+                }
+
+                if (!found_indexer_types) {
+                    std::vector<std::string> indexer_pattern;
+                    if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TOP_K_PATTERN, indexer_pattern, false)) {
+                        if (indexer_pattern.size() != hparams.n_layer) {
+                            throw std::runtime_error(format("invalid GLM DSA indexer top-k pattern length %zu, expected %u",
+                                        indexer_pattern.size(), hparams.n_layer));
+                        }
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            if (indexer_pattern[il] == "full" || indexer_pattern[il] == "F") {
+                                hparams.indexer_is_full[il] = true;
+                            } else if (indexer_pattern[il] == "shared" || indexer_pattern[il] == "S") {
+                                hparams.indexer_is_full[il] = false;
+                            } else {
+                                throw std::runtime_error(format("invalid GLM DSA indexer top-k pattern '%s' at layer %u",
+                                            indexer_pattern[il].c_str(), il));
+                            }
+                        }
+                        found_indexer_types = true;
+                    }
+                }
+
+                if (!found_indexer_types) {
+                    if (!found_indexer_freq && !found_indexer_offset &&
+                            hparams.n_layer == 78 &&
+                            hparams.n_ctx_train >= 1048576 &&
+                            hparams.rope_freq_base_train > 7000000.0f) {
+                        // Backfill the official GLM-5.2 schedule for older GGUFs
+                        // converted before IndexShare metadata was preserved.
+                        hparams.indexer_top_k_freq = 4;
+                        hparams.indexer_skip_top_k_offset = 3;
+                        hparams.indexer_share_for_mtp_iteration = true;
+                        hparams.indexer_rope_interleave = true;
+                    }
+                    hparams.set_indexer_pattern(hparams.indexer_top_k_freq, hparams.indexer_skip_top_k_offset);
+                }
 
                 // Expert gating function (GLM-4.5 uses sigmoid)
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
@@ -2485,6 +2955,24 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_HY_V3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                hparams.n_layer_dense_lead = 1;
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+
+                // HY V3 uses sigmoid routing with an expert-selection bias.
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+                }
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_SMOLLM3:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -2870,7 +3358,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     pimpl->flash_moe_sidecar_entries.clear();
+    pimpl->flash_moe_prefetch_sidecar_entries.clear();
+    pimpl->flash_moe_secondary_sidecar_entries.clear();
+    pimpl->flash_moe_tertiary_sidecar_entries.clear();
+    flash_moe_prefill_scratch_tensors.clear();
     pimpl->flash_moe_slot_bank_size = flash_moe_slot_bank ? (int32_t) flash_moe_slot_count : 0;
+
+    if (pimpl->flash_moe_prefill_layer_major_enabled && !flash_moe_slot_bank) {
+        LLAMA_LOG_INFO("%s: enabling Flash-MoE layer-major prefill for in-memory routed tensors; no slot-bank scratch tensors will be created in this mode\n",
+                __func__);
+    }
 
     if (flash_moe_slot_bank && n_gpu_layers != 0) {
         if (flash_moe_experimental_gpu_bank) {
@@ -2895,56 +3392,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 (long long) flash_moe_slot_count, (long long) hparams.n_expert));
         }
 
-        const std::filesystem::path sidecar_dir(params.moe_sidecar_path);
-        const std::filesystem::path manifest_path = sidecar_dir / "manifest.json";
+        const std::filesystem::path sidecar_input(params.moe_sidecar_path);
+        const auto [manifest_path, _manifest_dir] = llama_flash_moe_resolve_manifest_paths(sidecar_input);
         LLAMA_LOG_INFO("%s: slot-bank opening manifest %s\n", __func__, manifest_path.string().c_str());
-        std::ifstream manifest_file(manifest_path);
-        if (!manifest_file.is_open()) {
-            throw std::runtime_error(format("failed to open Flash-MoE manifest: %s", manifest_path.string().c_str()));
-        }
-
-        nlohmann::json manifest;
-        manifest_file >> manifest;
+        const auto sidecar_summary = llama_flash_moe_load_slot_bank_sidecar_entries(sidecar_input, pimpl->flash_moe_sidecar_entries);
         LLAMA_LOG_INFO("%s: slot-bank parsed manifest %s\n", __func__, manifest_path.string().c_str());
 
-        const auto sidecar_format = llama_flash_moe_parse_sidecar_format(
-                manifest.value("sidecar_kind", std::string("flashmoe_gguf")));
-        const auto & entries = manifest.at("entries");
-        size_t flash_moe_slot_bytes_all_layers_per_slot = 0;
-        int32_t flash_moe_slot_layers = 0;
-        std::unordered_set<int32_t> flash_moe_slot_layer_set;
-        for (const auto & item : entries) {
-            const std::string tensor_name = item.at("tensor_name").get<std::string>();
-            const std::string tensor_family = item.at("tensor_family").get<std::string>();
-
-            if (tensor_family != "ffn_gate_exps" &&
-                tensor_family != "ffn_up_exps" &&
-                tensor_family != "ffn_down_exps" &&
-                tensor_family != "ffn_gate_up_exps") {
-                continue;
-            }
-
-            llama_flash_moe_sidecar_entry entry;
-            entry.layer             = item.at("layer").get<int32_t>();
-            entry.tensor_name       = tensor_name;
-            entry.tensor_family     = tensor_family;
-            entry.repacked_path     = (sidecar_dir / item.at("repacked_file").get<std::string>()).string();
-            entry.quant_type        = llama_flash_moe_parse_quant_type(item.value("quant_type", std::string()));
-            entry.source_format     = sidecar_format;
-            entry.repacked_offset   = item.at("repacked_offset").get<size_t>();
-            entry.exact_byte_length = item.at("exact_byte_length").get<size_t>();
-            entry.bytes_per_expert  = item.at("bytes_per_expert").get<size_t>();
-
-            if (entry.bytes_per_expert == 0) {
-                throw std::runtime_error(format("Flash-MoE manifest entry '%s' has invalid bytes_per_expert = 0", tensor_name.c_str()));
-            }
-
-            flash_moe_slot_bytes_all_layers_per_slot += entry.bytes_per_expert;
-            flash_moe_slot_layer_set.insert(entry.layer);
-            pimpl->flash_moe_sidecar_entries.emplace(entry.tensor_name, std::move(entry));
-        }
-
-        flash_moe_slot_layers = (int32_t) flash_moe_slot_layer_set.size();
+        const size_t flash_moe_slot_bytes_all_layers_per_slot = sidecar_summary.bytes_all_layers_per_slot;
+        const int32_t flash_moe_slot_layers = sidecar_summary.layer_count;
         const size_t flash_moe_slot_bytes_all_layers = flash_moe_slot_bytes_all_layers_per_slot * (size_t) flash_moe_slot_count;
         const double flash_moe_slot_bytes_avg_per_layer =
             flash_moe_slot_layers > 0 ? (double) flash_moe_slot_bytes_all_layers / (double) flash_moe_slot_layers : 0.0;
@@ -2964,8 +3419,300 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     __func__, (int) flash_moe_slot_count);
         }
 
+        if (pimpl->flash_moe_demand_stripe_enabled) {
+            if (pimpl->flash_moe_demand_stripe_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE demand striping needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_demand_stripe_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE demand striping needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE weighted demand striping with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_demand_stripe_weights[0],
+                    pimpl->flash_moe_demand_stripe_weights[1],
+                    pimpl->flash_moe_demand_stripe_weights[2]);
+        }
+
+        if (pimpl->flash_moe_demand_stripe_enabled && pimpl->flash_moe_demand_distribute_enabled) {
+            throw std::runtime_error("Flash-MoE demand striping and demand whole-expert distribution are mutually exclusive; use only one of --moe-demand-stripe or --moe-demand-distribute");
+        }
+        if (pimpl->flash_moe_demand_concurrent_enabled &&
+                (pimpl->flash_moe_demand_stripe_enabled || pimpl->flash_moe_demand_distribute_enabled)) {
+            throw std::runtime_error("Flash-MoE concurrent demand reads are mutually exclusive with --moe-demand-stripe and --moe-demand-distribute");
+        }
+
+        if (pimpl->flash_moe_demand_distribute_enabled) {
+            if (pimpl->flash_moe_demand_distribute_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE demand distribution needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_demand_distribute_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE demand distribution needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE whole-expert demand distribution with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_demand_distribute_weights[0],
+                    pimpl->flash_moe_demand_distribute_weights[1],
+                    pimpl->flash_moe_demand_distribute_weights[2]);
+        }
+
+        if (pimpl->flash_moe_demand_concurrent_enabled) {
+            if (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0') {
+                throw std::runtime_error("Flash-MoE concurrent demand reads need --moe-secondary-sidecar");
+            }
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE concurrent demand reads across primary and secondary sidecars\n",
+                    __func__);
+        }
+
+        if ((pimpl->flash_moe_prefill_stripe_enabled || pimpl->flash_moe_prefill_distribute_enabled) &&
+                !pimpl->flash_moe_prefill_layer_major_enabled) {
+            LLAMA_LOG_INFO("%s: ignoring prefill-only I/O settings because --moe-prefill-layer-major is not enabled\n", __func__);
+            pimpl->flash_moe_prefill_stripe_enabled = false;
+            pimpl->flash_moe_prefill_distribute_enabled = false;
+            pimpl->flash_moe_prefill_stripe_weights = { 1, 0, 0 };
+            pimpl->flash_moe_prefill_distribute_weights = { 1, 0, 0 };
+        }
+        if (pimpl->flash_moe_prefill_banks > 1 && !pimpl->flash_moe_prefill_layer_major_enabled) {
+            LLAMA_LOG_INFO("%s: ignoring --moe-prefill-banks=%d because --moe-prefill-layer-major is not enabled\n",
+                    __func__, pimpl->flash_moe_prefill_banks);
+            pimpl->flash_moe_prefill_banks = 1;
+        }
+        if (pimpl->flash_moe_prefill_next_hot_experts > 0 && !pimpl->flash_moe_prefill_layer_major_enabled) {
+            LLAMA_LOG_INFO("%s: ignoring --moe-prefill-next-hot-experts=%d because --moe-prefill-layer-major is not enabled\n",
+                    __func__, pimpl->flash_moe_prefill_next_hot_experts);
+            pimpl->flash_moe_prefill_next_hot_experts = 0;
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                pimpl->flash_moe_prefill_next_hot_experts <= 0) {
+            LLAMA_LOG_INFO("%s: ignoring --moe-prefill-next-hot-exclusive-drives because --moe-prefill-next-hot-experts is disabled\n",
+                    __func__);
+            pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled = false;
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+            throw std::runtime_error("Flash-MoE exclusive drive prefill prefetch needs --moe-secondary-sidecar");
+        }
+        if (pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled &&
+                (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+            LLAMA_LOG_INFO("%s: --moe-prefill-next-hot-exclusive-drives is enabled without --moe-tertiary-sidecar; only the secondary L+1 lane will be used\n",
+                    __func__);
+        }
+
+        if (pimpl->flash_moe_prefill_stripe_enabled) {
+            if (pimpl->flash_moe_prefill_stripe_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefill striping needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_prefill_stripe_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefill striping needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE weighted prefill striping with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_prefill_stripe_weights[0],
+                    pimpl->flash_moe_prefill_stripe_weights[1],
+                    pimpl->flash_moe_prefill_stripe_weights[2]);
+        }
+
+        if (pimpl->flash_moe_prefill_stripe_enabled && pimpl->flash_moe_prefill_distribute_enabled) {
+            throw std::runtime_error("Flash-MoE prefill striping and prefill whole-expert distribution are mutually exclusive; use only one of --moe-prefill-stripe or --moe-prefill-distribute");
+        }
+
+        if (pimpl->flash_moe_prefill_distribute_enabled) {
+            if (pimpl->flash_moe_prefill_distribute_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefill distribution needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_prefill_distribute_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefill distribution needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE whole-expert prefill distribution with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_prefill_distribute_weights[0],
+                    pimpl->flash_moe_prefill_distribute_weights[1],
+                    pimpl->flash_moe_prefill_distribute_weights[2]);
+        }
+
         LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for slot-bank mode\n",
                 __func__, pimpl->flash_moe_sidecar_entries.size());
+
+        const bool prefetch_sidecar_requested =
+                params.moe_prefetch_sidecar_path != nullptr &&
+                params.moe_prefetch_sidecar_path[0] != '\0';
+        const bool prefetch_mode_active =
+                params.moe_prefetch_temporal ||
+                params.moe_prefetch_temporal_sparse ||
+                params.moe_predict_prev_token ||
+                params.moe_predict_top1_prev ||
+                params.moe_prefill_next_hot_experts > 0 ||
+                llama_flash_moe_mode_is(params, "oracle-prefetch");
+
+        if (pimpl->flash_moe_prefetch_stripe_enabled && !prefetch_mode_active) {
+            LLAMA_LOG_INFO("%s: ignoring prefetch stripe %s because no prefetch mode is enabled\n",
+                    __func__, params.moe_prefetch_stripe ? params.moe_prefetch_stripe : "");
+            pimpl->flash_moe_prefetch_stripe_enabled = false;
+            pimpl->flash_moe_prefetch_stripe_weights = { 1, 0, 0 };
+        }
+
+        if (pimpl->flash_moe_prefetch_distribute_enabled && !prefetch_mode_active) {
+            LLAMA_LOG_INFO("%s: ignoring prefetch distribute %s because no prefetch mode is enabled\n",
+                    __func__, params.moe_prefetch_distribute ? params.moe_prefetch_distribute : "");
+            pimpl->flash_moe_prefetch_distribute_enabled = false;
+            pimpl->flash_moe_prefetch_distribute_weights = { 1, 0, 0 };
+        }
+
+        if (prefetch_sidecar_requested && !prefetch_mode_active) {
+            LLAMA_LOG_INFO("%s: ignoring prefetch sidecar %s because no prefetch mode is enabled\n",
+                    __func__, params.moe_prefetch_sidecar_path);
+        }
+
+        if (pimpl->flash_moe_prefetch_stripe_enabled) {
+            if (pimpl->flash_moe_prefetch_stripe_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefetch striping needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_prefetch_stripe_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefetch striping needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE weighted prefetch striping with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_prefetch_stripe_weights[0],
+                    pimpl->flash_moe_prefetch_stripe_weights[1],
+                    pimpl->flash_moe_prefetch_stripe_weights[2]);
+        }
+
+        if (pimpl->flash_moe_prefetch_stripe_enabled && pimpl->flash_moe_prefetch_distribute_enabled) {
+            throw std::runtime_error("Flash-MoE prefetch striping and prefetch whole-expert distribution are mutually exclusive; use only one of --moe-prefetch-stripe or --moe-prefetch-distribute");
+        }
+
+        if (pimpl->flash_moe_prefetch_distribute_enabled) {
+            if (pimpl->flash_moe_prefetch_distribute_weights[1] > 0 &&
+                    (params.moe_secondary_sidecar_path == nullptr || params.moe_secondary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefetch distribution needs --moe-secondary-sidecar when the second weight is non-zero");
+            }
+            if (pimpl->flash_moe_prefetch_distribute_weights[2] > 0 &&
+                    (params.moe_tertiary_sidecar_path == nullptr || params.moe_tertiary_sidecar_path[0] == '\0')) {
+                throw std::runtime_error("Flash-MoE prefetch distribution needs --moe-tertiary-sidecar when the third weight is non-zero");
+            }
+
+            LLAMA_LOG_INFO("%s: enabling experimental Flash-MoE whole-expert prefetch distribution with weights %d:%d:%d\n",
+                    __func__,
+                    pimpl->flash_moe_prefetch_distribute_weights[0],
+                    pimpl->flash_moe_prefetch_distribute_weights[1],
+                    pimpl->flash_moe_prefetch_distribute_weights[2]);
+        }
+
+        if (prefetch_mode_active && prefetch_sidecar_requested) {
+            const std::filesystem::path prefetch_input(params.moe_prefetch_sidecar_path);
+            const auto [prefetch_manifest_path, _prefetch_manifest_dir] = llama_flash_moe_resolve_manifest_paths(prefetch_input);
+            LLAMA_LOG_INFO("%s: slot-bank opening prefetch manifest %s\n", __func__, prefetch_manifest_path.string().c_str());
+            llama_flash_moe_load_slot_bank_sidecar_entries(prefetch_input, pimpl->flash_moe_prefetch_sidecar_entries);
+            LLAMA_LOG_INFO("%s: slot-bank parsed prefetch manifest %s\n", __func__, prefetch_manifest_path.string().c_str());
+
+            for (const auto & [tensor_name, entry] : pimpl->flash_moe_sidecar_entries) {
+                const auto it_prefetch = pimpl->flash_moe_prefetch_sidecar_entries.find(tensor_name);
+                if (it_prefetch == pimpl->flash_moe_prefetch_sidecar_entries.end()) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE prefetch sidecar is missing routed tensor entry '%s'",
+                        tensor_name.c_str()));
+                }
+
+                const auto & prefetch_entry = it_prefetch->second;
+                if (prefetch_entry.layer != entry.layer ||
+                    prefetch_entry.tensor_family != entry.tensor_family ||
+                    prefetch_entry.quant_type != entry.quant_type ||
+                    prefetch_entry.source_format != entry.source_format ||
+                    prefetch_entry.exact_byte_length != entry.exact_byte_length ||
+                    prefetch_entry.bytes_per_expert != entry.bytes_per_expert) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE prefetch sidecar entry '%s' is incompatible with the primary sidecar",
+                        tensor_name.c_str()));
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for prefetch path from %s\n",
+                    __func__,
+                    pimpl->flash_moe_prefetch_sidecar_entries.size(),
+                    prefetch_manifest_path.string().c_str());
+        }
+
+        if (params.moe_secondary_sidecar_path != nullptr && params.moe_secondary_sidecar_path[0] != '\0') {
+            const std::filesystem::path secondary_input(params.moe_secondary_sidecar_path);
+            const auto [secondary_manifest_path, _secondary_manifest_dir] = llama_flash_moe_resolve_manifest_paths(secondary_input);
+            LLAMA_LOG_INFO("%s: slot-bank opening secondary manifest %s\n", __func__, secondary_manifest_path.string().c_str());
+            llama_flash_moe_load_slot_bank_sidecar_entries(secondary_input, pimpl->flash_moe_secondary_sidecar_entries);
+            LLAMA_LOG_INFO("%s: slot-bank parsed secondary manifest %s\n", __func__, secondary_manifest_path.string().c_str());
+
+            for (const auto & [tensor_name, entry] : pimpl->flash_moe_sidecar_entries) {
+                const auto it_secondary = pimpl->flash_moe_secondary_sidecar_entries.find(tensor_name);
+                if (it_secondary == pimpl->flash_moe_secondary_sidecar_entries.end()) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE secondary sidecar is missing routed tensor entry '%s'",
+                        tensor_name.c_str()));
+                }
+
+                const auto & secondary_entry = it_secondary->second;
+                if (secondary_entry.layer != entry.layer ||
+                    secondary_entry.tensor_family != entry.tensor_family ||
+                    secondary_entry.quant_type != entry.quant_type ||
+                    secondary_entry.source_format != entry.source_format ||
+                    secondary_entry.exact_byte_length != entry.exact_byte_length ||
+                    secondary_entry.bytes_per_expert != entry.bytes_per_expert) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE secondary sidecar entry '%s' is incompatible with the primary sidecar",
+                        tensor_name.c_str()));
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for secondary spill path from %s\n",
+                    __func__,
+                    pimpl->flash_moe_secondary_sidecar_entries.size(),
+                    secondary_manifest_path.string().c_str());
+        }
+
+        if (params.moe_tertiary_sidecar_path != nullptr && params.moe_tertiary_sidecar_path[0] != '\0') {
+            const std::filesystem::path tertiary_input(params.moe_tertiary_sidecar_path);
+            const auto [tertiary_manifest_path, _tertiary_manifest_dir] = llama_flash_moe_resolve_manifest_paths(tertiary_input);
+            LLAMA_LOG_INFO("%s: slot-bank opening tertiary manifest %s\n", __func__, tertiary_manifest_path.string().c_str());
+            llama_flash_moe_load_slot_bank_sidecar_entries(tertiary_input, pimpl->flash_moe_tertiary_sidecar_entries);
+            LLAMA_LOG_INFO("%s: slot-bank parsed tertiary manifest %s\n", __func__, tertiary_manifest_path.string().c_str());
+
+            for (const auto & [tensor_name, entry] : pimpl->flash_moe_sidecar_entries) {
+                const auto it_tertiary = pimpl->flash_moe_tertiary_sidecar_entries.find(tensor_name);
+                if (it_tertiary == pimpl->flash_moe_tertiary_sidecar_entries.end()) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE tertiary sidecar is missing routed tensor entry '%s'",
+                        tensor_name.c_str()));
+                }
+
+                const auto & tertiary_entry = it_tertiary->second;
+                if (tertiary_entry.layer != entry.layer ||
+                    tertiary_entry.tensor_family != entry.tensor_family ||
+                    tertiary_entry.quant_type != entry.quant_type ||
+                    tertiary_entry.source_format != entry.source_format ||
+                    tertiary_entry.exact_byte_length != entry.exact_byte_length ||
+                    tertiary_entry.bytes_per_expert != entry.bytes_per_expert) {
+                    throw std::runtime_error(format(
+                        "Flash-MoE tertiary sidecar entry '%s' is incompatible with the primary sidecar",
+                        tensor_name.c_str()));
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for tertiary striped path from %s\n",
+                    __func__,
+                    pimpl->flash_moe_tertiary_sidecar_entries.size(),
+                    tertiary_manifest_path.string().c_str());
+        }
     }
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -2973,6 +3720,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list_no_extra = make_cpu_buft_list(devices, false, params.no_host);
     for (auto * dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -3033,8 +3781,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    //
+    // The default llama.cpp placement keeps token embeddings on the CPU because
+    // the lookup is small. In Flash-MoE slot-bank full-offload mode this creates
+    // a CPU GET_ROWS + host-to-Metal boundary for every decode graph, so keep it
+    // on the first Metal layer unless explicitly disabled for debugging.
+    const bool flash_moe_offload_input =
+            flash_moe_slot_bank &&
+            n_gpu_layers > n_layer &&
+            !devices.empty() &&
+            !llama_flash_moe_keep_input_cpu_enabled();
+    if (flash_moe_offload_input) {
+        pimpl->dev_input = get_layer_buft_list(0);
+        LLAMA_LOG_INFO("%s: Flash-MoE full offload: placing input embeddings on %s (set LLAMA_FLASH_MOE_KEEP_INPUT_CPU=1 to force host placement)\n",
+                __func__, ggml_backend_dev_name(pimpl->dev_input.dev));
+    } else {
+        // there is very little benefit to offloading the input layer for the
+        // normal dense path, so keep the upstream CPU default outside the
+        // Flash-MoE slot-bank full-offload case.
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
@@ -3082,6 +3848,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         auto create_routed_expert_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             if (!flash_moe_slot_bank) {
+                // In-memory layer-major prefill stages expert slices from the
+                // resident tensor backend. Keep normal placement here so decode
+                // can still use the Metal mul_mat_id path when -ngl offloads.
                 return create_tensor(tn, ne, flags);
             }
 
@@ -3120,6 +3889,100 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
         };
         switch (arch) {
+            case LLM_ARCH_DEEPSEEK4:
+                {
+                    if (ml.get_tensor_meta("blk.0.ffn.experts.0.w1.weight") != nullptr &&
+                            ml.get_tensor_meta("blk.0.ffn_gate_exps.weight") == nullptr) {
+                        throw std::runtime_error(
+                                "DeepSeek V4 Flash split-expert GGUF detected. This dense path currently supports the packed expert tensor layout "
+                                "(blk.N.ffn_{gate,up,down}_exps.weight); the local split layout needs a packing/view compatibility layer before execution.");
+                    }
+
+                    const int64_t q_lora_rank       = hparams.n_lora_q;
+                    const int64_t o_lora_rank       = hparams.n_lora_o;
+                    const int64_t n_out_groups      = hparams.n_attn_out_groups;
+                    const int64_t n_ff_exp          = hparams.n_ff_exp;
+                    const int64_t n_expert_shared   = hparams.n_expert_shared;
+                    const int64_t n_hc              = hparams.n_hc;
+                    const int64_t hc_dim            = n_hc * n_embd;
+                    const int64_t hc_mix            = (2 + n_hc) * n_hc;
+
+                    if (n_out_groups == 0) {
+                        throw std::runtime_error("DeepSeek V4 requires attention output groups");
+                    }
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd}, 0);
+                    output          = create_tensor(tn(LLM_TENSOR_OUTPUT,          "weight"), {n_embd, n_vocab}, 0);
+                    output_hc_base  = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_BASE,  "weight"), {n_hc}, 0);
+                    output_hc_fn    = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_FN,    "weight"), {hc_dim, n_hc}, 0);
+                    output_hc_scale = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_SCALE, "weight"), {1}, 0);
+
+                    auto create_deepseek4_compressor = [&](llama_layer & layer, int bid, int64_t compress_ratio, int64_t head_size, bool indexer) {
+                        const int64_t coff = compress_ratio == 4 ? 2 : 1;
+                        ggml_tensor *& ape  = indexer ? layer.indexer_compressor_ape  : layer.attn_compressor_ape;
+                        ggml_tensor *& kv   = indexer ? layer.indexer_compressor_kv   : layer.attn_compressor_kv;
+                        ggml_tensor *& gate = indexer ? layer.indexer_compressor_gate : layer.attn_compressor_gate;
+                        ggml_tensor *& norm = indexer ? layer.indexer_compressor_norm : layer.attn_compressor_norm;
+
+                        ape  = create_tensor(tn(indexer ? LLM_TENSOR_INDEXER_COMPRESSOR_APE  : LLM_TENSOR_ATTN_COMPRESSOR_APE,  "weight", bid), {coff * head_size, compress_ratio}, 0);
+                        kv   = create_tensor(tn(indexer ? LLM_TENSOR_INDEXER_COMPRESSOR_KV   : LLM_TENSOR_ATTN_COMPRESSOR_KV,   "weight", bid), {n_embd, coff * head_size}, 0);
+                        gate = create_tensor(tn(indexer ? LLM_TENSOR_INDEXER_COMPRESSOR_GATE : LLM_TENSOR_ATTN_COMPRESSOR_GATE, "weight", bid), {n_embd, coff * head_size}, 0);
+                        norm = create_tensor(tn(indexer ? LLM_TENSOR_INDEXER_COMPRESSOR_NORM : LLM_TENSOR_ATTN_COMPRESSOR_NORM, "weight", bid), {head_size}, 0);
+                    };
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        const int64_t compress_ratio = hparams.attn_compress_ratio[i];
+
+                        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix}, 0);
+                        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix}, 0);
+                        layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
+                        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix}, 0);
+                        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix}, 0);
+                        layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+
+                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
+                        layer.ffn_norm       = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd}, 0);
+                        layer.attn_sinks     = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head}, 0);
+                        layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, 0);
+                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,    "weight", i), {n_embd, q_lora_rank}, 0);
+                        layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,    "weight", i), {q_lora_rank, n_head * n_embd_head_k}, 0);
+                        layer.attn_kv   = create_tensor(tn(LLM_TENSOR_ATTN_KV,     "weight", i), {n_embd, n_embd_head_k}, 0);
+                        layer.attn_wo_a = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,  "weight", i), {n_head * n_embd_head_v / n_out_groups, n_out_groups * o_lora_rank}, 0);
+                        layer.attn_wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,  "weight", i), {n_out_groups * o_lora_rank, n_embd}, 0);
+
+                        if (compress_ratio > 0) {
+                            create_deepseek4_compressor(layer, i, compress_ratio, n_embd_head_k, false);
+                        }
+                        if (compress_ratio == 4) {
+                            layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size}, 0);
+                            layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, 0);
+                            create_deepseek4_compressor(layer, i, compress_ratio, hparams.indexer_head_size, true);
+                        }
+
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                        if (static_cast<uint32_t>(i) < hparams.n_hash_layers) {
+                            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, 0);
+                            layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        } else {
+                            layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, 0);
+                            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
+                        }
+
+                        layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+                        layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+                    }
+                } break;
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
             case LLM_ARCH_MINICPM:
@@ -7119,6 +7982,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                     }
                 } break;
+            case LLM_ARCH_HY_V3:
+                {
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (output == nullptr) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk        = create_tensor(tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_k_gqa}, 0);
+                        layer.wv        = create_tensor(tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_v_gqa}, 0);
+                        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.ffn_norm    = create_tensor(tn(LLM_TENSOR_FFN_NORM,    "weight", i), {n_embd}, 0);
+
+                        const auto router_name = tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str();
+                        const bool is_moe_layer = ml.get_tensor_meta(router_name.c_str()) != nullptr;
+                        if (!is_moe_layer) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                            continue;
+                        }
+
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+
+                        // Upstream changed this tensor from blk.N.exp_probs_b.bias to
+                        // blk.N.exp_probs_b. Accept both so existing HY V3 GGUFs load.
+                        const auto router_bias_name = tn(LLM_TENSOR_FFN_EXP_PROBS_B, i).str();
+                        if (ml.get_tensor_meta(router_bias_name.c_str()) != nullptr) {
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
+                        } else {
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                        }
+
+                        layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp, n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd}, 0);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+                    }
+                } break;
             case LLM_ARCH_SMOLLM3:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -7392,9 +8307,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
+                        layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
                         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
                     }
                 } break;
@@ -8020,6 +8935,111 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+
+        if (flash_moe_slot_bank && pimpl->flash_moe_prefill_layer_major_enabled) {
+            bool supports_prefill_layer_major = true;
+            bool saw_routed_expert_tensor = false;
+            std::unordered_map<std::string, ggml_tensor *> scratch_variants;
+            flash_moe_prefill_scratch_tensors.clear();
+            const int64_t prefill_transient_slots = std::max<int64_t>(1, int64_t(n_expert));
+
+            auto scratch_variant_key = [](llm_tensor tensor_id, const ggml_tensor * tensor) {
+                return
+                    std::to_string((int) tensor_id) + ":" +
+                    std::to_string((int) tensor->type) + ":" +
+                    std::to_string((long long) tensor->ne[0]) + ":" +
+                    std::to_string((long long) tensor->ne[1]);
+            };
+
+            auto create_prefill_scratch_tensor = [&](ggml_tensor * ref, llm_tensor tensor_id, int variant_index) -> ggml_tensor * {
+                if (ref == nullptr) {
+                    return nullptr;
+                }
+
+                std::vector<int64_t> dims = {
+                    ref->ne[0],
+                    ref->ne[1],
+                    prefill_transient_slots,
+                };
+
+                return ml.create_tensor_virtual(
+                    hparams,
+                    &pimpl->cpu_buft_list,
+                    &pimpl->cpu_buft_list,
+                    &pimpl->cpu_buft_list,
+                    &pimpl->cpu_buft_list,
+                    tn(tensor_id, "weight.prefill", variant_index),
+                    dims,
+                    0,
+                    ref->type);
+            };
+
+            int prefill_variant_index = 0;
+            auto register_prefill_family = [&](llm_tensor tensor_id, ggml_tensor * tensor) -> bool {
+                if (tensor == nullptr) {
+                    return true;
+                }
+
+                saw_routed_expert_tensor = true;
+
+                const std::string variant_key = scratch_variant_key(tensor_id, tensor);
+                auto it = scratch_variants.find(variant_key);
+                if (it == scratch_variants.end()) {
+                    ggml_tensor * scratch = create_prefill_scratch_tensor(tensor, tensor_id, prefill_variant_index++);
+                    scratch_variants.emplace(variant_key, scratch);
+                    it = scratch_variants.find(variant_key);
+                }
+
+                flash_moe_prefill_scratch_tensors[ggml_get_name(tensor)] = it->second;
+                return true;
+            };
+
+            for (const auto & layer : layers) {
+                if (layer.ffn_gate_up_exps_b != nullptr ||
+                    layer.ffn_gate_exps_b    != nullptr ||
+                    layer.ffn_up_exps_b      != nullptr ||
+                    layer.ffn_down_exps_b    != nullptr) {
+                    LLAMA_LOG_WARN("%s: disabling Flash-MoE layer-major prefill scratch path because routed expert bias tensors are present and not yet scratch-remapped in this build\n",
+                            __func__);
+                    supports_prefill_layer_major = false;
+                    break;
+                }
+
+                supports_prefill_layer_major = supports_prefill_layer_major &&
+                        register_prefill_family(LLM_TENSOR_FFN_GATE_UP_EXPS, layer.ffn_gate_up_exps) &&
+                        register_prefill_family(LLM_TENSOR_FFN_GATE_EXPS,    layer.ffn_gate_exps) &&
+                        register_prefill_family(LLM_TENSOR_FFN_UP_EXPS,      layer.ffn_up_exps) &&
+                        register_prefill_family(LLM_TENSOR_FFN_DOWN_EXPS,    layer.ffn_down_exps);
+                if (!supports_prefill_layer_major) {
+                    break;
+                }
+            }
+
+            if (supports_prefill_layer_major && !saw_routed_expert_tensor) {
+                LLAMA_LOG_WARN("%s: disabling Flash-MoE layer-major prefill scratch path because no routed expert tensors were found\n",
+                        __func__);
+                supports_prefill_layer_major = false;
+            }
+
+            if (supports_prefill_layer_major) {
+                double total_gib = 0.0;
+                for (const auto & [_, tensor] : scratch_variants) {
+                    if (tensor != nullptr) {
+                        total_gib += ggml_nbytes(tensor) / 1024.0 / 1024.0 / 1024.0;
+                    }
+                }
+
+                LLAMA_LOG_INFO("%s: enabled Flash-MoE layer-major prefill scratch tensors with %lld transient slots and prefill queue depth %d across %zu routed layout variants (shared bank reserve %.2f GiB)\n",
+                        __func__,
+                        (long long) prefill_transient_slots,
+                        std::max<int32_t>(1, pimpl->flash_moe_prefill_banks),
+                        scratch_variants.size(),
+                        total_gib);
+            } else {
+                flash_moe_prefill_scratch_tensors.clear();
+                pimpl->flash_moe_prefill_layer_major_enabled = false;
+            }
+        }
     }
 
     ml.done_getting_tensors();
@@ -8519,6 +9539,33 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
     }
 
+    if (!hparams.vocab_only && arch == LLM_ARCH_GLM_DSA) {
+        uint32_t indexer_full = 0;
+        std::string indexer_pattern;
+        const uint32_t n_preview = std::min<uint32_t>(hparams.n_layer, 32);
+        indexer_pattern.reserve(n_preview + (hparams.n_layer > n_preview ? 3 : 0));
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            const bool is_full = hparams.is_indexer_full(il);
+            indexer_full += is_full ? 1 : 0;
+            if (il < n_preview) {
+                indexer_pattern.push_back(is_full ? 'F' : 'S');
+            }
+        }
+        if (hparams.n_layer > n_preview) {
+            indexer_pattern += "...";
+        }
+
+        LLAMA_LOG_INFO("%s: indexer_n_head       = %u\n",     __func__, hparams.indexer_n_head);
+        LLAMA_LOG_INFO("%s: indexer_head_size    = %u\n",     __func__, hparams.indexer_head_size);
+        LLAMA_LOG_INFO("%s: indexer_top_k        = %u\n",     __func__, hparams.indexer_top_k);
+        LLAMA_LOG_INFO("%s: indexer_top_k_freq   = %u\n",     __func__, hparams.indexer_top_k_freq);
+        LLAMA_LOG_INFO("%s: indexer_skip_offset  = %u\n",     __func__, hparams.indexer_skip_top_k_offset);
+        LLAMA_LOG_INFO("%s: indexer_rope_inter   = %d\n",     __func__, hparams.indexer_rope_interleave);
+        LLAMA_LOG_INFO("%s: indexer_share_mtp    = %d\n",     __func__, hparams.indexer_share_for_mtp_iteration);
+        LLAMA_LOG_INFO("%s: indexer_full_layers  = %u/%u pattern=%s\n",
+                __func__, indexer_full, hparams.n_layer, indexer_pattern.c_str());
+    }
+
     if (arch == LLM_ARCH_QWEN2MOE) {
         LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
         LLAMA_LOG_INFO("%s: n_ff_shexp            = %d\n",     __func__, hparams.n_ff_shexp);
@@ -8651,6 +9698,10 @@ bool llama_model::flash_moe_slot_bank_enabled() const {
     return pimpl->flash_moe_slot_bank_enabled;
 }
 
+int32_t llama_model::flash_moe_fused_slot_expert_count() const {
+    return pimpl->flash_moe_fused_slot_expert_count;
+}
+
 bool llama_model::flash_moe_resident_source_enabled() const {
     return pimpl->flash_moe_resident_source_enabled;
 }
@@ -8667,6 +9718,10 @@ bool llama_model::flash_moe_temporal_prefetch_enabled() const {
     return pimpl->flash_moe_temporal_prefetch_enabled;
 }
 
+bool llama_model::flash_moe_temporal_prefetch_sparse_enabled() const {
+    return pimpl->flash_moe_temporal_prefetch_sparse_enabled;
+}
+
 bool llama_model::flash_moe_predict_prev_token_enabled() const {
     return pimpl->flash_moe_predict_prev_token_enabled;
 }
@@ -8675,12 +9730,104 @@ bool llama_model::flash_moe_predict_top1_prev_enabled() const {
     return pimpl->flash_moe_predict_top1_prev_enabled;
 }
 
+const char * llama_model::flash_moe_predictor_path() const {
+    return pimpl->flash_moe_predictor_path.empty() ? nullptr : pimpl->flash_moe_predictor_path.c_str();
+}
+
+int32_t llama_model::flash_moe_predictor_prefetch_topk() const {
+    return std::max<int32_t>(0, pimpl->flash_moe_predictor_prefetch_topk);
+}
+
+bool llama_model::flash_moe_secondary_sidecar_enabled() const {
+    return !pimpl->flash_moe_secondary_sidecar_entries.empty();
+}
+
+bool llama_model::flash_moe_tertiary_sidecar_enabled() const {
+    return !pimpl->flash_moe_tertiary_sidecar_entries.empty();
+}
+
+bool llama_model::flash_moe_demand_stripe_enabled() const {
+    return pimpl->flash_moe_demand_stripe_enabled;
+}
+
+bool llama_model::flash_moe_demand_distribute_enabled() const {
+    return pimpl->flash_moe_demand_distribute_enabled;
+}
+
+bool llama_model::flash_moe_demand_concurrent_enabled() const {
+    return pimpl->flash_moe_demand_concurrent_enabled;
+}
+
+bool llama_model::flash_moe_prefill_stripe_enabled() const {
+    return pimpl->flash_moe_prefill_stripe_enabled;
+}
+
+bool llama_model::flash_moe_prefill_distribute_enabled() const {
+    return pimpl->flash_moe_prefill_distribute_enabled;
+}
+
+bool llama_model::flash_moe_prefetch_stripe_enabled() const {
+    return pimpl->flash_moe_prefetch_stripe_enabled;
+}
+
+bool llama_model::flash_moe_prefetch_distribute_enabled() const {
+    return pimpl->flash_moe_prefetch_distribute_enabled;
+}
+
+bool llama_model::flash_moe_prefill_layer_major_enabled() const {
+    return pimpl->flash_moe_prefill_layer_major_enabled;
+}
+
+bool llama_model::flash_moe_prefill_next_hot_exclusive_drives_enabled() const {
+    return pimpl->flash_moe_prefill_next_hot_exclusive_drives_enabled;
+}
+
 int32_t llama_model::flash_moe_slot_bank_size() const {
     return pimpl->flash_moe_slot_bank_size;
 }
 
+int32_t llama_model::flash_moe_prefill_banks() const {
+    return std::max<int32_t>(1, pimpl->flash_moe_prefill_banks);
+}
+
+int32_t llama_model::flash_moe_prefill_next_hot_experts() const {
+    return std::max<int32_t>(0, pimpl->flash_moe_prefill_next_hot_experts);
+}
+
 int32_t llama_model::flash_moe_cache_io_split() const {
     return pimpl->flash_moe_cache_io_split;
+}
+
+int32_t llama_model::flash_moe_prefill_cache_io_split() const {
+    return pimpl->flash_moe_prefill_cache_io_split;
+}
+
+int32_t llama_model::flash_moe_prefetch_cache_io_split() const {
+    return pimpl->flash_moe_prefetch_cache_io_split;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_demand_stripe_weights() const {
+    return pimpl->flash_moe_demand_stripe_weights;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_demand_distribute_weights() const {
+    return pimpl->flash_moe_demand_distribute_weights;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_prefill_stripe_weights() const {
+    return pimpl->flash_moe_prefill_stripe_weights;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_prefill_distribute_weights() const {
+    return pimpl->flash_moe_prefill_distribute_weights;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_prefetch_stripe_weights() const {
+    return pimpl->flash_moe_prefetch_stripe_weights;
+}
+
+std::array<int32_t, 3> llama_model::flash_moe_prefetch_distribute_weights() const {
+    return pimpl->flash_moe_prefetch_distribute_weights;
 }
 
 int32_t llama_model::moe_n_expert_used() const {
@@ -8698,6 +9845,42 @@ const llama_flash_moe_sidecar_entry * llama_model::flash_moe_sidecar_entry_for(c
     }
 
     return &it->second;
+}
+
+const llama_flash_moe_sidecar_entry * llama_model::flash_moe_prefetch_sidecar_entry_for(const char * name) const {
+    const auto it = pimpl->flash_moe_prefetch_sidecar_entries.find(name);
+    if (it != pimpl->flash_moe_prefetch_sidecar_entries.end()) {
+        return &it->second;
+    }
+
+    return flash_moe_sidecar_entry_for(name);
+}
+
+const llama_flash_moe_sidecar_entry * llama_model::flash_moe_secondary_sidecar_entry_for(const char * name) const {
+    const auto it = pimpl->flash_moe_secondary_sidecar_entries.find(name);
+    if (it != pimpl->flash_moe_secondary_sidecar_entries.end()) {
+        return &it->second;
+    }
+
+    return flash_moe_sidecar_entry_for(name);
+}
+
+const llama_flash_moe_sidecar_entry * llama_model::flash_moe_tertiary_sidecar_entry_for(const char * name) const {
+    const auto it = pimpl->flash_moe_tertiary_sidecar_entries.find(name);
+    if (it != pimpl->flash_moe_tertiary_sidecar_entries.end()) {
+        return &it->second;
+    }
+
+    return flash_moe_sidecar_entry_for(name);
+}
+
+ggml_tensor * llama_model::flash_moe_prefill_scratch_tensor_for(const char * name) const {
+    const auto it = flash_moe_prefill_scratch_tensors.find(name);
+    if (it == flash_moe_prefill_scratch_tensors.end()) {
+        return nullptr;
+    }
+
+    return it->second;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -8725,6 +9908,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    const uint32_t attn_n_ubatch = std::max(cparams.n_ubatch, cparams.n_ubatch_prefill);
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -8745,6 +9929,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RND1:
             {
                 res = nullptr;
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                llama_memory_i::layer_filter_cb filter_attn = [&](int32_t) {
+                    return true;
+                };
+                llama_memory_i::layer_filter_cb filter_recr = [&](int32_t il) {
+                    return hparams.attn_compress_ratio[il] != 0;
+                };
+
+                res = new llama_memory_hybrid_iswa(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_swa_full     */ params.swa_full,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_ubatch     */ attn_n_ubatch,
+                        /* attn_n_pad        */ 1,
+                        /* recurrent_type_r  */ GGML_TYPE_F32,
+                        /* recurrent_type_s  */ GGML_TYPE_F32,
+                        /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(filter_attn),
+                        /* filter_recr       */ std::move(filter_recr));
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
@@ -8785,7 +9996,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_ubatch     */ cparams.n_ubatch,
+                            /* attn_n_ubatch     */ attn_n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
@@ -8840,7 +10051,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
-                                cparams.n_ubatch,
+                                attn_n_ubatch,
                                 1,
                                 nullptr,
                                 reuse);
@@ -9139,6 +10350,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_deepseek>(*this, params);
             } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                llm = std::make_unique<llm_build_deepseek4>(*this, params);
+            } break;
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_MISTRAL4:
@@ -9295,6 +10510,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_hunyuan_dense>(*this, params);
             } break;
+        case LLM_ARCH_HY_V3:
+            {
+                llm = std::make_unique<llm_build_hy_v3>(*this, params);
+            } break;
         case LLM_ARCH_SMOLLM3:
             {
                 llm = std::make_unique<llm_build_smollm3>(*this, params);
@@ -9403,9 +10622,18 @@ llama_model_params llama_model_default_params() {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.moe_sidecar_path            =*/ nullptr,
+        /*.moe_prefetch_sidecar_path   =*/ nullptr,
+        /*.moe_secondary_sidecar_path  =*/ nullptr,
+        /*.moe_tertiary_sidecar_path   =*/ nullptr,
         /*.moe_mode                    =*/ nullptr,
         /*.moe_trace_file              =*/ nullptr,
         /*.moe_quant_map               =*/ nullptr,
+        /*.moe_demand_stripe           =*/ nullptr,
+        /*.moe_demand_distribute       =*/ nullptr,
+        /*.moe_prefill_stripe          =*/ nullptr,
+        /*.moe_prefill_distribute      =*/ nullptr,
+        /*.moe_prefetch_stripe         =*/ nullptr,
+        /*.moe_prefetch_distribute     =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
@@ -9422,12 +10650,24 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.moe_verify_sidecar          =*/ false,
+        /*.moe_prefill_layer_major     =*/ false,
         /*.moe_prefetch_temporal       =*/ false,
+        /*.moe_prefetch_temporal_sparse =*/ false,
         /*.moe_predict_prev_token      =*/ false,
         /*.moe_predict_top1_prev       =*/ false,
         /*.moe_slot_bank               =*/ 0,
+        /*.moe_prefill_banks           =*/ 1,
         /*.moe_topk_override           =*/ 0,
         /*.moe_cache_io_split          =*/ 4,
+        /*.moe_prefill_cache_io_split  =*/ 0,
+        /*.moe_prefetch_cache_io_split =*/ 0,
+        /*.moe_prefill_next_hot_exclusive_drives =*/ false,
+        /*.moe_prefill_next_hot_experts =*/ 0,
+        /*.moe_predictor_path          =*/ nullptr,
+        /*.moe_predictor_prefetch_topk =*/ 0,
+        /*.moe_demand_concurrent       =*/ false,
+        /*.slot8                       =*/ false,
+        /*.slot4                       =*/ false,
     };
 
     return result;
@@ -9551,6 +10791,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:
@@ -9621,6 +10862,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JAIS2:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_HUNYUAN_DENSE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:

@@ -26,6 +26,9 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
+#define N_R0_F8_E4M3_B128 2
+#define N_SG_F8_E4M3_B128 2
+
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
@@ -85,6 +88,13 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+
+#define GGML_METAL_MUL_MM_WALK_LEGACY  0
+#define GGML_METAL_MUL_MM_WALK_REGULAR 1
+#define GGML_METAL_MUL_MM_WALK_MORTON  2
+
+#define GGML_METAL_FLASH_ATTN_CHUNK_STRIDED    0
+#define GGML_METAL_FLASH_ATTN_CHUNK_CONTIGUOUS 1
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -310,6 +320,125 @@ typedef struct {
 } ggml_metal_kargs_rope;
 
 typedef struct {
+    int32_t  n_hc;
+    int32_t  sinkhorn_iters;
+    float    eps;
+    int64_t  n_rows;
+    uint64_t mixes_nb1;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_dsv4_hc_split_sinkhorn;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  n_elem;
+    uint64_t x_nb0;
+    uint64_t x_nb1;
+    uint64_t x_nb2;
+    uint64_t w_nb0;
+    uint64_t w_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_dsv4_hc_weighted_sum;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_ff;
+    int64_t  n_used;
+    uint64_t gate_nb1;
+    uint64_t gate_nb2;
+    uint64_t up_nb1;
+    uint64_t up_nb2;
+    uint64_t down_nb1;
+    uint64_t down_nb2;
+    uint64_t w_nb1;
+    uint64_t slot_nb0;
+} ggml_metal_kargs_flashmoe_slot8;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    int64_t  n_elem;
+    uint64_t block_nb0;
+    uint64_t block_nb1;
+    uint64_t res_nb0;
+    uint64_t res_nb1;
+    uint64_t res_nb2;
+    uint64_t post_nb0;
+    uint64_t post_nb1;
+    uint64_t comb_nb0;
+    uint64_t comb_nb1;
+    uint64_t comb_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_dsv4_hc_expand;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  n_nope;
+    int64_t  n_rows;
+    int64_t  n_blocks;
+    int64_t  ne1;
+    int64_t  ne2;
+    uint64_t src_nb0;
+    uint64_t src_nb1;
+    uint64_t src_nb2;
+    uint64_t src_nb3;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_dsv4_fp8_kv_quantize;
+
+typedef struct {
+    int64_t  head_dim;
+    int64_t  n_rows;
+    int64_t  ne1;
+    int64_t  ne2;
+    uint64_t src_nb0;
+    uint64_t src_nb1;
+    uint64_t src_nb2;
+    uint64_t src_nb3;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_dsv4_hadamard_fp4_quantize;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  n_dims;
+    int32_t  n_nope;
+    int32_t  n_ctx_orig;
+    int32_t  inverse;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    bool     src2;
+} ggml_metal_kargs_dsv4_rope_tail;
+
+typedef struct {
     int32_t  ne11;
     int32_t  ne_12_2; // assume K and V are same shape
     int32_t  ne_12_3;
@@ -428,6 +557,18 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mm;
+
+typedef struct {
+    int32_t  n_embd_in;
+    int32_t  n_ff;
+    int32_t  n_tokens;
+    int32_t  n_out;
+    uint64_t gate_nb01;
+    uint64_t up_nb01;
+    uint64_t down_nb01;
+    uint64_t in_nb1;
+    uint64_t out_nb1;
+} ggml_metal_kargs_flashmoe_split_mlp;
 
 typedef struct {
     int32_t  ne00;

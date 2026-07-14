@@ -428,7 +428,9 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_COUNT   = 41,
+        GGML_TYPE_RESERVED_41 = 41,
+        GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
@@ -465,6 +467,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -573,7 +576,16 @@ extern "C" {
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
+        GGML_OP_MUL_MAT_F16,
+        GGML_OP_FLASHMOE_SPLIT_GLU,
         GGML_OP_GLU,
+        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
+        GGML_OP_DSV4_HC_WEIGHTED_SUM,
+        GGML_OP_DSV4_HC_EXPAND,
+        GGML_OP_DSV4_FP8_KV_QUANTIZE,
+        GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE,
+        GGML_OP_DSV4_ROPE_TAIL,
+        GGML_OP_FLASHMOE_SLOT8_FFN,
 
         GGML_OP_COUNT,
     };
@@ -2480,6 +2492,67 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            int                   n_hc,
+            int                   sinkhorn_iters,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
+
+    // --slot4/--slot8: fused single-token routed MoE FFN over all selected experts.
+    // The historical slot8 function name is retained for ABI compatibility; n_used
+    // determines whether four or eight experts are consumed by the Metal operator.
+    //   gate_exps/up_exps: [n_embd, n_ff, n_slots], down_exps: [n_ff, n_embd, n_slots]
+    //   slot_ids: [n_expert_used, 1] I32 (resident slot indices), weights: [1, n_expert_used, 1] F32
+    //   result:  [n_embd, 1] F32  =  sum_e weights[e] * down_e( silu(gate_e . x) * (up_e . x) )
+    GGML_API struct ggml_tensor * ggml_flashmoe_slot8_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate_exps,
+            struct ggml_tensor  * up_exps,
+            struct ggml_tensor  * down_exps,
+            struct ggml_tensor  * slot_ids,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_rot);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_hadamard_fp4_quantize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_dsv4_rope_tail(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * freq_factors,
+            int                   n_dims,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            bool                  inverse);
 
     // custom operators
 

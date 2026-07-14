@@ -359,25 +359,28 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             call_id_section = p.optional(call_id.prefix + p.tool_id(p.until(call_id.suffix)) + call_id.suffix);
         }
 
+        common_peg_parser function_open =
+            p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix);
+        if (!function.args_separator.empty()) {
+            function_open = function_open + p.space() + p.literal(function.args_separator);
+        }
+
         bool matched_atomic = false;
         common_peg_parser func_parser = p.eps();
         if (!function.name_suffix.empty()) {
-            func_parser = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix) +
-                call_id_section + p.space() + args_seq;
+            func_parser = function_open + call_id_section + p.space() + args_seq;
             matched_atomic = true;
         } else if (have_call_id) {
-            func_parser = p.atomic(p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix) +
-                call_id_section) + p.space() + args_seq;
+            func_parser = p.atomic(function_open + call_id_section) + p.space() + args_seq;
             matched_atomic = true;
         } else if (!arguments.name_prefix.empty() && !required_parsers.empty()) {
             // Only peek for an arg tag when there are required args that must follow.
             // When all args are optional, the model may emit no arg tags at all (#20650).
-            func_parser = p.atomic(p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix) +
-                call_id_section + p.space() + p.peek(p.literal(arguments.name_prefix))) + args_seq;
+            func_parser = p.atomic(function_open + call_id_section + p.space() +
+                p.peek(p.literal(arguments.name_prefix))) + args_seq;
             matched_atomic = true;
         } else {
-            func_parser = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix) +
-                call_id_section + p.space() + args_seq;
+            func_parser = function_open + call_id_section + p.space() + args_seq;
         }
 
         if (!function.close.empty()) {

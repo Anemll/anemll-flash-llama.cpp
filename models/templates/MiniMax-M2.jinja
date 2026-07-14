@@ -94,7 +94,7 @@
                 {%- set content = content.split('</think>')[-1].strip('\n') %}
             {%- endif %}
         {%- endif %}
-        {%- if reasoning_content and loop.index0 > ns.last_user_index -%}
+        {%- if reasoning_content and loop.index0 > ns.last_user_index and (enable_thinking is not defined or enable_thinking) -%}
             {{- '<think>' ~ '\n' ~ reasoning_content ~ '\n' ~ '</think>' ~ '\n\n' }}
         {%- endif -%}
         {%- if content -%}
@@ -108,7 +108,7 @@
                     {%- set tool_call = tool_call.function %}
                 {%- endif %}
                 {{- '<invoke name="' + tool_call.name + '">' }}
-                {% set _args = tool_call.arguments %}
+                {% set _args = tool_call.arguments if tool_call.arguments is defined and tool_call.arguments is mapping else {} %}
                 {%- for k, v in _args.items() %}
                 {{- '<parameter name="' + k + '">' }}
                 {{- v | tojson(ensure_ascii=False) if v is not string else v }}
@@ -155,5 +155,8 @@
 
 {#- Generation prompt -#}
 {%- if add_generation_prompt -%}
-{{- ']~b]ai' ~ '\n' ~ '<think>' ~ '\n' }}
+{{- ']~b]ai' ~ '\n' }}
+{%- if enable_thinking is not defined or enable_thinking -%}
+{{- '<think>' ~ '\n' }}
+{%- endif -%}
 {%- endif -%}

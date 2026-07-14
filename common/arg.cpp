@@ -427,6 +427,33 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+static int parse_nonnegative_k_value(const std::string & value) {
+    if (value.empty()) {
+        throw std::invalid_argument("invalid value");
+    }
+
+    std::string digits = value;
+    int multiplier = 1;
+    const char last = value.back();
+    if (last == 'k' || last == 'K') {
+        multiplier = 1024;
+        digits.pop_back();
+    }
+
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](char ch) {
+        return ch >= '0' && ch <= '9';
+    })) {
+        throw std::invalid_argument("invalid value");
+    }
+
+    const long long parsed = std::stoll(digits);
+    if (parsed > INT_MAX / multiplier) {
+        throw std::invalid_argument("value out of range");
+    }
+
+    return (int) parsed * multiplier;
+}
+
 //
 // CLI argument parsing functions
 //
@@ -1269,6 +1296,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_ubatch_explicit = true;
         }
     ).set_env("LLAMA_ARG_UBATCH"));
+    add_opt(common_arg(
+        {"--moe-prefill-batch"}, "N",
+        "prefill-only logical batch size for --moe-prefill-layer-major (0 = default 8192, suffix K/k = *1024)",
+        [](common_params & params, const std::string & value) {
+            const int parsed = parse_nonnegative_k_value(value);
+            if (parsed < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_batch = parsed;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_BATCH"));
+    add_opt(common_arg(
+        {"--force-moe-prefill-batch"},
+        {"--no-force-moe-prefill-batch"},
+        string_format("accept architecture-specific large public --moe-prefill-batch values; DeepSeek V4 may still split internally, while explicit true-slab envs control experimental internal slab sizing (values above the validated cap require LLAMA_FLASH_MOE_DSV4_ALLOW_BROKEN_TRUE_PREFILL_SLAB=1) (default: %s)", params.moe_force_prefill_batch ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_force_prefill_batch = value;
+        }
+    ).set_env("LLAMA_ARG_FORCE_MOE_PREFILL_BATCH"));
+    add_opt(common_arg(
+        {"--moe-prefill-micro-batch"}, "N|auto",
+        "prefill-only expert compute micro-batch for --moe-prefill-layer-major (0 = follow prefill batch, auto = adapt by prompt length)",
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.moe_prefill_micro_batch = COMMON_MOE_PREFILL_MICRO_BATCH_AUTO;
+                return;
+            }
+            const int parsed = std::stoi(value);
+            if (parsed < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_micro_batch = parsed;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_MICRO_BATCH"));
     add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
@@ -2234,6 +2295,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SIDECAR"));
     add_opt(common_arg(
+        {"--moe-prefetch-sidecar", "--prefetch-sidecar", "--prefetch"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used only for prefetch loads (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_SIDECAR"));
+    add_opt(common_arg(
+        {"--moe-secondary-sidecar", "--secondary-sidecar"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used only for the last miss in a 4-miss routed call experiment (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_secondary_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SECONDARY_SIDECAR"));
+    add_opt(common_arg(
+        {"--moe-tertiary-sidecar", "--tertiary-sidecar"}, "PATH",
+        "optional alternate Flash-MoE sidecar directory or manifest path used as the third lane for experimental weighted demand striping (defaults to --moe-sidecar)",
+        [](common_params & params, const std::string & value) {
+            params.moe_tertiary_sidecar = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TERTIARY_SIDECAR"));
+    add_opt(common_arg(
         {"--moe-mode"}, "{stock,resident,resident-bank,resident-slot-bank,slot-bank,oracle-all-hit,oracle-prefetch}",
         "Flash-MoE runtime mode",
         [](common_params & params, const std::string & value) {
@@ -2263,6 +2345,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SLOT_BANK"));
     add_opt(common_arg(
+        {"--moe-prefill-banks"}, "N",
+        "layer-major prefill read-ahead depth in experts per staged batch (1 = no read-ahead batching)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_banks = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_BANKS"));
+    add_opt(common_arg(
+        {"--moe-prefill-next-hot-experts"}, "N",
+        "prototype one-lookahead layer-major prefill host staging budget: while layer L computes, prefetch up to N hot experts predicted for layer L+1 from that target layer's last call (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_next_hot_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-prefill-next-hot-exclusive-drives", "--moe-prefill-exclusive-drive-prefetch"},
+        {"--no-moe-prefill-next-hot-exclusive-drives", "--no-moe-prefill-exclusive-drive-prefetch"},
+        string_format("pin dedicated prefill next-hot host staging to the sidecars only: current-layer demand stays on the primary drive, layer L+1 stages on the secondary drive, and layer L+2 stages on the tertiary drive when available (default: %s)", params.moe_prefill_next_hot_exclusive_drives ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefill_next_hot_exclusive_drives = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXCLUSIVE_DRIVES"));
+    add_opt(common_arg(
+        {"--slot4"},
+        {"--no-slot4"},
+        string_format("Flash-MoE: collapse an effective top-4 routed-expert FFN into the fused Metal operator (gate/up/swiglu/down/weighted-sum over 4 experts), bypassing the per-expert decode replay/ICB cache; use with --moe-topk 4 (default: %s)", params.slot4 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot4 = value;
+            if (value) {
+                params.slot8 = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT4"));
+    add_opt(common_arg(
+        {"--slot8"},
+        {"--no-slot8"},
+        string_format("Flash-MoE: collapse a top-8 routed-expert FFN into a single fused Metal kernel (gate/up/swiglu/down/weighted-sum over all 8 experts), bypassing the per-expert decode replay/ICB cache; only engages on eligible layers, otherwise falls back to the normal slot-bank path (default: %s)", params.slot8 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot8 = value;
+            if (value) {
+                params.slot4 = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT8"));
+    add_opt(common_arg(
         {"--moe-topk"}, "N",
         "experimental runtime reduction-only override for routed experts per token (0 = model metadata, must be <= GGUF MoE top-k)",
         [](common_params & params, int value) {
@@ -2283,6 +2415,76 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_IO_SPLIT"));
     add_opt(common_arg(
+        {"--moe-prefill-io-split", "--moe-prefill-cache-io-split"}, "N",
+        "split layer-major prefill expert preads into N page-aligned chunks (0 = follow --moe-cache-io-split, 1 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefill_cache_io_split = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_IO_SPLIT"));
+    add_opt(common_arg(
+        {"--moe-prefetch-cache-io-split"}, "N",
+        "split prefetch-sidecar expert preads into N page-aligned chunks during slot-bank installs (0 = follow --moe-cache-io-split, 1 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_prefetch_cache_io_split = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_CACHE_IO_SPLIT"));
+    add_opt(common_arg(
+        {"--moe-demand-stripe"}, "A:B:C",
+        "experimental weighted demand striping across primary:secondary:tertiary sidecars for routed family reads, e.g. 5:1:1 or 4:1:1",
+        [](common_params & params, const std::string & value) {
+            params.moe_demand_stripe = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DEMAND_STRIPE"));
+    add_opt(common_arg(
+        {"--moe-demand-distribute", "--moe-demand-expert-distribute"}, "A:B:C",
+        "experimental whole-expert demand distribution across primary:secondary:tertiary sidecars, e.g. 1:1:1 for round-robin or 2:1:1 for weighted fanout",
+        [](common_params & params, const std::string & value) {
+            params.moe_demand_distribute = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DEMAND_DISTRIBUTE"));
+    add_opt(common_arg(
+        {"--moe-demand-concurrent"},
+        {"--no-moe-demand-concurrent"},
+        string_format("experimental: race full demand expert reads from primary and secondary sidecars; first completed read wins (default: %s)", params.moe_demand_concurrent ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_demand_concurrent = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DEMAND_CONCURRENT"));
+    add_opt(common_arg(
+        {"--moe-prefill-stripe"}, "A:B:C",
+        "experimental weighted prefill-only striping across primary:secondary:tertiary sidecars for dedicated layer-major prompt reads, e.g. 3:2:2",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefill_stripe = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_STRIPE"));
+    add_opt(common_arg(
+        {"--moe-prefill-distribute", "--moe-prefill-expert-distribute"}, "A:B:C",
+        "experimental whole-expert prefill-only distribution across primary:secondary:tertiary sidecars for dedicated layer-major prompt reads, e.g. 1:1:1",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefill_distribute = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_DISTRIBUTE"));
+    add_opt(common_arg(
+        {"--moe-prefetch-stripe", "--moe-preftech-stripe"}, "A:B:C",
+        "experimental weighted prefetch striping across prefetch:secondary:tertiary sidecars for prefetch-family reads, e.g. 0:1:1",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_stripe = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_STRIPE"));
+    add_opt(common_arg(
+        {"--moe-prefetch-distribute", "--moe-prefetch-expert-distribute"}, "A:B:C",
+        "experimental whole-expert prefetch distribution across prefetch:secondary:tertiary sidecars, e.g. 1:1:1 for round-robin or 2:1:1 for weighted fanout",
+        [](common_params & params, const std::string & value) {
+            params.moe_prefetch_distribute = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_DISTRIBUTE"));
+    add_opt(common_arg(
         {"--moe-force-expert"}, "N",
         "force routed expert selection to a single expert id for every token (implies K=1 inside the routed path, -1 disables)",
         [](common_params & params, int value) {
@@ -2300,6 +2502,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_prefetch_temporal = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL"));
+    add_opt(common_arg(
+        {"--moe-prefetch-temporal-sparse"},
+        {"--no-moe-prefetch-temporal-sparse"},
+        string_format("alternate temporal prefetch between even and odd routed layers on successive decode steps for slower prefetch media (implies --moe-prefetch-temporal, default: %s)", params.moe_prefetch_temporal_sparse ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefetch_temporal_sparse = value;
+            if (value) {
+                params.moe_prefetch_temporal = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH_TEMPORAL_SPARSE"));
+    add_opt(common_arg(
+        {"--moe-prefill-layer-major"},
+        {"--no-moe-prefill-layer-major"},
+        string_format("enable shared scratch-bank routed prefill for multi-token prompt batches while keeping decode on the normal slot-bank path (default: %s)", params.moe_prefill_layer_major ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_prefill_layer_major = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_LAYER_MAJOR"));
     add_opt(common_arg(
         {"--moe-predict-prev-token"},
         {"--no-moe-predict-prev-token"},
@@ -2323,6 +2544,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREDICT_TOP1_PREV"));
     add_opt(common_arg(
+        {"--moe-predictor"}, "DIR",
+        "raw Flash-MoE hidden-state predictor directory for pre-attention slot-bank prefetch",
+        [](common_params & params, const std::string & value) {
+            params.moe_predictor = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICTOR"));
+    add_opt(common_arg(
+        {"--moe-predictor-prefetch-topk"}, "N",
+        "limit hidden-state predictor prefetch installs to the top N predicted experts per layer (0 = predictor topk)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_predictor_prefetch_topk = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICTOR_PREFETCH_TOPK"));
+    add_opt(common_arg(
         {"--moe-shared-only"},
         {"--no-moe-shared-only"},
         string_format("bypass routed experts at graph build time and keep shared experts only (default: %s)", params.moe_shared_only ? "enabled" : "disabled"),
@@ -2338,6 +2576,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_router_only = value;
         }
     ).set_env("LLAMA_ARG_MOE_ROUTER_ONLY"));
+    add_opt(common_arg(
+        {"--moe-sort-decode-expert-ids"},
+        {"--no-moe-sort-decode-expert-ids"},
+        string_format("for single-token Flash-MoE decode, sort routed experts by ascending expert id before the routed MLP so weights and matmuls follow the same reordered top-k list (default: %s)", params.moe_sort_decode_expert_ids ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_sort_decode_expert_ids = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SORT_DECODE_EXPERT_IDS"));
     add_opt(common_arg(
         {"--moe-trace-harness"},
         "llama-cli only: bypass the chat loop and run the provided --prompt as a raw non-interactive completion for long Flash-MoE trace collection",

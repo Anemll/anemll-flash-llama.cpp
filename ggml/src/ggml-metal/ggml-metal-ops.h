@@ -36,6 +36,9 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
+void ggml_metal_op_mul_mat_log_stats(void);
+void ggml_metal_op_mul_mat_reset_stats(void);
+void ggml_metal_op_mul_mat_set_experimental_m5_expert_active(bool active);
 void ggml_metal_op_mul_mat_id_log_stats(void);
 void ggml_metal_op_mul_mat_id_get_stats(struct ggml_metal_mul_mat_id_stats * stats);
 void ggml_metal_op_mul_mat_id_reset_stats(void);
@@ -49,6 +52,12 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
+
+// temporary activation buffer for internal split-GLU -> down fusion
+size_t ggml_metal_op_flashmoe_split_glu_extra_tmp(const struct ggml_tensor * op);
+
+// temporary buffers for the fused single-token routed MoE FFN (--slot8)
+size_t ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(const struct ggml_tensor * op);
 
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
@@ -79,6 +88,9 @@ int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_1d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mul_mat_f16       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flashmoe_split_glu(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_flashmoe_slot8_ffn(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
@@ -87,6 +99,12 @@ int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_split_sinkhorn(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_weighted_sum  (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_expand        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_fp8_kv_quantize  (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hadamard_fp4_quantize(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_rope_tail        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_transpose_1d (ggml_metal_op_t ctx, int idx);

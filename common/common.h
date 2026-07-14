@@ -410,12 +410,19 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+static constexpr int32_t COMMON_MOE_PREFILL_MICRO_BATCH_AUTO = -1;
+
+int32_t common_moe_prefill_micro_batch_auto_for_tokens(int32_t prompt_tokens);
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     bool    n_ubatch_explicit     = false; // true when -ub/--ubatch-size (or env alias) was set by the user
+    int32_t moe_prefill_batch     =     0; // prefill-only logical batch override for --moe-prefill-layer-major (0 = follow n_batch)
+    int32_t moe_prefill_micro_batch =   0; // prefill-only expert compute micro-batch (0 = follow prefill batch, -1 = auto)
+    bool    moe_force_prefill_batch = false; // accept large --moe-prefill-batch values; model memory may still split internally while DSv4 true-slab sizing stays behind explicit envs
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -636,22 +643,44 @@ struct common_params {
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
 
-    std::string moe_sidecar   = "";      // Flash-MoE sidecar directory or manifest path              // NOLINT
-    std::string moe_mode      = "stock"; // Flash-MoE runtime mode                                     // NOLINT
-    std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
-    std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
-    std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
+    std::string moe_sidecar           = "";      // Flash-MoE sidecar directory or manifest path                // NOLINT
+    std::string moe_prefetch_sidecar  = "";      // optional alternate sidecar used only for prefetch           // NOLINT
+    std::string moe_secondary_sidecar = "";      // optional alternate sidecar used for last-miss spill loads   // NOLINT
+    std::string moe_tertiary_sidecar  = "";      // optional alternate sidecar used for striped demand tests    // NOLINT
+    std::string moe_mode              = "stock"; // Flash-MoE runtime mode                                       // NOLINT
+    std::string moe_trace             = "";      // reserved trace output path                                   // NOLINT
+    std::string moe_quant_map         = "";      // reserved dynamic-quant policy path                           // NOLINT
+    std::string moe_demand_stripe     = "";      // experimental weighted demand striping, e.g. 5:1:1          // NOLINT
+    std::string moe_demand_distribute = "";      // experimental whole-expert demand fanout, e.g. 1:1:1        // NOLINT
+    bool        moe_demand_concurrent = false;   // race full demand reads between primary and secondary sidecars // NOLINT
+    std::string moe_prefill_stripe    = "";      // experimental prefill-only weighted striping, e.g. 3:2:2    // NOLINT
+    std::string moe_prefill_distribute = "";     // experimental prefill-only whole-expert fanout, e.g. 1:1:1 // NOLINT
+    std::string moe_prefetch_stripe   = "";      // experimental weighted prefetch striping, e.g. 0:1:1        // NOLINT
+    std::string moe_prefetch_distribute = "";    // experimental whole-expert prefetch fanout, e.g. 1:1:1      // NOLINT
+    std::string moe_predictor         = "";      // raw Flash-MoE hidden-state predictor directory             // NOLINT
+    std::string oracle_dump           = "";      // llama-cli tensor oracle dump directory                       // NOLINT
     int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
+    int32_t     moe_prefill_banks = 1;   // in-flight prefill expert staging banks / read-batch depth // NOLINT
+    int32_t     moe_prefill_next_hot_experts = 0; // prototype one-lookahead prefill hot-expert host staging // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
     int32_t     moe_cache_io_split = 4;  // split each routed expert pread into N aligned chunks       // NOLINT
+    int32_t     moe_prefill_cache_io_split = 0; // override split count for layer-major prefill reads  // NOLINT
+    int32_t     moe_prefetch_cache_io_split = 0; // override split count for prefetch sidecar reads     // NOLINT
+    int32_t     moe_predictor_prefetch_topk = 0; // max hidden-predictor experts to prefetch; 0 follows predictor topk // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT
     int32_t     oracle_topk = 32;        // number of final logits to retain in oracle manifests       // NOLINT
     bool        moe_prefetch_temporal = false; // runtime temporal prefetch for slot-bank              // NOLINT
+    bool        moe_prefetch_temporal_sparse = false; // alternate even/odd layer temporal prefetch   // NOLINT
+    bool        moe_prefill_layer_major = false; // shared scratch-bank layer-major routed prefill    // NOLINT
+    bool        moe_prefill_next_hot_exclusive_drives = false; // pin prefill next-hot staging to secondary/tertiary sidecars // NOLINT
     bool        moe_predict_prev_token = false; // prev-token same-layer expert predictor              // NOLINT
     bool        moe_predict_top1_prev = false; // prev-token top-1 same-layer predictor               // NOLINT
     bool        moe_shared_only = false; // bypass routed experts and keep shared experts only         // NOLINT
     bool        moe_router_only = false; // keep routing/topk, bypass routed expert matmuls           // NOLINT
+    bool        moe_sort_decode_expert_ids = false; // sort single-token routed decode experts by id // NOLINT
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
+    bool        slot4 = false;           // fused single-kernel top-4 routed-expert FFN (Metal)         // NOLINT
+    bool        slot8 = false;           // fused single-kernel top-8 routed-expert FFN (Metal)         // NOLINT
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed

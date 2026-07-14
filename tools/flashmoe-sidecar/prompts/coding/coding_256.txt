@@ -1,0 +1,24 @@
+You are debugging a coding assistant backend with a web IDE, build queue, repository indexer, and streamed websocket traces.
+
+Important files:
+01. server/jobs/build_queue.ts - scheduler and retry backoff
+02. server/repos/git_indexer.ts - incremental fingerprinting
+03. server/rpc/ws_transport.ts - reconnects and acknowledgements
+04. server/rpc/request_store.ts - request lifecycle
+
+Bug ticket:
+Users report that a streamed patch succeeds in the UI but leaves the repository index stale after a reconnect or two fast retries. Log chunks, indexing, and websocket acknowledgements overlap.
+
+Observed trace:
+- request_store begins request q-90001
+- ws_transport reports duplicate ack sequence=2
+- build_queue accepts the patch job
+- git_indexer skips refresh due to active lease workspace=1001
+- editor diagnostics remain stale
+
+Task:
+Explain the likely ordering bug, propose the state transition fix, list the files to edit, and describe one regression test.
+
+Acceptance:
+- duplicate websocket acknowledgements must not suppress repository refresh
+- the build queue must not clear request state before the indexer observes the final patch result

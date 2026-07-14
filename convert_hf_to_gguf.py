@@ -9455,6 +9455,22 @@ class GlmMoeDsaModel(DeepseekV2Model):
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
+        # Optional GLM-5.2 IndexShare/indexer metadata. The runtime parses these
+        # fields for schedule awareness; full DSA sparse-mask/cache execution is
+        # handled separately from conversion.
+        if (index_topk_freq := self.hparams.get("index_topk_freq")) is not None:
+            self.gguf_writer.add_indexer_top_k_freq(int(index_topk_freq))
+        if (index_topk_pattern := self.hparams.get("index_topk_pattern")) is not None:
+            self.gguf_writer.add_indexer_top_k_pattern(index_topk_pattern)
+        if (indexer_types := self.hparams.get("indexer_types")) is not None:
+            self.gguf_writer.add_indexer_types([str(indexer_type) for indexer_type in indexer_types])
+        if (index_share_for_mtp_iteration := self.hparams.get("index_share_for_mtp_iteration")) is not None:
+            self.gguf_writer.add_indexer_share_for_mtp_iteration(bool(index_share_for_mtp_iteration))
+        if (index_skip_topk_offset := self.hparams.get("index_skip_topk_offset")) is not None:
+            self.gguf_writer.add_indexer_skip_top_k_offset(int(index_skip_topk_offset))
+        if (indexer_rope_interleave := self.hparams.get("indexer_rope_interleave")) is not None:
+            self.gguf_writer.add_indexer_rope_interleave(bool(indexer_rope_interleave))
+
 
 @ModelBase.register("GlmForCausalLM", "ChatGLMModel", "ChatGLMForConditionalGeneration")
 class ChatGLMModel(TextModel):
@@ -11112,6 +11128,72 @@ class HunYuanModel(TextModel):
                 return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("HYV3ForCausalLM")
+class HYV3Model(TextModel):
+    """Tencent HY V3 trunk converter.
+
+    HY V3 checkpoints may append MTP/NextN decoder blocks after the main
+    transformer stack. This fork currently exports the inference trunk and
+    deliberately skips those appended draft blocks.
+    """
+
+    model_arch = gguf.MODEL_ARCH.HY_V3
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        moe_intermediate_size = self.hparams["moe_intermediate_size"]
+        num_shared_experts = self.hparams.get("num_shared_experts", 1)
+
+        self.gguf_writer.add_leading_dense_block_count(self.hparams.get("first_k_dense_replace", 1))
+        self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+        self.gguf_writer.add_expert_shared_feed_forward_length(moe_intermediate_size * num_shared_experts)
+        self.gguf_writer.add_expert_weights_norm(self.hparams.get("route_norm", True))
+        self.gguf_writer.add_expert_weights_scale(float(self.hparams.get("router_scaling_factor", 1.0)))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Keep this backport trunk-only until the fork's runtime grows generic
+        # MTP graph support. Main HY V3 blocks are [0, block_count).
+        if bid is not None and bid >= self.block_count:
+            return
+
+        if name.startswith("model.layers.") and ".mlp.experts." in name:
+            n_experts = self.find_hparam(["num_local_experts", "num_experts"])
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+            if len(self._experts[bid]) < n_experts * 3:
+                return
+
+            for w_name in ("down_proj", "gate_proj", "up_proj"):
+                datas: list[Tensor] = []
+                for xid in range(n_experts):
+                    ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                    datas.append(self._experts[bid].pop(ename))
+
+                merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                yield from super().modify_tensors(torch.stack(datas, dim=0), merged_name, bid)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            remaining = [name for layer in self._experts for name in layer]
+            if remaining:
+                raise ValueError(f"Unprocessed HY V3 experts: {remaining}")
 
 
 @ModelBase.register("SmolLM3ForCausalLM")

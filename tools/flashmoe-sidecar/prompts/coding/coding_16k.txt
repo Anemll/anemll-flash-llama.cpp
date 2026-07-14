@@ -1,0 +1,1908 @@
+You are debugging a large codebase. Read the repository notes, the bug tickets, and the failing tests. Focus on race conditions, ordering issues, incremental indexing, and streamed RPC behavior.
+
+Repository overview:
+This benchmark prompt describes a moderately large coding assistant backend with a web IDE, build queue, code search, and streamed traces.
+
+Important modules:
+01. server/auth/session_cache.ts - session cache invalidation and tenant-scoped auth
+02. server/jobs/build_queue.ts - bounded build scheduler with retry backoff
+03. server/jobs/log_mux.ts - interleaved job log fan-in and chunk flushing
+04. server/repos/git_indexer.ts - repository scan and incremental file fingerprinting
+05. server/search/symbol_graph.ts - symbol edges, reverse references, and path ranking
+06. server/search/query_planner.ts - heuristics for code search terms and fallback regex
+07. server/rpc/ws_transport.ts - streamed RPC frames and reconnect handling
+08. server/rpc/request_store.ts - request lifecycle and timeout accounting
+09. shared/config/runtime_flags.ts - feature flags and staged rollout rules
+10. shared/config/workspace_limits.ts - token, memory, and concurrency limits
+11. apps/web/src/routes/editor.tsx - editor route, file tabs, and diagnostics panel
+12. apps/web/src/routes/search.tsx - search results grouping and ranking badges
+13. apps/web/src/components/diff_view.tsx - split diff renderer and fold state
+14. apps/web/src/components/trace_table.tsx - runtime trace table with sticky filters
+15. apps/web/src/lib/fetch_json.ts - typed fetch wrapper with retry budget
+16. apps/web/src/lib/use_stream.ts - stream reader and backpressure aware hooks
+
+### Coding Ticket 001: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-01
+- Build shard: shard-1
+- Primary route: /api/workspaces/1001/apply
+- Editor session id: editor-4001
+- Search request id: q-90001
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:07.114Z INFO  request_store: begin request=q-90001 tenant=tenant-01
+2026-04-17T10:12:08.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:09.402Z INFO  build_queue: build accepted on shard-1 priority=2
+2026-04-17T10:12:10.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1001
+2026-04-17T10:12:11.612Z ERROR editor: stale diagnostics after apply request=q-90001
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-01",
+        workspaceId: 1001,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1001);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 002: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-02
+- Build shard: shard-2
+- Primary route: /api/workspaces/1002/apply
+- Editor session id: editor-4002
+- Search request id: q-90002
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:14.114Z INFO  request_store: begin request=q-90002 tenant=tenant-02
+2026-04-17T10:12:15.229Z WARN  ws_transport: duplicate ack sequence=3
+2026-04-17T10:12:16.402Z INFO  build_queue: build accepted on shard-2 priority=3
+2026-04-17T10:12:17.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1002
+2026-04-17T10:12:18.612Z ERROR editor: stale diagnostics after apply request=q-90002
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-02",
+        workspaceId: 1002,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(8));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1002);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 003: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-03
+- Build shard: shard-3
+- Primary route: /api/workspaces/1003/apply
+- Editor session id: editor-4003
+- Search request id: q-90003
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:21.114Z INFO  request_store: begin request=q-90003 tenant=tenant-03
+2026-04-17T10:12:22.229Z WARN  ws_transport: duplicate ack sequence=4
+2026-04-17T10:12:23.402Z INFO  build_queue: build accepted on shard-3 priority=4
+2026-04-17T10:12:24.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1003
+2026-04-17T10:12:25.612Z ERROR editor: stale diagnostics after apply request=q-90003
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-03",
+        workspaceId: 1003,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(9));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1003);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 004: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-04
+- Build shard: shard-4
+- Primary route: /api/workspaces/1004/apply
+- Editor session id: editor-4004
+- Search request id: q-90004
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:28.114Z INFO  request_store: begin request=q-90004 tenant=tenant-04
+2026-04-17T10:12:29.229Z WARN  ws_transport: duplicate ack sequence=5
+2026-04-17T10:12:30.402Z INFO  build_queue: build accepted on shard-4 priority=1
+2026-04-17T10:12:31.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1004
+2026-04-17T10:12:32.612Z ERROR editor: stale diagnostics after apply request=q-90004
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-04",
+        workspaceId: 1004,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(10));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1004);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 005: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-05
+- Build shard: shard-5
+- Primary route: /api/workspaces/1005/apply
+- Editor session id: editor-4005
+- Search request id: q-90005
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:35.114Z INFO  request_store: begin request=q-90005 tenant=tenant-05
+2026-04-17T10:12:36.229Z WARN  ws_transport: duplicate ack sequence=1
+2026-04-17T10:12:37.402Z INFO  build_queue: build accepted on shard-5 priority=2
+2026-04-17T10:12:38.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1005
+2026-04-17T10:12:39.612Z ERROR editor: stale diagnostics after apply request=q-90005
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-05",
+        workspaceId: 1005,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(6));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1005);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 006: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-06
+- Build shard: shard-6
+- Primary route: /api/workspaces/1006/apply
+- Editor session id: editor-4006
+- Search request id: q-90006
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:42.114Z INFO  request_store: begin request=q-90006 tenant=tenant-06
+2026-04-17T10:12:43.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:44.402Z INFO  build_queue: build accepted on shard-6 priority=3
+2026-04-17T10:12:45.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1006
+2026-04-17T10:12:46.612Z ERROR editor: stale diagnostics after apply request=q-90006
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-06",
+        workspaceId: 1006,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1006);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 007: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-07
+- Build shard: shard-0
+- Primary route: /api/workspaces/1007/apply
+- Editor session id: editor-4007
+- Search request id: q-90007
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:49.114Z INFO  request_store: begin request=q-90007 tenant=tenant-07
+2026-04-17T10:12:50.229Z WARN  ws_transport: duplicate ack sequence=3
+2026-04-17T10:12:51.402Z INFO  build_queue: build accepted on shard-0 priority=4
+2026-04-17T10:12:52.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1007
+2026-04-17T10:12:53.612Z ERROR editor: stale diagnostics after apply request=q-90007
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-07",
+        workspaceId: 1007,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(8));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1007);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 008: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-08
+- Build shard: shard-1
+- Primary route: /api/workspaces/1008/apply
+- Editor session id: editor-4008
+- Search request id: q-90008
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:56.114Z INFO  request_store: begin request=q-90008 tenant=tenant-08
+2026-04-17T10:12:57.229Z WARN  ws_transport: duplicate ack sequence=4
+2026-04-17T10:12:58.402Z INFO  build_queue: build accepted on shard-1 priority=1
+2026-04-17T10:12:59.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1008
+2026-04-17T10:12:00.612Z ERROR editor: stale diagnostics after apply request=q-90008
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-08",
+        workspaceId: 1008,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(9));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1008);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 009: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-09
+- Build shard: shard-2
+- Primary route: /api/workspaces/1009/apply
+- Editor session id: editor-4009
+- Search request id: q-90009
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:03.114Z INFO  request_store: begin request=q-90009 tenant=tenant-09
+2026-04-17T10:12:04.229Z WARN  ws_transport: duplicate ack sequence=5
+2026-04-17T10:12:05.402Z INFO  build_queue: build accepted on shard-2 priority=2
+2026-04-17T10:12:06.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1009
+2026-04-17T10:12:07.612Z ERROR editor: stale diagnostics after apply request=q-90009
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-09",
+        workspaceId: 1009,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(10));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1009);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 010: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-10
+- Build shard: shard-3
+- Primary route: /api/workspaces/1010/apply
+- Editor session id: editor-4010
+- Search request id: q-90010
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:10.114Z INFO  request_store: begin request=q-90010 tenant=tenant-10
+2026-04-17T10:12:11.229Z WARN  ws_transport: duplicate ack sequence=1
+2026-04-17T10:12:12.402Z INFO  build_queue: build accepted on shard-3 priority=3
+2026-04-17T10:12:13.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1010
+2026-04-17T10:12:14.612Z ERROR editor: stale diagnostics after apply request=q-90010
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-10",
+        workspaceId: 1010,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(6));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1010);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 011: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-00
+- Build shard: shard-4
+- Primary route: /api/workspaces/1011/apply
+- Editor session id: editor-4011
+- Search request id: q-90011
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:17.114Z INFO  request_store: begin request=q-90011 tenant=tenant-00
+2026-04-17T10:12:18.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:19.402Z INFO  build_queue: build accepted on shard-4 priority=4
+2026-04-17T10:12:20.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1011
+2026-04-17T10:12:21.612Z ERROR editor: stale diagnostics after apply request=q-90011
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-00",
+        workspaceId: 1011,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1011);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 012: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-01
+- Build shard: shard-5
+- Primary route: /api/workspaces/1012/apply
+- Editor session id: editor-4012
+- Search request id: q-90012
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:24.114Z INFO  request_store: begin request=q-90012 tenant=tenant-01
+2026-04-17T10:12:25.229Z WARN  ws_transport: duplicate ack sequence=3
+2026-04-17T10:12:26.402Z INFO  build_queue: build accepted on shard-5 priority=1
+2026-04-17T10:12:27.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1012
+2026-04-17T10:12:28.612Z ERROR editor: stale diagnostics after apply request=q-90012
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-01",
+        workspaceId: 1012,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(8));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1012);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 013: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-02
+- Build shard: shard-6
+- Primary route: /api/workspaces/1013/apply
+- Editor session id: editor-4013
+- Search request id: q-90013
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:31.114Z INFO  request_store: begin request=q-90013 tenant=tenant-02
+2026-04-17T10:12:32.229Z WARN  ws_transport: duplicate ack sequence=4
+2026-04-17T10:12:33.402Z INFO  build_queue: build accepted on shard-6 priority=2
+2026-04-17T10:12:34.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1013
+2026-04-17T10:12:35.612Z ERROR editor: stale diagnostics after apply request=q-90013
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-02",
+        workspaceId: 1013,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(9));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1013);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 014: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-03
+- Build shard: shard-0
+- Primary route: /api/workspaces/1014/apply
+- Editor session id: editor-4014
+- Search request id: q-90014
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:38.114Z INFO  request_store: begin request=q-90014 tenant=tenant-03
+2026-04-17T10:12:39.229Z WARN  ws_transport: duplicate ack sequence=5
+2026-04-17T10:12:40.402Z INFO  build_queue: build accepted on shard-0 priority=3
+2026-04-17T10:12:41.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1014
+2026-04-17T10:12:42.612Z ERROR editor: stale diagnostics after apply request=q-90014
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-03",
+        workspaceId: 1014,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(10));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1014);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 015: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-04
+- Build shard: shard-1
+- Primary route: /api/workspaces/1015/apply
+- Editor session id: editor-4015
+- Search request id: q-90015
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:45.114Z INFO  request_store: begin request=q-90015 tenant=tenant-04
+2026-04-17T10:12:46.229Z WARN  ws_transport: duplicate ack sequence=1
+2026-04-17T10:12:47.402Z INFO  build_queue: build accepted on shard-1 priority=4
+2026-04-17T10:12:48.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1015
+2026-04-17T10:12:49.612Z ERROR editor: stale diagnostics after apply request=q-90015
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-04",
+        workspaceId: 1015,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(6));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1015);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 016: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-05
+- Build shard: shard-2
+- Primary route: /api/workspaces/1016/apply
+- Editor session id: editor-4016
+- Search request id: q-90016
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:52.114Z INFO  request_store: begin request=q-90016 tenant=tenant-05
+2026-04-17T10:12:53.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:54.402Z INFO  build_queue: build accepted on shard-2 priority=1
+2026-04-17T10:12:55.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1016
+2026-04-17T10:12:56.612Z ERROR editor: stale diagnostics after apply request=q-90016
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-05",
+        workspaceId: 1016,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1016);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 017: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-06
+- Build shard: shard-3
+- Primary route: /api/workspaces/1017/apply
+- Editor session id: editor-4017
+- Search request id: q-90017
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:59.114Z INFO  request_store: begin request=q-90017 tenant=tenant-06
+2026-04-17T10:12:00.229Z WARN  ws_transport: duplicate ack sequence=3
+2026-04-17T10:12:01.402Z INFO  build_queue: build accepted on shard-3 priority=2
+2026-04-17T10:12:02.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1017
+2026-04-17T10:12:03.612Z ERROR editor: stale diagnostics after apply request=q-90017
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-06",
+        workspaceId: 1017,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(8));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1017);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 018: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-07
+- Build shard: shard-4
+- Primary route: /api/workspaces/1018/apply
+- Editor session id: editor-4018
+- Search request id: q-90018
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:06.114Z INFO  request_store: begin request=q-90018 tenant=tenant-07
+2026-04-17T10:12:07.229Z WARN  ws_transport: duplicate ack sequence=4
+2026-04-17T10:12:08.402Z INFO  build_queue: build accepted on shard-4 priority=3
+2026-04-17T10:12:09.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1018
+2026-04-17T10:12:10.612Z ERROR editor: stale diagnostics after apply request=q-90018
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-07",
+        workspaceId: 1018,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(9));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1018);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 019: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-08
+- Build shard: shard-5
+- Primary route: /api/workspaces/1019/apply
+- Editor session id: editor-4019
+- Search request id: q-90019
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:13.114Z INFO  request_store: begin request=q-90019 tenant=tenant-08
+2026-04-17T10:12:14.229Z WARN  ws_transport: duplicate ack sequence=5
+2026-04-17T10:12:15.402Z INFO  build_queue: build accepted on shard-5 priority=4
+2026-04-17T10:12:16.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1019
+2026-04-17T10:12:17.612Z ERROR editor: stale diagnostics after apply request=q-90019
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-08",
+        workspaceId: 1019,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(10));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1019);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 020: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-09
+- Build shard: shard-6
+- Primary route: /api/workspaces/1020/apply
+- Editor session id: editor-4020
+- Search request id: q-90020
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:20.114Z INFO  request_store: begin request=q-90020 tenant=tenant-09
+2026-04-17T10:12:21.229Z WARN  ws_transport: duplicate ack sequence=1
+2026-04-17T10:12:22.402Z INFO  build_queue: build accepted on shard-6 priority=1
+2026-04-17T10:12:23.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1020
+2026-04-17T10:12:24.612Z ERROR editor: stale diagnostics after apply request=q-90020
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-09",
+        workspaceId: 1020,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(6));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1020);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 021: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-10
+- Build shard: shard-0
+- Primary route: /api/workspaces/1021/apply
+- Editor session id: editor-4021
+- Search request id: q-90021
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:27.114Z INFO  request_store: begin request=q-90021 tenant=tenant-10
+2026-04-17T10:12:28.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:29.402Z INFO  build_queue: build accepted on shard-0 priority=2
+2026-04-17T10:12:30.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1021
+2026-04-17T10:12:31.612Z ERROR editor: stale diagnostics after apply request=q-90021
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-10",
+        workspaceId: 1021,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1021);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
+3. Editor diagnostics and symbol graph refresh become monotonic after reconnect.
+4. The fix remains safe under 32 concurrent apply requests and partial log flushes.
+5. Add tests for reconnect, retry, and lease handoff.
+
+Review checklist:
+- identify the likely ordering bug
+- propose the state transition change
+- list the exact files to edit
+- suggest a regression test matrix
+- call out any risk to streamed log ordering or latency
+
+### Coding Ticket 022: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-00
+- Build shard: shard-1
+- Primary route: /api/workspaces/1022/apply
+- Editor session id: editor-4022
+- Search request id: q-90022
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+-

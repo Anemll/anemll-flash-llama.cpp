@@ -726,6 +726,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_RESERVED_41] = {
+        .type_name                = "reserved",
+        .blck_size                = 1,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_F8_E4M3_B128] = {
+        .type_name                = "f8_e4m3_b128",
+        .blck_size                = QK_F8_E4M3_B128,
+        .type_size                = sizeof(block_f8_e4m3_b128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3_b128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_b128_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1054,10 +1068,19 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
+    "MUL_MAT_F16",
+    "FLASHMOE_SPLIT_GLU",
     "GLU",
+    "DSV4_HC_SPLIT_SINKHORN",
+    "DSV4_HC_WEIGHTED_SUM",
+    "DSV4_HC_EXPAND",
+    "DSV4_FP8_KV_QUANTIZE",
+    "DSV4_HADAMARD_FP4_QUANTIZE",
+    "DSV4_ROPE_TAIL",
+    "FLASHMOE_SLOT8_FFN",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1164,10 +1187,19 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
     "sgd(x)",
 
+    "mul_mat_f16(x,y)",
+    "flashmoe_split_glu(g,u,x)",
     "glu(x)",
+    "dsv4_hc_split_sinkhorn(x)",
+    "dsv4_hc_weighted_sum(x)",
+    "dsv4_hc_expand(x)",
+    "dsv4_fp8_kv_quantize(x)",
+    "dsv4_hadamard_fp4_quantize(x)",
+    "dsv4_rope_tail(x)",
+    "flashmoe_slot8_ffn(x,g,u,d)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1389,6 +1421,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4: wtype = GGML_TYPE_F8_E4M3_B128; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -3233,7 +3266,7 @@ struct ggml_tensor * ggml_mul_mat(
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_F16);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -6192,6 +6225,240 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// ggml_dsv4_hc_split_sinkhorn
+
+struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        int                   n_hc,
+        int                   sinkhorn_iters,
+        float                 eps) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes));
+    GGML_ASSERT(ggml_is_contiguous(scale));
+    GGML_ASSERT(ggml_is_contiguous(base));
+
+    GGML_ASSERT(n_hc > 0);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mixes->ne[0] == (2 + n_hc) * n_hc);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(scale) >= 3);
+    GGML_ASSERT(ggml_nelements(base)  >= mixes->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+
+    ggml_set_op_params_i32(result, 0, n_hc);
+    ggml_set_op_params_i32(result, 1, sinkhorn_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_SPLIT_SINKHORN;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_hc_weighted_sum
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(x->ne[1] == weights->ne[0]);
+    GGML_ASSERT(x->ne[2] == weights->ne[1]);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
+
+    result->op     = GGML_OP_DSV4_HC_WEIGHTED_SUM;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_hc_expand
+
+struct ggml_tensor * ggml_dsv4_hc_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(post->type      == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type      == GGML_TYPE_F32);
+
+    GGML_ASSERT(block_out->ne[0] == residual->ne[0]);
+    GGML_ASSERT(block_out->ne[1] == residual->ne[2]);
+    GGML_ASSERT(block_out->ne[2] == 1);
+    GGML_ASSERT(block_out->ne[3] == 1);
+    GGML_ASSERT(post->ne[0] == residual->ne[1]);
+    GGML_ASSERT(post->ne[1] == residual->ne[2]);
+    GGML_ASSERT(post->ne[2] == 1);
+    GGML_ASSERT(post->ne[3] == 1);
+    GGML_ASSERT(comb->ne[0] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[1] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[2] == residual->ne[2]);
+    GGML_ASSERT(comb->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, residual);
+
+    result->op     = GGML_OP_DSV4_HC_EXPAND;
+    result->src[0] = block_out;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_flashmoe_slot8_ffn
+
+struct ggml_tensor * ggml_flashmoe_slot8_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate_exps,
+        struct ggml_tensor  * up_exps,
+        struct ggml_tensor  * down_exps,
+        struct ggml_tensor  * slot_ids,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(slot_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type  == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t n_ff   = gate_exps->ne[1];
+    const int64_t n_used = slot_ids->ne[0];
+
+    // single-token decode fast path only
+    GGML_ASSERT(x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(slot_ids->ne[1] == 1);
+    GGML_ASSERT(gate_exps->ne[0] == n_embd);
+    GGML_ASSERT(up_exps->ne[0]   == n_embd);
+    GGML_ASSERT(ggml_are_same_shape(gate_exps, up_exps));
+    GGML_ASSERT(down_exps->ne[0] == n_ff);
+    GGML_ASSERT(down_exps->ne[1] == n_embd);
+    GGML_ASSERT(weights->ne[1] == n_used); // [1, n_expert_used, 1]
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+
+    result->op     = GGML_OP_FLASHMOE_SLOT8_FFN;
+    result->src[0] = x;
+    result->src[1] = gate_exps;
+    result->src[2] = up_exps;
+    result->src[3] = down_exps;
+    result->src[4] = slot_ids;
+    result->src[5] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_fp8_kv_quantize
+
+struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_rot) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_rot >= 0);
+    GGML_ASSERT(a->ne[0] > n_rot);
+    GGML_ASSERT((a->ne[0] - n_rot) % 64 == 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, n_rot);
+
+    result->op     = GGML_OP_DSV4_FP8_KV_QUANTIZE;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_dsv4_hadamard_fp4_quantize
+
+struct ggml_tensor * ggml_dsv4_hadamard_fp4_quantize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] > 0);
+    GGML_ASSERT((a->ne[0] & (a->ne[0] - 1)) == 0);
+    GGML_ASSERT(a->ne[0] % 32 == 0);
+    GGML_ASSERT(a->ne[0] <= 256);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_DSV4_HADAMARD_FP4_QUANTIZE;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_dsv4_rope_tail
+
+struct ggml_tensor * ggml_dsv4_rope_tail(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * freq_factors,
+        int                   n_dims,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        bool                  inverse) {
+    GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(pos));
+    GGML_ASSERT(a->ne[2] == pos->ne[0]);
+    GGML_ASSERT(n_dims > 0);
+    GGML_ASSERT(n_dims <= a->ne[0]);
+    GGML_ASSERT(n_dims % 2 == 0);
+
+    if (freq_factors) {
+        GGML_ASSERT(freq_factors->type == GGML_TYPE_F32);
+        GGML_ASSERT(freq_factors->ne[0] >= n_dims / 2);
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[16] = { n_dims, mode, n_ctx_orig, inverse ? 1 : 0 };
+    memcpy(params +  4, &freq_base,   sizeof(float));
+    memcpy(params +  5, &freq_scale,  sizeof(float));
+    memcpy(params +  6, &ext_factor,  sizeof(float));
+    memcpy(params +  7, &attn_factor, sizeof(float));
+    memcpy(params +  8, &beta_fast,   sizeof(float));
+    memcpy(params +  9, &beta_slow,   sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DSV4_ROPE_TAIL;
+    result->src[0] = a;
+    result->src[1] = pos;
+    result->src[2] = freq_factors;
+
+    return result;
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
@@ -6480,7 +6747,8 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
             }
         } break;
-        case GGML_OP_MUL_MAT: {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_F16: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
             // s0 = np.random.randn(5, 10)
@@ -6802,6 +7070,12 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_FLASHMOE_SPLIT_GLU: {
+            GGML_ABORT("backward pass not implemented for FLASHMOE_SPLIT_GLU");
+        } break;
+        case GGML_OP_FLASHMOE_SLOT8_FFN: {
+            GGML_ABORT("backward pass not implemented for FLASHMOE_SLOT8_FFN");
         } break;
         case GGML_OP_NONE: {
             // noop
@@ -7657,6 +7931,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_F8_E4M3_B128: result = quantize_f8_e4m3_b128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

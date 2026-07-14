@@ -321,6 +321,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_ubatch_index() const override;
+    uint32_t get_ubatch_count() const override;
 
     //
     // llama_kv_cache_context specific API

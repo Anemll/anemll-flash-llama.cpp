@@ -10,6 +10,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -48,7 +49,7 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(uint32_t n_tokens_hint = 0);
 
     void synchronize();
 
@@ -67,6 +68,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    const char * get_last_error() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -172,6 +174,9 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    bool flash_moe_progress_get(bool prefill, llama_flash_moe_progress_stats & out) const;
+    void flash_moe_prefill_progress_set(uint32_t current_batch, uint32_t total_batches, uint32_t total_tokens, uint32_t tokens_before_batch = 0);
+    void flash_moe_prefill_progress_clear();
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 
@@ -236,6 +241,9 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void clear_last_error();
+    void set_last_error(const std::string & err);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -269,6 +277,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+    std::string last_error;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -317,6 +326,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    uint32_t sched_reserved_n_tokens = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -328,8 +338,17 @@ private:
     ggml_threadpool_t threadpool_batch = nullptr;
 
     std::unique_ptr<llama_flash_moe_slot_runtime> flash_moe_slot_runtime;
+    std::unique_ptr<llm_flash_moe_slot_runtime_i> flash_moe_prefill_runtime;
+    mutable llm_flash_moe_slot_runtime_i * flash_moe_active_runtime = nullptr;
     ggml_backend_sched_eval_callback flash_moe_cb_eval_downstream = nullptr;
     void * flash_moe_cb_eval_downstream_user_data = nullptr;
+    struct flash_moe_prefill_progress_override_data {
+        bool active = false;
+        uint32_t current_batch = 0;
+        uint32_t total_batches = 0;
+        uint32_t total_tokens = 0;
+        uint32_t tokens_before_batch = 0;
+    } flash_moe_prefill_progress_override;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -357,12 +376,17 @@ private:
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;
     mutable int64_t t_eval_us   = 0;
+    mutable int64_t flash_moe_prefill_eval_us = 0;
+    mutable int64_t flash_moe_decode_eval_us  = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
+    mutable int32_t flash_moe_prefill_eval_tokens = 0;
+    mutable int32_t flash_moe_decode_eval_tokens  = 0;
+    int flash_moe_queued_eval_kind = 0;
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };

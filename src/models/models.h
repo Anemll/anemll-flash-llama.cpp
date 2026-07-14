@@ -190,6 +190,10 @@ struct llm_build_deepseek2 : public llm_graph_context {
     llm_build_deepseek2(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_deepseek4 : public llm_graph_context {
+    llm_build_deepseek4(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_deepseek : public llm_graph_context {
     llm_build_deepseek(const llama_model & model, const llm_graph_params & params);
 };
@@ -341,6 +345,10 @@ struct llm_build_hunyuan_dense : public llm_graph_context {
 
 struct llm_build_hunyuan_moe : public llm_graph_context {
     llm_build_hunyuan_moe(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_hy_v3 : public llm_graph_context {
+    llm_build_hy_v3(const llama_model & model, const llm_graph_params & params);
 };
 
 struct llm_build_internlm2 : public llm_graph_context {

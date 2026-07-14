@@ -143,3 +143,11 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+space_invaders.py
+AGENTS.md
+CONTRIBUTING.md
+pi-session-2026-04-19T16-04-34-588Z_019da67c-909c-746e-a081-01630a9e0c42.html
+tools/flashmoe-sidecar/prompts/coding/ane.txt
+tools/flashmoe-sidecar/prompts/coding/prefill-log.txt
+flashmoe-results/dsv4-topk-prompt-sweep/20260430-122237/summary.csv
+flashmoe-results/dsv4-topk-prompt-sweep/20260430-140117/summary.csv

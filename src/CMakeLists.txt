@@ -57,6 +57,7 @@ add_library(llama
             models/deci.cpp
             models/deepseek.cpp
             models/deepseek2.cpp
+            models/deepseek4.cpp
             models/delta-net-base.cpp
             models/dots1.cpp
             models/dream.cpp
@@ -84,6 +85,7 @@ add_library(llama
             models/grovemoe.cpp
             models/hunyuan-dense.cpp
             models/hunyuan-moe.cpp
+            models/hy-v3.cpp
             models/internlm2.cpp
             models/jais.cpp
             models/jais2.cpp

@@ -6,6 +6,10 @@ Flash-MoE inference for large GGUF Mixture-of-Experts models on Apple Silicon, u
 >
 > Flash-MoE-specific guide: [tools/flashmoe-sidecar/README.md](./tools/flashmoe-sidecar/README.md)
 >
+> MiniMax M2.7 note: [tools/flashmoe-sidecar/MINIMAX_M2.md](./tools/flashmoe-sidecar/MINIMAX_M2.md)
+>
+> Tencent HY V3 guide: [tools/flashmoe-sidecar/HY3.md](./tools/flashmoe-sidecar/HY3.md)
+>
 > Flash-MoE bank-modeling workflow: [docs/moe-bank-modeling-workflow.md](./docs/moe-bank-modeling-workflow.md)
 >
 > Native slot-bank model-porting guide: [docs/native-slot-bank-porting.md](./docs/native-slot-bank-porting.md)
@@ -20,16 +24,27 @@ Per-model extract + run recipes live in [tools/flashmoe-sidecar/README.md](./too
 | Qwen3.5-397B-A17B | qwen35moe (linear-attn) | Stable (slot-bank required) | [Extract](./tools/flashmoe-sidecar/README.md#extract-a-qwen35-sidecar) | [Run](./tools/flashmoe-sidecar/README.md#run-with-the-sidecar) |
 | Gemma4-26B-A4B | gemma4 | Stable | [Extract](./tools/flashmoe-sidecar/README.md#extract-a-gemma4-26b-a4b-sidecar) | [Run](./tools/flashmoe-sidecar/README.md#run-gemma4-26b-a4b-with-the-sidecar) |
 | Kimi K2 / K2.5 | deepseek2 (MLA) | Experimental | [Extract](./tools/flashmoe-sidecar/README.md#extract-only-selected-layers) | [Run](./tools/flashmoe-sidecar/README.md#estimate-persistent-bank-cost-and-coverage) |
+| MiniMax-M2.7 | minimax-m2 | Experimental (dense-package path) | [Export](./tools/flashmoe-sidecar/README.md#export-a-minimax-m27-flash-package) | [Run](./tools/flashmoe-sidecar/README.md#run-minimax-m27-with-flash-moe) |
+| Tencent HY V3 | hy_v3 | Experimental (dense + expert-major sidecar; fused `--slot4`/`--slot8`; [IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | [Export](./tools/flashmoe-sidecar/HY3.md#export-the-local-hy3-checkpoint) | [Run](./tools/flashmoe-sidecar/HY3.md#run-a-bounded-inference-smoke-test) |
 | **GLM-5.1 (256×22B)** | **glm-dsa (MLA + DSA indexer)** | **Experimental** | [**Extract**](./tools/flashmoe-sidecar/README.md#extract-a-glm-51-sidecar) | [**Run**](./tools/flashmoe-sidecar/README.md#run-glm-51-with-the-sidecar) |
+| **GLM-5.2 (256×22B)** | **glm-dsa (MLA + DSA indexer)** | **Experimental (+`--slot8` fused decode)** | [**Extract**](./tools/flashmoe-sidecar/README.md#extract-a-glm-52-sidecar) | [**Run**](./tools/flashmoe-sidecar/README.md#run-glm-52-with-the-sidecar) |
+| DeepSeek V4 / V4 Flash | deepseek4 (MLA + indexer) | Experimental (native HF→SSD) | [Export](./docs/flashmoe-layer-major-dedup-single-sidecar.md#deepseek-v4-native-hf-export-and-inference) | [Run](./docs/flashmoe-layer-major-dedup-single-sidecar.md#simple-inference-smoke-test) |
 
 Build instructions are below; once built, jump to the extract + run recipe for your model.
+
+A prebuilt GLM-5.2 `UD-IQ1_M` sidecar (dense GGUF + per-layer routed experts) is published at
+[`anemll/GLM-5.2-sidecar`](https://huggingface.co/anemll/GLM-5.2-sidecar).
 
 ## Current Model Support
 
 - **`Qwen3.5` GGUF MoE** is the current anchor path for bring-up and regression work. Stable.
 - **`Gemma4-26B-A4B`** GGUF MoE: stable. Native `n_expert_used = 8`. Sensitive to slot-bank size on smaller-memory machines — start with `--moe-slot-bank 8` or `16`.
 - **`Kimi-K2` and `Kimi-K2.5`** GGUF support is experimental: sidecar extraction, slot-bank runtime, trace capture, and bank modeling work, but quality and performance are still being tuned. Kimi currently requires `-ub 1` for correct output. The `-ngl 99` dense GPU path produces degraded output on some runs due to a Metal compute issue being investigated.
+- **`MiniMax-M2.7` (`minimax-m2`, 256 experts, native K=8)** is experimental but working in dense-package + slot-bank form on this branch. The checked `UD-IQ2_XXS` package was smoke-tested on M5 Max; use `MOE_TOPK=8` to match native routing width, or keep the wrapper default `MOE_TOPK=4` for lower expert I/O.
+- **`Tencent HY V3` (`hy_v3`, 192 experts, native K=8)** is experimental but working in dense/shared GGUF + expert-major sidecar form. The checked [`Hy3-IQ1_M.gguf`](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf) has one leading dense block followed by 79 routed layers. Slot-bank and fused Metal decode support both `--slot8` at native K=8 and `--slot4` with the reduced `--moe-topk 4` path; see the [Hy3 guide](./tools/flashmoe-sidecar/HY3.md).
 - **`GLM-5.1` (`glm-dsa`, 256×22B MoE)** is experimental: 79 layers, MLA attention with `q_lora_rank=2048`, DeepSeek-V3-style sigmoid routing (K=8 of 256), shared expert, and a per-layer DSA sparse-attention indexer. Slot-bank streaming works; the DSA indexer adds per-layer dense matmul overhead K2.5 doesn't have, and IQ1_M / IQ2_XXS `mul_mat_id` Metal kernels are not yet on the hot path. Realistic decode on M5 Max 128 GB is currently ~3.9 tok/s with `--moe-topk 4 --moe-prefetch-temporal --moe-slot-bank 64`. Shares the DeepSeek2 GPU-bank fallback path.
+- **`GLM-5.2` (`glm-dsa`, 256×22B MoE)** is the same family as GLM-5.1 with GLM-5.2 long-context RoPE (`context_length = 1048576`, `rope.freq_base = 8000000`) and the newer DSA IndexShare fields. This branch adds **`--slot8`**: a single-token decode fast path that fuses the whole routed FFN — gate, up, SwiGLU, down, and the routed weighted-sum over all selected experts — into one op (two IQ1_M Metal kernels), reading slot ids once at encode time so the per-expert `mul_mat_id` decode replay/ICB cache is not used. Output is validated byte-identical to the unfused path; toggle with `--slot8` / `--no-slot8` (or `LLAMA_FLASH_MOE_SLOT8_REFERENCE=1` for the reference path). Decode on M5 Max 128 GB with the `UD-IQ1_M` sidecar is ~2.2–2.5 tok/s and is SSD-I/O-bound on expert streaming. A prebuilt sidecar is on Hugging Face at [`anemll/GLM-5.2-sidecar`](https://huggingface.co/anemll/GLM-5.2-sidecar).
+- **`DeepSeek V4` / `DeepSeek V4 Flash` (`deepseek4`)** is experimental and brought up through the **native HF→SSD exporter** rather than the GGUF `flashmoe_sidecar.py` extract path (GGUFs tagged `deepseek2` that carry DeepSeek V4 Flash tensors are auto-routed to the `deepseek4` loader). Export, conversion, quantization-preservation, smoke-test, decode-probe, and server-mode recipes are in [docs/flashmoe-layer-major-dedup-single-sidecar.md](./docs/flashmoe-layer-major-dedup-single-sidecar.md#deepseek-v4-native-hf-export-and-inference).
 - The recommended build uses `-DLLAMA_FLASH_MOE_GPU_BANK=ON` (the default). In slot-bank mode, routed experts are **not** loaded into GPU memory — they stream from SSD. Use `-ngl 99` to offload dense/shared weights to GPU; the fitter clamps dense/shared placement against the routed slot-bank budget.
 - For Kimi/DeepSeek2/GLM-5.1, GPU-bank placement of routed experts is enabled by default in GPU-bank builds. Set `LLAMA_FLASH_MOE_DISABLE_UNSAFE_DEEPSEEK2_GPU_BANK=1` to force the host-backed slot-bank path if you hit hangs or memory pressure.
 
@@ -271,6 +286,58 @@ Dense and shared weights are offloaded to GPU via `-ngl 99` as usual.
 Routed experts are streamed from SSD on demand by the slot-bank runtime —
 only the K active experts per token are read, and recently-used experts
 are kept in a host-memory cache (sized by `--moe-slot-bank`).
+
+### MiniMax-M2.7 UD-IQ2_XXS (3-shard GGUF, 2.58 GiB dense + 58.3 GiB routed)
+
+MiniMax M2.7 currently uses the package workflow in this fork: extract routed experts into `sidecar/`, export dense/shared tensors into `model-dense.gguf`, then run the pair together.
+
+```bash
+# 1. Build the Flash-MoE package
+python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
+  --model ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS/MiniMax-M2.7-UD-IQ2_XXS-00001-of-00003.gguf \
+  --out-dir ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  --force
+
+# 2. Run on M5 Max with native MiniMax routing width (K=8)
+MOE_TOPK=8 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 128 \
+  -p "What is Apple Neural Engine? Answer in 3 sentences."
+
+# 3. M1 Max 64 GB (MOE_TOPK=4 for lower expert I/O, large slot bank)
+MOE_TOPK=4 MOE_SLOT_BANK=128 bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+# 4. Smaller-memory starting point for a 24 GB-class Apple Silicon machine
+MOE_TOPK=8 MOE_SLOT_BANK=32 CTX=2048 BATCH=32 UBATCH=1 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 96 \
+  -p "Summarize Apple Neural Engine in 3 sentences."
+
+# 5. Reproducible branch-to-branch comparison runs
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=4 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+
+LLAMA_BIN=/absolute/path/to/build/bin/llama-cli \
+MOE_TOPK=8 \
+SEED=123 \
+TEMP=0.2 \
+bash ./tools/flashmoe-sidecar/run_minimax_m2_flash.sh \
+  ~/Models/MiniMax-M2.7-GGUF/UD-IQ2_XXS-Flash \
+  -st -n 4096 \
+  -p "Make a game of Space Invaders in pygame"
+```
+
+Use `MOE_TOPK`, not sampler `--top-k`, to control MiniMax routed-expert width in Flash-MoE. The wrapper default `MOE_TOPK=4` is speed-oriented; use `MOE_TOPK=8` for model-default routing width. For branch-to-branch comparisons, pin `LLAMA_BIN`, `SEED`, `TEMP`, prompt, and `-n`. See [tools/flashmoe-sidecar/MINIMAX_M2.md](./tools/flashmoe-sidecar/MINIMAX_M2.md) for the detailed export/inference notes and slot-bank sizing guidance.
 
 ### Troubleshooting: Trace and Log Output
 

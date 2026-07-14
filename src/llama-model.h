@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -259,6 +260,15 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    struct ggml_tensor * attn_kv   = nullptr;
+    struct ggml_tensor * attn_wo_a = nullptr;
+    struct ggml_tensor * attn_wo_b = nullptr;
+
+    // DeepSeek V4 compressed attention
+    struct ggml_tensor * attn_compressor_ape  = nullptr;
+    struct ggml_tensor * attn_compressor_kv   = nullptr;
+    struct ggml_tensor * attn_compressor_gate = nullptr;
+    struct ggml_tensor * attn_compressor_norm = nullptr;
 
     // attention bias
     struct ggml_tensor * bq   = nullptr;
@@ -331,6 +341,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -472,6 +483,18 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // DeepSeek V4 compressed indexer + hyper-connections
+    struct ggml_tensor * indexer_compressor_ape  = nullptr;
+    struct ggml_tensor * indexer_compressor_kv   = nullptr;
+    struct ggml_tensor * indexer_compressor_gate = nullptr;
+    struct ggml_tensor * indexer_compressor_norm = nullptr;
+    struct ggml_tensor * hc_attn_base            = nullptr;
+    struct ggml_tensor * hc_attn_fn              = nullptr;
+    struct ggml_tensor * hc_attn_scale           = nullptr;
+    struct ggml_tensor * hc_ffn_base             = nullptr;
+    struct ggml_tensor * hc_ffn_fn               = nullptr;
+    struct ggml_tensor * hc_ffn_scale            = nullptr;
+
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -507,6 +530,9 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+    struct ggml_tensor * output_hc_base  = nullptr;
+    struct ggml_tensor * output_hc_fn    = nullptr;
+    struct ggml_tensor * output_hc_scale = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
@@ -526,6 +552,8 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
+
+    std::unordered_map<std::string, struct ggml_tensor *> flash_moe_prefill_scratch_tensors;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
@@ -590,13 +618,42 @@ struct llama_model {
     bool flash_moe_oracle_all_hit_enabled() const;
     bool flash_moe_oracle_prefetch_enabled() const;
     bool flash_moe_temporal_prefetch_enabled() const;
+    bool flash_moe_temporal_prefetch_sparse_enabled() const;
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
+    int32_t flash_moe_fused_slot_expert_count() const;
+    const char * flash_moe_predictor_path() const;
+    int32_t flash_moe_predictor_prefetch_topk() const;
+    bool flash_moe_secondary_sidecar_enabled() const;
+    bool flash_moe_tertiary_sidecar_enabled() const;
+    bool flash_moe_demand_stripe_enabled() const;
+    bool flash_moe_demand_distribute_enabled() const;
+    bool flash_moe_demand_concurrent_enabled() const;
+    bool flash_moe_prefill_stripe_enabled() const;
+    bool flash_moe_prefill_distribute_enabled() const;
+    bool flash_moe_prefetch_stripe_enabled() const;
+    bool flash_moe_prefetch_distribute_enabled() const;
+    bool flash_moe_prefill_layer_major_enabled() const;
+    bool flash_moe_prefill_next_hot_exclusive_drives_enabled() const;
     int32_t flash_moe_slot_bank_size() const;
+    int32_t flash_moe_prefill_banks() const;
+    int32_t flash_moe_prefill_next_hot_experts() const;
     int32_t flash_moe_cache_io_split() const;
+    int32_t flash_moe_prefill_cache_io_split() const;
+    int32_t flash_moe_prefetch_cache_io_split() const;
+    std::array<int32_t, 3> flash_moe_demand_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_demand_distribute_weights() const;
+    std::array<int32_t, 3> flash_moe_prefill_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_prefill_distribute_weights() const;
+    std::array<int32_t, 3> flash_moe_prefetch_stripe_weights() const;
+    std::array<int32_t, 3> flash_moe_prefetch_distribute_weights() const;
     int32_t moe_n_expert_used() const;
     const char * flash_moe_trace_file() const;
     const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_prefetch_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_secondary_sidecar_entry_for(const char * name) const;
+    const llama_flash_moe_sidecar_entry * flash_moe_tertiary_sidecar_entry_for(const char * name) const;
+    struct ggml_tensor * flash_moe_prefill_scratch_tensor_for(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -628,6 +685,8 @@ struct llama_flash_moe_sidecar_entry {
     size_t                          repacked_offset   = 0;
     size_t                          exact_byte_length = 0;
     size_t                          bytes_per_expert  = 0;
+    size_t                          expert_stride     = 0;
+    bool                            expert_major      = false;
 };
 
 // For internal test use

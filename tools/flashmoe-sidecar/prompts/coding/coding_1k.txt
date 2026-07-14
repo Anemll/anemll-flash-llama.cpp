@@ -1,0 +1,101 @@
+You are debugging a large codebase. Read the repository notes, the bug tickets, and the failing tests. Focus on race conditions, ordering issues, incremental indexing, and streamed RPC behavior.
+
+Repository overview:
+This benchmark prompt describes a moderately large coding assistant backend with a web IDE, build queue, code search, and streamed traces.
+
+Important modules:
+01. server/auth/session_cache.ts - session cache invalidation and tenant-scoped auth
+02. server/jobs/build_queue.ts - bounded build scheduler with retry backoff
+03. server/jobs/log_mux.ts - interleaved job log fan-in and chunk flushing
+04. server/repos/git_indexer.ts - repository scan and incremental file fingerprinting
+05. server/search/symbol_graph.ts - symbol edges, reverse references, and path ranking
+06. server/search/query_planner.ts - heuristics for code search terms and fallback regex
+07. server/rpc/ws_transport.ts - streamed RPC frames and reconnect handling
+08. server/rpc/request_store.ts - request lifecycle and timeout accounting
+09. shared/config/runtime_flags.ts - feature flags and staged rollout rules
+10. shared/config/workspace_limits.ts - token, memory, and concurrency limits
+11. apps/web/src/routes/editor.tsx - editor route, file tabs, and diagnostics panel
+12. apps/web/src/routes/search.tsx - search results grouping and ranking badges
+13. apps/web/src/components/diff_view.tsx - split diff renderer and fold state
+14. apps/web/src/components/trace_table.tsx - runtime trace table with sticky filters
+15. apps/web/src/lib/fetch_json.ts - typed fetch wrapper with retry budget
+16. apps/web/src/lib/use_stream.ts - stream reader and backpressure aware hooks
+
+### Coding Ticket 001: inconsistent streamed patch apply under retry pressure
+
+Context:
+- Active tenant: tenant-01
+- Build shard: shard-1
+- Primary route: /api/workspaces/1001/apply
+- Editor session id: editor-4001
+- Search request id: q-90001
+
+Problem statement:
+Users report that a streamed patch can succeed in the UI but still leave the repository index stale.
+The failure usually happens after a reconnect or after two fast retries from the browser.
+The issue is not deterministic; it appears when log chunks, repo indexing, and websocket acks overlap.
+
+Files most likely involved:
+- server/jobs/build_queue.ts
+- server/repos/git_indexer.ts
+- server/rpc/ws_transport.ts
+- shared/config/runtime_flags.ts
+- apps/web/src/routes/editor.tsx
+- apps/web/src/components/diff_view.tsx
+
+Relevant code sketch:
+```ts
+export async function applyPatchAndRefresh(ctx: RequestContext, patch: PatchChunk[]) {
+    const requestId = ctx.requestId;
+    await queueBuild({
+        tenantId: ctx.tenantId,
+        requestId,
+        onLog(line) {
+            ctx.stream.write({ type: "log", line });
+        },
+    });
+
+    await repoIndexer.refreshWorkspace(ctx.workspaceId, {
+        requestId,
+        eagerSymbols: ctx.flags.eagerSymbols,
+        maxChangedFiles: ctx.flags.maxChangedFiles,
+    });
+
+    return {
+        requestId,
+        refreshedAt: Date.now(),
+        changedFiles: patch.length,
+    };
+}
+```
+
+Observed failure details:
+```text
+2026-04-17T10:12:07.114Z INFO  request_store: begin request=q-90001 tenant=tenant-01
+2026-04-17T10:12:08.229Z WARN  ws_transport: duplicate ack sequence=2
+2026-04-17T10:12:09.402Z INFO  build_queue: build accepted on shard-1 priority=2
+2026-04-17T10:12:10.516Z WARN  git_indexer: refresh skipped due to active lease workspace=1001
+2026-04-17T10:12:11.612Z ERROR editor: stale diagnostics after apply request=q-90001
+```
+
+Minimal failing test:
+```ts
+it("refreshes the workspace index after a streamed patch even if the websocket reconnects", async () => {
+    const ctx = createTestRequestContext({
+        tenantId: "tenant-01",
+        workspaceId: 1001,
+        flags: { eagerSymbols: true, maxChangedFiles: 64 },
+    });
+
+    wsTransport.injectReconnect(ctx.sessionId);
+    await applyPatchAndRefresh(ctx, makePatchChunks(7));
+
+    expect(repoIndexer.lastRefresh?.workspaceId).toBe(1001);
+    expect(repoIndexer.lastRefresh?.requestId).toBe(ctx.requestId);
+    expect(editorState(ctx.workspaceId).diagnostics.stale).toBe(false);
+});
+```
+
+Acceptance criteria:
+1. Duplicate websocket acknowledgements do not suppress the repository refresh.
+2. The build queue never clears the request state before the indexer observes the final patch result.
