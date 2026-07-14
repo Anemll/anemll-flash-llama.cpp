@@ -131,6 +131,19 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_prefill_batch == 32768);
 
+    params.slot4 = false;
+    params.slot8 = false;
+    argv = {"binary_name", "--slot4", "--moe-topk", "4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.slot4);
+    assert(!params.slot8);
+    assert(params.moe_topk_override == 4);
+
+    argv = {"binary_name", "--slot8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!params.slot4);
+    assert(params.slot8);
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--draft", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

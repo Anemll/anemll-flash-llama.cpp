@@ -2373,11 +2373,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXCLUSIVE_DRIVES"));
     add_opt(common_arg(
+        {"--slot4"},
+        {"--no-slot4"},
+        string_format("Flash-MoE: collapse an effective top-4 routed-expert FFN into the fused Metal operator (gate/up/swiglu/down/weighted-sum over 4 experts), bypassing the per-expert decode replay/ICB cache; use with --moe-topk 4 (default: %s)", params.slot4 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot4 = value;
+            if (value) {
+                params.slot8 = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT4"));
+    add_opt(common_arg(
         {"--slot8"},
         {"--no-slot8"},
         string_format("Flash-MoE: collapse a top-8 routed-expert FFN into a single fused Metal kernel (gate/up/swiglu/down/weighted-sum over all 8 experts), bypassing the per-expert decode replay/ICB cache; only engages on eligible layers, otherwise falls back to the normal slot-bank path (default: %s)", params.slot8 ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.slot8 = value;
+            if (value) {
+                params.slot4 = false;
+            }
         }
     ).set_env("LLAMA_ARG_SLOT8"));
     add_opt(common_arg(

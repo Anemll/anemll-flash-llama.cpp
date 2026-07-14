@@ -883,7 +883,7 @@ public:
               resident_bank_source(!transient_shared_scratch && model.flash_moe_resident_source_enabled()),
               oracle_all_hit(!transient_shared_scratch && model.flash_moe_oracle_all_hit_enabled()),
               oracle_prefetch(!transient_shared_scratch && model.flash_moe_oracle_prefetch_enabled()),
-              slot8_enabled(model.flash_moe_slot8_enabled()),
+              fused_slot_experts(model.flash_moe_fused_slot_expert_count()),
               temporal_prefetch(!transient_shared_scratch && model.flash_moe_temporal_prefetch_enabled()),
               temporal_prefetch_sparse(!transient_shared_scratch && model.flash_moe_temporal_prefetch_sparse_enabled()),
               predict_prev_token(!transient_shared_scratch && model.flash_moe_predict_prev_token_enabled()),
@@ -1179,14 +1179,14 @@ public:
 
     bool uses_native_slot_map(int layer) const override {
         return uses_layer(layer) &&
-                (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2) &&
+                (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_HY_V3) &&
                 !native_slot_map_disabled();
     }
 
-    bool uses_slot8_fused(int layer) const override {
+    int32_t fused_slot_expert_count(int layer) const override {
         // Runtime-level opt-in only; build_moe_ffn checks the graph-shape requirements
-        // (merged gate_up, swiglu, top-8, weight-after-down, no expert bias/scale).
-        return slot8_enabled && uses_layer(layer);
+        // and requires the effective top-K to match this requested width.
+        return uses_layer(layer) ? fused_slot_experts : 0;
     }
 
     bool uses_dedicated_prefill_moe(int layer) const override {
@@ -1221,6 +1221,7 @@ public:
             case LLM_ARCH_DEEPSEEK2:
             case LLM_ARCH_DEEPSEEK4:
             case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_HY_V3:
                 return separate_gate_up_down;
             case LLM_ARCH_GEMMA4:
                 return merged_gate_up_down;
@@ -2268,7 +2269,7 @@ private:
     bool resident_full_bank_pending = false;
     bool oracle_all_hit = false;
     bool oracle_prefetch = false;
-    bool slot8_enabled = false;
+    int32_t fused_slot_experts = 0;
     bool temporal_prefetch = false;
     bool temporal_prefetch_sparse = false;
     bool temporal_prefetch_sparse_even_layers = true;
@@ -9527,6 +9528,7 @@ private:
             case LLM_ARCH_GLM_DSA:
             case LLM_ARCH_DEEPSEEK2:
             case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_HY_V3:
                 return separate_gate_up_down;
             case LLM_ARCH_GEMMA4:
                 return merged_gate_up_down;
@@ -14246,7 +14248,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(n_tokens * 160, 96u * model.n_tensors());
     }
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_HY_V3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());

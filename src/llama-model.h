@@ -621,7 +621,7 @@ struct llama_model {
     bool flash_moe_temporal_prefetch_sparse_enabled() const;
     bool flash_moe_predict_prev_token_enabled() const;
     bool flash_moe_predict_top1_prev_enabled() const;
-    bool flash_moe_slot8_enabled() const;
+    int32_t flash_moe_fused_slot_expert_count() const;
     const char * flash_moe_predictor_path() const;
     int32_t flash_moe_predictor_prefetch_topk() const;
     bool flash_moe_secondary_sidecar_enabled() const;

@@ -31,13 +31,14 @@ static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
     return enabled == 1;
 }
 
-static bool llama_flash_moe_slot8_debug_enabled() {
-    static int enabled = -1;
-    if (enabled == -1) {
-        const char * value = getenv("LLAMA_FLASH_MOE_SLOT8_DEBUG");
-        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
-    }
-    return enabled == 1;
+static bool llama_flash_moe_fused_slot_debug_enabled(int32_t expert_count) {
+    const char * common = getenv("LLAMA_FLASH_MOE_FUSED_SLOT_DEBUG");
+    const char * width_specific = getenv(expert_count == 4 ?
+            "LLAMA_FLASH_MOE_SLOT4_DEBUG" : "LLAMA_FLASH_MOE_SLOT8_DEBUG");
+    const auto enabled = [](const char * value) {
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    };
+    return enabled(common) || enabled(width_specific);
 }
 
 static bool llama_flash_attn_debug_enabled() {
@@ -1631,15 +1632,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    // --slot8 eligibility: the fused single-kernel top-8 FFN handles exactly the GLM-5.2
-    // routed shape — separate gate/up expert matmuls, SwiGLU, top-8, routed weights applied
+    // --slot4/--slot8 eligibility: the fused operator handles the routed shape with
+    // separate gate/up expert matmuls, SwiGLU, an exact requested top-K, routed weights applied
     // after the down projection, and no per-expert bias/scale tensors. Any layer that does not
     // match falls through to the existing per-expert slot-bank path.
-    const bool slot8_eligible =
+    const int32_t fused_slot_experts = flash_moe_slot_runtime != nullptr ?
+            flash_moe_slot_runtime->fused_slot_expert_count(il) : 0;
+    const bool fused_slot_eligible =
             flash_moe_slot_runtime != nullptr &&
-            flash_moe_slot_runtime->uses_slot8_fused(il) &&
+            (fused_slot_experts == 4 || fused_slot_experts == 8) &&
             n_tokens == 1 &&             // single-token decode fast path only
-            n_expert_used >= 1 && n_expert_used <= 32 && // any routed top-k (kernels loop n_used)
+            n_expert_used == fused_slot_experts &&
             type_op == LLM_FFN_SILU &&
             gate_up_exps == nullptr &&   // separate gate/up path (merged gate_up unsupported here)
             gate_exps != nullptr &&      // gated SwiGLU with a distinct gate matmul
@@ -1649,9 +1652,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             !weight_before_down &&       // routed weights applied after the down projection
             gate_exps_b == nullptr && up_exps_b == nullptr && down_exps_b == nullptr && // no expert bias
             gate_exps_s == nullptr && up_exps_s == nullptr && down_exps_s == nullptr;   // no per-expert scale2
-    if (slot8_eligible && llama_flash_moe_slot8_debug_enabled()) {
-        fprintf(stderr, "%s: slot8 eligible layer=%d n_expert_used=%lld n_embd=%lld\n",
-                __func__, il, (long long) n_expert_used, (long long) n_embd);
+    if (fused_slot_eligible && llama_flash_moe_fused_slot_debug_enabled(fused_slot_experts)) {
+        fprintf(stderr, "%s: slot%d eligible layer=%d n_expert_used=%lld n_embd=%lld\n",
+                __func__, fused_slot_experts, il, (long long) n_expert_used, (long long) n_embd);
     }
 
     //call early so that topk-moe can be used
@@ -1659,8 +1662,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    if (slot8_eligible) {
-        // Fuse the whole routed FFN (gate/up/swiglu/down + weighted sum over all 8 experts)
+    if (fused_slot_eligible) {
+        // Fuse the whole routed FFN (gate/up/swiglu/down + weighted sum over selected experts)
         // into a single op. slot ids index the resident slot-bank weight tensors directly;
         // there is no per-expert graph node and no mul_mat_id decode replay/ICB cache here.
         ggml_tensor * moe_out = ggml_flashmoe_slot8_ffn(

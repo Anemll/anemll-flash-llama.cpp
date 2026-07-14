@@ -2514,7 +2514,9 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // --slot8: fused single-token routed MoE FFN over all selected experts.
+    // --slot4/--slot8: fused single-token routed MoE FFN over all selected experts.
+    // The historical slot8 function name is retained for ABI compatibility; n_used
+    // determines whether four or eight experts are consumed by the Metal operator.
     //   gate_exps/up_exps: [n_embd, n_ff, n_slots], down_exps: [n_ff, n_embd, n_slots]
     //   slot_ids: [n_expert_used, 1] I32 (resident slot indices), weights: [1, n_expert_used, 1] F32
     //   result:  [n_embd, 1] F32  =  sum_e weights[e] * down_e( silu(gate_e . x) * (up_e . x) )

@@ -347,6 +347,10 @@ struct llm_build_hunyuan_moe : public llm_graph_context {
     llm_build_hunyuan_moe(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_hy_v3 : public llm_graph_context {
+    llm_build_hy_v3(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_internlm2 : public llm_graph_context {
     llm_build_internlm2(const llama_model & model, const llm_graph_params & params);
 };

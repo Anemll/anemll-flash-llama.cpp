@@ -548,7 +548,7 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
     bool flash_moe_slot_bank_enabled = false;
-    bool flash_moe_slot8_enabled = false;
+    int32_t flash_moe_fused_slot_expert_count = 0;
     bool flash_moe_resident_source_enabled = false;
     bool flash_moe_oracle_all_hit_enabled = false;
     bool flash_moe_oracle_prefetch_enabled = false;
@@ -817,10 +817,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
             pimpl->flash_moe_oracle_all_hit_enabled ||
             pimpl->flash_moe_oracle_prefetch_enabled;
     pimpl->flash_moe_trace_file = params.moe_trace_file ? params.moe_trace_file : "";
-    // --slot8 only has meaning when the routed slot-bank runtime is active; the fused
-    // kernel consumes slot-mapped expert weights, and per-layer eligibility is checked
-    // later in build_moe_ffn (top-8 + merged gate_up + swiglu, etc.).
-    pimpl->flash_moe_slot8_enabled = params.slot8 && pimpl->flash_moe_slot_bank_enabled;
+    if (params.slot4 && params.slot8) {
+        throw std::invalid_argument("Flash-MoE --slot4 and --slot8 are mutually exclusive");
+    }
+    // The fused operator consumes slot-mapped expert weights. Graph-shape and exact
+    // effective top-K eligibility are checked later in build_moe_ffn.
+    if (pimpl->flash_moe_slot_bank_enabled) {
+        pimpl->flash_moe_fused_slot_expert_count = params.slot4 ? 4 : (params.slot8 ? 8 : 0);
+    }
 }
 
 llama_model::~llama_model() {
@@ -2950,6 +2954,24 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 4096: type = LLM_TYPE_7B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_HY_V3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                hparams.n_layer_dense_lead = 1;
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+
+                // HY V3 uses sigmoid routing with an expert-selection bias.
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+                }
+
+                type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_SMOLLM3:
             {
@@ -7960,6 +7982,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                     }
                 } break;
+            case LLM_ARCH_HY_V3:
+                {
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (output == nullptr) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk        = create_tensor(tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_k_gqa}, 0);
+                        layer.wv        = create_tensor(tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_v_gqa}, 0);
+                        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.ffn_norm    = create_tensor(tn(LLM_TENSOR_FFN_NORM,    "weight", i), {n_embd}, 0);
+
+                        const auto router_name = tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str();
+                        const bool is_moe_layer = ml.get_tensor_meta(router_name.c_str()) != nullptr;
+                        if (!is_moe_layer) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                            continue;
+                        }
+
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+
+                        // Upstream changed this tensor from blk.N.exp_probs_b.bias to
+                        // blk.N.exp_probs_b. Accept both so existing HY V3 GGUFs load.
+                        const auto router_bias_name = tn(LLM_TENSOR_FFN_EXP_PROBS_B, i).str();
+                        if (ml.get_tensor_meta(router_bias_name.c_str()) != nullptr) {
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
+                        } else {
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                        }
+
+                        layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp, n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
+
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd}, 0);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, 0);
+                    }
+                } break;
             case LLM_ARCH_SMOLLM3:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -9624,8 +9698,8 @@ bool llama_model::flash_moe_slot_bank_enabled() const {
     return pimpl->flash_moe_slot_bank_enabled;
 }
 
-bool llama_model::flash_moe_slot8_enabled() const {
-    return pimpl->flash_moe_slot8_enabled;
+int32_t llama_model::flash_moe_fused_slot_expert_count() const {
+    return pimpl->flash_moe_fused_slot_expert_count;
 }
 
 bool llama_model::flash_moe_resident_source_enabled() const {
@@ -10436,6 +10510,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_hunyuan_dense>(*this, params);
             } break;
+        case LLM_ARCH_HY_V3:
+            {
+                llm = std::make_unique<llm_build_hy_v3>(*this, params);
+            } break;
         case LLM_ARCH_SMOLLM3:
             {
                 llm = std::make_unique<llm_build_smollm3>(*this, params);
@@ -10589,6 +10667,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_predictor_prefetch_topk =*/ 0,
         /*.moe_demand_concurrent       =*/ false,
         /*.slot8                       =*/ false,
+        /*.slot4                       =*/ false,
     };
 
     return result;
@@ -10783,6 +10862,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JAIS2:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_HUNYUAN_DENSE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:

@@ -9912,7 +9912,7 @@ kernel void kernel_mul_mv_iq1_m_f32(
     kernel_mul_mv_iq1_m_f32_impl<N_R0_IQ1_M, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-// --slot8 fused routed MoE FFN (IQ1_M weights).
+// --slot4/--slot8 fused routed MoE FFN (IQ1_M weights; width comes from n_used).
 //
 // iq1m_dot_row: dot product of one IQ1_M weight row (ne00 elements = ne00/QK_K blocks) with an
 // f32 activation vector y[ne00], reduced across one simdgroup. Mirrors the per-block dequant of

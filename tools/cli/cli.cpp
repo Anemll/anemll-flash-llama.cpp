@@ -953,6 +953,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  prefill-next-hot-exclusive-drives = %s\n",
                 params.moe_prefill_next_hot_exclusive_drives ? "on" : "off");
         fprintf(stderr, "  topk-override    = %d\n", params.moe_topk_override);
+        fprintf(stderr, "  fused-experts    = %d\n", params.slot4 ? 4 : (params.slot8 ? 8 : 0));
         fprintf(stderr, "  cache-io-split   = %d\n", params.moe_cache_io_split);
         fprintf(stderr, "  prefetch-cache-io-split = %d%s\n",
                 params.moe_prefetch_cache_io_split > 0 ? params.moe_prefetch_cache_io_split : params.moe_cache_io_split,

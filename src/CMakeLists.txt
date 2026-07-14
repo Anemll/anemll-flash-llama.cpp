@@ -85,6 +85,7 @@ add_library(llama
             models/grovemoe.cpp
             models/hunyuan-dense.cpp
             models/hunyuan-moe.cpp
+            models/hy-v3.cpp
             models/internlm2.cpp
             models/jais.cpp
             models/jais2.cpp

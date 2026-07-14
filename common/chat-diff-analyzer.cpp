@@ -186,6 +186,7 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
     LOG_DBG("per_call_end: '%s'\n", tools.format.per_call_end.c_str());
     LOG_DBG("func_name_prefix: '%s'\n", tools.function.name_prefix.c_str());
     LOG_DBG("func_name_suffix: '%s'\n", tools.function.name_suffix.c_str());
+    LOG_DBG("func_args_separator: '%s'\n", tools.function.args_separator.c_str());
     LOG_DBG("func_close: '%s'\n", tools.function.close.c_str());
     LOG_DBG("arg_name_prefix: '%s'\n", tools.arguments.name_prefix.c_str());
     LOG_DBG("arg_name_suffix: '%s'\n", tools.arguments.name_suffix.c_str());
@@ -224,6 +225,7 @@ void autoparser::collect_preserved_tokens() {
     add_token(tools.format.per_call_end);
     add_token(tools.function.name_prefix);
     add_token(tools.function.name_suffix);
+    add_token(tools.function.args_separator);
     add_token(tools.function.close);
     add_token(tools.arguments.start);
     add_token(tools.arguments.end);
@@ -780,6 +782,23 @@ void analyze_tools::check_per_call_markers() {
         format.section_start.clear();
         format.section_end.clear();
     }
+
+    if (!format.per_call_end.empty()) {
+        auto count_occurrences = [](const std::string & haystack, const std::string & needle) {
+            size_t count = 0;
+            for (size_t pos = haystack.find(needle); pos != std::string::npos;
+                 pos = haystack.find(needle, pos + needle.size())) {
+                count++;
+            }
+            return count;
+        };
+        size_t calls_one = count_occurrences(one_vs_two->output_A, format.per_call_end);
+        size_t calls_two = count_occurrences(one_vs_two->output_B, format.per_call_end);
+        if (calls_one > 0 && calls_one == calls_two) {
+            format.section_end = format.per_call_end;
+            format.per_call_end.clear();
+        }
+    }
 }
 
 void analyze_tools::extract_function_markers() {
@@ -861,6 +880,17 @@ void analyze_tools::extract_function_markers() {
             auto suf_result = suffix_parser.parse_and_extract(diff.suffix);
             if (suf_result.result.success()) {
                 function.name_suffix += suf_result.tags["ext"];
+
+                auto arg_start = [&](common_peg_parser_builder &p) {
+                    return p.marker() + p.space() + p.choice({ p.literal(ARG_FIRST), p.literal(ARG_SECOND) });
+                };
+                auto sep_parser = build_tagged_peg_parser([&](common_peg_parser_builder &p) {
+                    return p.tag("sep", p.zero_or_more(p.negate(arg_start(p)) + p.any())) + arg_start(p);
+                });
+                auto sep_result = sep_parser.parse_and_extract(diff.suffix.substr(suf_result.tags["ext"].size()));
+                if (sep_result.result.success()) {
+                    function.args_separator = trim_whitespace(sep_result.tags["sep"]);
+                }
             }
         }
 

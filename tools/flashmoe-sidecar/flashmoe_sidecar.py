@@ -278,6 +278,9 @@ def build_tensor_index(
     expert_count = reader_scalar(first_reader, f"{arch}.expert_count")
     expert_used_count = reader_scalar(first_reader, f"{arch}.expert_used_count")
     leading_dense = reader_scalar(first_reader, f"{arch}.leading_dense_block_count")
+    if arch == "hy_v3" and leading_dense is None:
+        # Early HY V3 conversions omitted this key, although blk.0 is dense.
+        leading_dense = 1
 
     tensors: dict[str, dict[str, Any]] = {}
     for shard_index, (path, reader) in enumerate(zip(model_paths, readers)):

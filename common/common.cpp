@@ -1445,6 +1445,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_cache_io_split = params.moe_cache_io_split;
     mparams.moe_prefill_cache_io_split = params.moe_prefill_cache_io_split;
     mparams.moe_prefetch_cache_io_split = params.moe_prefetch_cache_io_split;
+    mparams.slot4 = params.slot4;
     mparams.slot8 = params.slot8;
 
     if (params.kv_overrides.empty()) {

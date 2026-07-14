@@ -28,6 +28,7 @@ Per-model extract + run recipes in this document:
 | Gemma4-26B-A4B | gemma4 | [Extract](#extract-a-gemma4-26b-a4b-sidecar) | [Run](#run-gemma4-26b-a4b-with-the-sidecar) |
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
+| Tencent HY V3 ([IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | hy_v3 | [Export](#export-a-tencent-hy-v3-flash-package) | [Run](#export-a-tencent-hy-v3-flash-package) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 | **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
 
@@ -42,6 +43,7 @@ Per-model extract + run recipes in this document:
   - `oracle-prefetch`
 - Manifest layout implemented here:
   - `layer_major_whole_tensor`
+  - `layer_major_expert` (expert-major family slices)
 - Future work still not implemented end-to-end:
   - dynamic quant bank switching
 
@@ -130,6 +132,68 @@ python3 ./tools/flashmoe-sidecar/minimax_m2_prepare.py \
 ```
 
 For more background and sizing notes, see [`MINIMAX_M2.md`](./MINIMAX_M2.md).
+
+## Export a Tencent HY V3 Flash package
+
+HY V3 uses one leading dense block followed by routed MoE blocks with separate
+gate/up/down weights. The preparation helper writes an expert-major routed
+sidecar plus `model-dense.gguf` and validates sidecar metadata before returning.
+Its defaults match the local HY V3 source and destination paths; both remain
+overridable.
+
+See [`HY3.md`](./HY3.md) for the complete export, verification, inference, fused
+slot4/slot8, and troubleshooting workflow.
+
+```bash
+uv run --no-project --with pyyaml --with numpy \
+  python ./tools/flashmoe-sidecar/hy3_prepare.py --force
+```
+
+Generic form:
+
+```bash
+uv run --no-project --with pyyaml --with numpy \
+  python ./tools/flashmoe-sidecar/hy3_prepare.py \
+  --model /path/to/Hy3.gguf \
+  --out-dir /path/to/Hy3-Flash \
+  --force
+```
+
+The native HY V3 route width is eight. A minimal decode run therefore needs at
+least eight slots and `-ub 1`. `--slot8` enables the fused single-token routed
+FFN path used by the IQ1_M package:
+
+```bash
+./build/bin/llama-cli \
+  -m /path/to/Hy3-Flash/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /path/to/Hy3-Flash/sidecar \
+  --moe-slot-bank 8 --moe-topk 8 --slot8 \
+  -fit on -ub 1 -b 1 -ngl 999 -c 128 \
+  --no-warmup -st -p "Hello" -n 2
+```
+
+To reduce routed compute and I/O to four experts per token, select the matching
+four-expert fused mode:
+
+```bash
+./build/bin/llama-cli \
+  -m /path/to/Hy3-Flash/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar /path/to/Hy3-Flash/sidecar \
+  --moe-slot-bank 4 --moe-topk 4 --slot4 \
+  -fit on -ub 1 -b 1 -ngl 999 -c 128 \
+  --no-warmup -st -p "Hello" -n 2
+```
+
+For long-context Hy3 runs, quantize both K and V caches and enable Flash
+Attention: `-fa on -ctk q8_0 -ctv q8_0`. Unlike DeepSeek V4's K-backed MLA
+cache, Hy3 allocates separate K and V caches, so quantizing only K leaves a
+substantial part of its cache at the default precision. `--slot4` versus
+`--slot8` changes routed-expert execution and useful slot-bank capacity, not
+KV-cache size. DeepSeek V4 users should also avoid `--swa-full` when minimizing
+memory. See [Hy3 KV-cache memory notes](./HY3.md#kv-cache-memory-notes) for the
+detailed explanation.
 
 ## Export a dense-only GGUF (experimental)
 

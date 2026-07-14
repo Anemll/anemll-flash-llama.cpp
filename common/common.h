@@ -679,6 +679,7 @@ struct common_params {
     bool        moe_router_only = false; // keep routing/topk, bypass routed expert matmuls           // NOLINT
     bool        moe_sort_decode_expert_ids = false; // sort single-token routed decode experts by id // NOLINT
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
+    bool        slot4 = false;           // fused single-kernel top-4 routed-expert FFN (Metal)         // NOLINT
     bool        slot8 = false;           // fused single-kernel top-8 routed-expert FFN (Metal)         // NOLINT
 
     // retrieval params
