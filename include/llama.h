@@ -155,6 +155,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 41, // except 1d tensors
+        // 42..63 remain available to upstream. These values are written to
+        // general.file_type, so they deliberately match the fork-local GGML ids.
+        LLAMA_FTYPE_MOSTLY_IQ1_XS        = 64, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXS       = 65, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_XXXS      = 66, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

@@ -29,6 +29,7 @@ Per-model extract + run recipes in this document:
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | Tencent HY V3 ([IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | hy_v3 | [Export](#export-a-tencent-hy-v3-flash-package) | [Run](#export-a-tencent-hy-v3-flash-package) |
+| Qwen3.8-2.4T-A95B | qwen35moe | [Export](#export-a-qwen38-flash-package) | Runtime kernels pending |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 | **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
 
@@ -55,6 +56,24 @@ PYTHON=python3 \
   --model ~/Models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
   --out-dir ~/Models/flash/qwen35
 ```
+
+## Export a Qwen3.8 Flash package
+
+Qwen3.8-2.4T-A95B uses the existing `qwen35moe` architecture metadata with 512 routed experts and native top-10 routing. The helper walks all split GGUF shards and creates the standard one-root package:
+
+- `model-dense.gguf` contains every non-routed and shared tensor
+- `sidecar/` contains exact routed tensor bytes in layer-major files
+- `flashmoe-package.json` records source, size, and runtime metadata
+
+```bash
+python3 ./tools/flashmoe-sidecar/qwen38_prepare.py \
+  --model /Volumes/TB36/Models/Qwen/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --out-dir ~/Models/Qwen3.8 \
+  --force \
+  --verify-bytes
+```
+
+The checked `UD-Q1_0` source requires approximately 370 GiB for the generated package: `360,374,599,680` routed bytes plus `36,870,741,504` dense tensor bytes and small GGUF/manifest overhead. Its routed tensors use the new IQ1_XXXS type; exporting preserves them exactly, while actual inference still requires the matching CPU, CUDA, and Metal quantization kernels.
 
 ## Extract a Gemma4-26B-A4B sidecar
 

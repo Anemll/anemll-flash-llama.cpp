@@ -334,6 +334,16 @@ def build_package_metadata(
                 "LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES": "1",
             },
         }
+    elif arch == "qwen35moe" and expert_count is not None and int(expert_count) >= 512:
+        runtime_hint = {
+            "moe_mode": "slot-bank",
+            "moe_topk": int(expert_used_count) if expert_used_count is not None else 10,
+            "moe_slot_bank": 32,
+            "moe_cache_io_split": 4,
+            "moe_prefetch_temporal": True,
+            "ubatch": 1,
+            "note": "Qwen3.8 narrow IQ1 inference requires matching CPU/CUDA/Metal kernels.",
+        }
 
     return {
         "schema_version": 1,

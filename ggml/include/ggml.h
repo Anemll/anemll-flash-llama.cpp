@@ -430,7 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_RESERVED_41 = 41,
         GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
-        GGML_TYPE_COUNT   = 43,
+        // IQ1_S's 8-element ternary codebook with narrower indices. 43..63
+        // remain available to upstream; fork-local types start at 64 so stock
+        // readers reject these payloads instead of interpreting another type.
+        GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
+        GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
+        GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
+        GGML_TYPE_COUNT    = 67,
     };
 
     // precision
