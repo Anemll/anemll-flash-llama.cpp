@@ -474,6 +474,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
+        // Keep these aligned with the fork-local tensor and llama file-type ids.
+        GGML_FTYPE_MOSTLY_IQ1_XS   = 64, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXS  = 65, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXXS = 66, // except 1d tensors
     };
 
     // available tensor operations:

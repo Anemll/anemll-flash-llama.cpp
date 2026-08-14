@@ -148,8 +148,8 @@ def main() -> int:
     print("")
     print("runtime note:")
     print(
-        "  This GGUF uses the new IQ1_XXXS tensor type. Package export is supported; "
-        "inference requires the matching CPU/CUDA/Metal quant kernels."
+        "  This package uses IQ1_XXXS routed tensors. The Metal backend supports ordinary "
+        "IQ1_XXXS matvec plus fused native top-10 decode with --slot10."
     )
     return 0
 

@@ -2039,12 +2039,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_split_si
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_phaseA(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
-    GGML_UNUSED(op);
 
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_flashmoe_slot8_phaseA");
+    switch (op->src[1]->type) {
+        case GGML_TYPE_IQ1_M:
+            snprintf(base, 256, "kernel_flashmoe_slot8_phaseA");
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            snprintf(base, 256, "kernel_flashmoe_slot8_phaseA_iq1_xxxs");
+            break;
+        default:
+            GGML_ABORT("unsupported fused Flash-MoE gate type: %s", ggml_type_name(op->src[1]->type));
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -2057,12 +2065,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_phaseB(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
-    GGML_UNUSED(op);
 
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_flashmoe_slot8_phaseB");
+    switch (op->src[3]->type) {
+        case GGML_TYPE_IQ1_M:
+            snprintf(base, 256, "kernel_flashmoe_slot8_phaseB");
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            snprintf(base, 256, "kernel_flashmoe_slot8_phaseB_iq1_xxxs");
+            break;
+        default:
+            GGML_ABORT("unsupported fused Flash-MoE down type: %s", ggml_type_name(op->src[3]->type));
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

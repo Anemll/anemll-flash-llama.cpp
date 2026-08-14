@@ -38,6 +38,12 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     return ggml_metal_buffer_get_id(ctx, t);
 }
 
+static bool ggml_metal_type_is_narrow_iq1(enum ggml_type type) {
+    return type == GGML_TYPE_IQ1_XS ||
+           type == GGML_TYPE_IQ1_XXS ||
+           type == GGML_TYPE_IQ1_XXXS;
+}
+
 static int16_t ggml_metal_mul_mm_env_walk_mode() {
     static int16_t walk = -1;
     if (walk != -1) {
@@ -2156,6 +2162,7 @@ static int ggml_metal_encode_mul_mat_from_tensors(
     } else if (
         !ggml_is_transposed(src0) &&
         !ggml_is_transposed(src1) &&
+        !ggml_metal_type_is_narrow_iq1(src0->type) &&
         props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
         !ggml_metal_experimental_disable_mul_mm_enabled()) {
         g_ggml_metal_mul_mat_mm_count.fetch_add(1);
@@ -4564,6 +4571,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
+        !ggml_metal_type_is_narrow_iq1(op->src[0]->type) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
         props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
@@ -4889,7 +4897,7 @@ static int ggml_metal_op_flashmoe_slot8_ffn_reference(ggml_metal_op_t ctx, ggml_
     return 1;
 }
 
-// --slot8 fused encode (Stage 3b): two purpose-built IQ1_M kernels that collapse all 8 experts
+// Fused encode (Stage 3b): two purpose-built IQ1_M / IQ1_XXXS kernels that collapse all selected experts
 // and the 3 projections into 2 dispatches.
 //   Phase A: h[j,e] = silu(gate_e . x) * (up_e . x)        for j in n_ff, e in n_used  -> h scratch
 //   Phase B: moe_out[r] = sum_e weights[e] * (down_e[r] . h[:,e])  for r in n_embd     -> dst
@@ -4957,16 +4965,20 @@ int ggml_metal_op_flashmoe_slot8_ffn(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
 
-    // The fused IQ1_M kernels handle only IQ1_M gate/up/down with super-block-aligned dims.
+    // The fused kernels handle IQ1_M or IQ1_XXXS gate/up/down with super-block-aligned dims.
     // Anything else (or the explicit A/B toggle) uses the mul_mat reference path.
     constexpr int64_t kSuperBlock = 256; // QK_K
     const bool all_iq1m =
             op->src[1]->type == GGML_TYPE_IQ1_M &&
             op->src[2]->type == GGML_TYPE_IQ1_M &&
             op->src[3]->type == GGML_TYPE_IQ1_M;
+    const bool all_iq1xxxs =
+            op->src[1]->type == GGML_TYPE_IQ1_XXXS &&
+            op->src[2]->type == GGML_TYPE_IQ1_XXXS &&
+            op->src[3]->type == GGML_TYPE_IQ1_XXXS;
     const bool dims_ok = (op->ne[0] % kSuperBlock == 0) && (op->src[1]->ne[1] % kSuperBlock == 0);
 
-    if (all_iq1m && dims_ok && !ggml_metal_slot8_use_reference()) {
+    if ((all_iq1m || all_iq1xxxs) && dims_ok && !ggml_metal_slot8_use_reference()) {
         return ggml_metal_op_flashmoe_slot8_ffn_fused(ctx, op);
     }
 
@@ -5142,7 +5154,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min) &&
+    if (!ggml_metal_type_is_narrow_iq1(op->src[0]->type) &&
+        props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min) &&
         !ggml_metal_experimental_disable_mul_mm_id_enabled()) {
         g_ggml_metal_mul_mat_id_generic_mm_count.fetch_add(1);
 

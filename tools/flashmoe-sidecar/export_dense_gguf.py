@@ -339,10 +339,12 @@ def build_package_metadata(
             "moe_mode": "slot-bank",
             "moe_topk": int(expert_used_count) if expert_used_count is not None else 10,
             "moe_slot_bank": 32,
+            "slot10": True,
+            "fused_slot_modes": [10],
             "moe_cache_io_split": 4,
             "moe_prefetch_temporal": True,
             "ubatch": 1,
-            "note": "Qwen3.8 narrow IQ1 inference requires matching CPU/CUDA/Metal kernels.",
+            "note": "The Metal backend supports IQ1_XXXS matvec and fused native top-10 decode via --slot10.",
         }
 
     return {

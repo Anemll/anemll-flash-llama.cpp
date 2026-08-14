@@ -84,7 +84,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
-    if (arch == LLM_ARCH_LLAMA4) {
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        // One recurrent layer, one full-attention layer, and one trailing MTP layer.
+        n_layer = 3;
+    } else if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA3N) {
         n_embd = 64;
@@ -113,6 +116,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        // Exercise the trailing Qwen3.8 MTP block contract. It is part of the
+        // GGUF block count, but normal autoregressive inference must skip it.
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {

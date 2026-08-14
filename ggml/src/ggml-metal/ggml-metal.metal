@@ -10229,6 +10229,127 @@ static inline float iq1m_dot_row(
     return simd_sum(sumf);
 }
 
+// Dot product for one IQ1_XXXS row. This is the single-row form of
+// kernel_mul_mv_iq1_xxxs_f32_impl used by the fused routed FFN below.
+static inline float iq1xxxs_dot_row(
+        device const block_iq1_xxxs * xrow,
+        device const float          * y,
+        int                           ne00,
+        ushort                        tiisg) {
+    const int nb   = ne00 / QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    float yl[32];
+    float sumf = 0.f;
+
+    const short ix = tiisg;
+    device const float * y4 = y + 32 * ix;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        float sumy = 0.f;
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+            sumy += yl[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq1_xxxs * xr = xrow + ibl;
+        device const uint8_t * qs = xr->qs + 4 * ib;
+        device const uint8_t * sc = xr->sc + ib/2;
+
+        constant uint8_t * grid1 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs[0]);
+        constant uint8_t * grid2 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs[1]);
+        constant uint8_t * grid3 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs[2]);
+        constant uint8_t * grid4 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs[3]);
+
+        float sum = 0.f;
+        for (short j = 0; j < 4; ++j) {
+            sum += yl[j+ 0] * (grid1[j] & 0xf) + yl[j+ 4] * (grid1[j] >> 4)
+                 + yl[j+ 8] * (grid2[j] & 0xf) + yl[j+12] * (grid2[j] >> 4)
+                 + yl[j+16] * (grid3[j] & 0xf) + yl[j+20] * (grid3[j] >> 4)
+                 + yl[j+24] * (grid4[j] & 0xf) + yl[j+28] * (grid4[j] >> 4);
+        }
+
+        const int nibble = (sc[0] >> (4*(ib & 1))) & 0xf;
+        const float delta = nibble & 8 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+        sumf += (float)xr->d * (sum + sumy * delta) * (2*(nibble & 7) + 1);
+
+        y4 += 32 * 32;
+    }
+
+    return simd_sum(sumf);
+}
+
+// Gate and up consume the same activation row. Compute both dot products in one
+// traversal so each activation value and its block sum are loaded only once.
+static inline float2 iq1xxxs_dot_row_pair(
+        device const block_iq1_xxxs * xrow0,
+        device const block_iq1_xxxs * xrow1,
+        device const float          * y,
+        int                           ne00,
+        ushort                        tiisg) {
+    const int nb   = ne00 / QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    float yl[32];
+    float2 sumf = 0.f;
+
+    const short ix = tiisg;
+    device const float * y4 = y + 32 * ix;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        float sumy = 0.f;
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+            sumy += yl[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq1_xxxs * xr0 = xrow0 + ibl;
+        device const block_iq1_xxxs * xr1 = xrow1 + ibl;
+        device const uint8_t * qs0 = xr0->qs + 4 * ib;
+        device const uint8_t * qs1 = xr1->qs + 4 * ib;
+        device const uint8_t * sc0 = xr0->sc + ib/2;
+        device const uint8_t * sc1 = xr1->sc + ib/2;
+
+        constant uint8_t * grid00 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs0[0]);
+        constant uint8_t * grid01 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs0[1]);
+        constant uint8_t * grid02 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs0[2]);
+        constant uint8_t * grid03 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs0[3]);
+        constant uint8_t * grid10 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs1[0]);
+        constant uint8_t * grid11 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs1[1]);
+        constant uint8_t * grid12 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs1[2]);
+        constant uint8_t * grid13 = (constant uint8_t *)(iq1_xxxs_grid_gpu + qs1[3]);
+
+        float2 sum = 0.f;
+        for (short j = 0; j < 4; ++j) {
+            sum[0] += yl[j+ 0] * (grid00[j] & 0xf) + yl[j+ 4] * (grid00[j] >> 4)
+                    + yl[j+ 8] * (grid01[j] & 0xf) + yl[j+12] * (grid01[j] >> 4)
+                    + yl[j+16] * (grid02[j] & 0xf) + yl[j+20] * (grid02[j] >> 4)
+                    + yl[j+24] * (grid03[j] & 0xf) + yl[j+28] * (grid03[j] >> 4);
+            sum[1] += yl[j+ 0] * (grid10[j] & 0xf) + yl[j+ 4] * (grid10[j] >> 4)
+                    + yl[j+ 8] * (grid11[j] & 0xf) + yl[j+12] * (grid11[j] >> 4)
+                    + yl[j+16] * (grid12[j] & 0xf) + yl[j+20] * (grid12[j] >> 4)
+                    + yl[j+24] * (grid13[j] & 0xf) + yl[j+28] * (grid13[j] >> 4);
+        }
+
+        const int nibble0 = (sc0[0] >> (4*(ib & 1))) & 0xf;
+        const int nibble1 = (sc1[0] >> (4*(ib & 1))) & 0xf;
+        const float delta0 = nibble0 & 8 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+        const float delta1 = nibble1 & 8 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+        sumf[0] += (float)xr0->d * (sum[0] + sumy * delta0) * (2*(nibble0 & 7) + 1);
+        sumf[1] += (float)xr1->d * (sum[1] + sumy * delta1) * (2*(nibble1 & 7) + 1);
+
+        y4 += 32 * 32;
+    }
+
+    return float2(simd_sum(sumf[0]), simd_sum(sumf[1]));
+}
+
 // Phase A: for every (row j in n_ff, expert e), compute h[j,e] = silu(gate_e . x) * (up_e . x).
 // One simdgroup per (j, e). Grid = (n_ff, 1, n_used), 32 threads/threadgroup.
 kernel void kernel_flashmoe_slot8_phaseA(
@@ -10285,6 +10406,68 @@ kernel void kernel_flashmoe_slot8_phaseB(
         device const float       * he   = (device const float       *) h + (uint64_t)e*args.n_ff;
 
         const float d = iq1m_dot_row(drow, he, args.n_ff, tiisg);
+        const float w = *(device const float *)(weights + (uint64_t)e*args.w_nb1);
+        acc += w * d;
+    }
+
+    if (tiisg == 0) {
+        ((device float *) dst)[r] = acc;
+    }
+}
+
+// IQ1_XXXS specialization of the fused routed FFN. The width is carried in
+// args.n_used, so this supports Qwen3.8's native top-10 without fixed-size
+// expert arrays or per-expert command-buffer replay.
+kernel void kernel_flashmoe_slot8_phaseA_iq1_xxxs(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,
+        device const char * gate,
+        device const char * up,
+        device const char * slot_ids,
+        device       char * h,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int j = tgpig.x;
+    const int e = tgpig.z;
+    if (j >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+
+    const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+    device const float          * y    = (device const float          *) x;
+    device const block_iq1_xxxs * grow = (device const block_iq1_xxxs *)(gate + slot*args.gate_nb2 + (uint64_t)j*args.gate_nb1);
+    device const block_iq1_xxxs * urow = (device const block_iq1_xxxs *)(up   + slot*args.up_nb2   + (uint64_t)j*args.up_nb1);
+
+    const float2 gu = iq1xxxs_dot_row_pair(grow, urow, y, args.n_embd, tiisg);
+
+    if (tiisg == 0) {
+        ((device float *) h)[(uint64_t)e*args.n_ff + j] = (gu[0] / (1.0f + exp(-gu[0]))) * gu[1];
+    }
+}
+
+kernel void kernel_flashmoe_slot8_phaseB_iq1_xxxs(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * h,
+        device const char * down,
+        device const char * slot_ids,
+        device const char * weights,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int r = tgpig.x;
+    if (r >= args.n_embd) {
+        return;
+    }
+
+    float acc = 0.f;
+    for (int e = 0; e < args.n_used; ++e) {
+        const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+        device const block_iq1_xxxs * drow = (device const block_iq1_xxxs *)(down + slot*args.down_nb2 + (uint64_t)r*args.down_nb1);
+        device const float          * he   = (device const float          *) h + (uint64_t)e*args.n_ff;
+
+        const float d = iq1xxxs_dot_row(drow, he, args.n_ff, tiisg);
         const float w = *(device const float *)(weights + (uint64_t)e*args.w_nb1);
         acc += w * d;
     }

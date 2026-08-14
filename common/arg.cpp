@@ -2295,21 +2295,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SIDECAR"));
     add_opt(common_arg(
-        {"--moe-prefetch-sidecar", "--prefetch-sidecar", "--prefetch"}, "PATH",
+        {"--prefetch", "--prefetch-sidecar", "--moe-prefetch-sidecar"}, "PATH",
         "optional alternate Flash-MoE sidecar directory or manifest path used only for prefetch loads (defaults to --moe-sidecar)",
         [](common_params & params, const std::string & value) {
             params.moe_prefetch_sidecar = value;
         }
     ).set_env("LLAMA_ARG_MOE_PREFETCH_SIDECAR"));
     add_opt(common_arg(
-        {"--moe-secondary-sidecar", "--secondary-sidecar"}, "PATH",
+        {"--secondary-sidecar", "--moe-secondary-sidecar"}, "PATH",
         "optional alternate Flash-MoE sidecar directory or manifest path used only for the last miss in a 4-miss routed call experiment (defaults to --moe-sidecar)",
         [](common_params & params, const std::string & value) {
             params.moe_secondary_sidecar = value;
         }
     ).set_env("LLAMA_ARG_MOE_SECONDARY_SIDECAR"));
     add_opt(common_arg(
-        {"--moe-tertiary-sidecar", "--tertiary-sidecar"}, "PATH",
+        {"--tertiary-sidecar", "--moe-tertiary-sidecar"}, "PATH",
         "optional alternate Flash-MoE sidecar directory or manifest path used as the third lane for experimental weighted demand striping (defaults to --moe-sidecar)",
         [](common_params & params, const std::string & value) {
             params.moe_tertiary_sidecar = value;
@@ -2365,8 +2365,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREFILL_NEXT_HOT_EXPERTS"));
     add_opt(common_arg(
-        {"--moe-prefill-next-hot-exclusive-drives", "--moe-prefill-exclusive-drive-prefetch"},
-        {"--no-moe-prefill-next-hot-exclusive-drives", "--no-moe-prefill-exclusive-drive-prefetch"},
+        {"--moe-prefill-exclusive-drive-prefetch", "--moe-prefill-next-hot-exclusive-drives"},
+        {"--no-moe-prefill-exclusive-drive-prefetch", "--no-moe-prefill-next-hot-exclusive-drives"},
         string_format("pin dedicated prefill next-hot host staging to the sidecars only: current-layer demand stays on the primary drive, layer L+1 stages on the secondary drive, and layer L+2 stages on the tertiary drive when available (default: %s)", params.moe_prefill_next_hot_exclusive_drives ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.moe_prefill_next_hot_exclusive_drives = value;
@@ -2380,6 +2380,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot4 = value;
             if (value) {
                 params.slot8 = false;
+                params.slot10 = false;
             }
         }
     ).set_env("LLAMA_ARG_SLOT4"));
@@ -2391,9 +2392,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot8 = value;
             if (value) {
                 params.slot4 = false;
+                params.slot10 = false;
             }
         }
     ).set_env("LLAMA_ARG_SLOT8"));
+    add_opt(common_arg(
+        {"--slot10"},
+        {"--no-slot10"},
+        string_format("Flash-MoE: collapse a native top-10 routed-expert FFN into the fused Metal operator (gate/up/swiglu/down/weighted-sum over all 10 experts); optimized for Qwen3.8 IQ1_XXXS routed weights, also supports IQ1_M, and falls back to the reference operator on other quant combinations (default: %s)", params.slot10 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot10 = value;
+            if (value) {
+                params.slot4 = false;
+                params.slot8 = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT10"));
     add_opt(common_arg(
         {"--moe-topk"}, "N",
         "experimental runtime reduction-only override for routed experts per token (0 = model metadata, must be <= GGUF MoE top-k)",

@@ -401,6 +401,7 @@ extern "C" {
         bool moe_demand_concurrent; // race demand reads between primary and secondary sidecars; first complete read wins
         bool slot8; // fuse a top-8 routed-expert FFN into a single Metal kernel (gate/up/swiglu/down/weighted-sum)
         bool slot4; // fuse a top-4 routed-expert FFN into the width-generic Metal operator
+        bool slot10; // fuse a top-10 routed-expert FFN into the width-generic Metal operator
     };
 
     struct llama_sampler_seq_config {

@@ -34,7 +34,8 @@ static bool llama_flash_moe_experimental_metal_split_glu_enabled() {
 static bool llama_flash_moe_fused_slot_debug_enabled(int32_t expert_count) {
     const char * common = getenv("LLAMA_FLASH_MOE_FUSED_SLOT_DEBUG");
     const char * width_specific = getenv(expert_count == 4 ?
-            "LLAMA_FLASH_MOE_SLOT4_DEBUG" : "LLAMA_FLASH_MOE_SLOT8_DEBUG");
+            "LLAMA_FLASH_MOE_SLOT4_DEBUG" :
+            (expert_count == 8 ? "LLAMA_FLASH_MOE_SLOT8_DEBUG" : "LLAMA_FLASH_MOE_SLOT10_DEBUG"));
     const auto enabled = [](const char * value) {
         return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
     };
@@ -1632,7 +1633,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    // --slot4/--slot8 eligibility: the fused operator handles the routed shape with
+    // --slot4/--slot8/--slot10 eligibility: the fused operator handles the routed shape with
     // separate gate/up expert matmuls, SwiGLU, an exact requested top-K, routed weights applied
     // after the down projection, and no per-expert bias/scale tensors. Any layer that does not
     // match falls through to the existing per-expert slot-bank path.
@@ -1640,7 +1641,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             flash_moe_slot_runtime->fused_slot_expert_count(il) : 0;
     const bool fused_slot_eligible =
             flash_moe_slot_runtime != nullptr &&
-            (fused_slot_experts == 4 || fused_slot_experts == 8) &&
+            (fused_slot_experts == 4 || fused_slot_experts == 8 || fused_slot_experts == 10) &&
             n_tokens == 1 &&             // single-token decode fast path only
             n_expert_used == fused_slot_experts &&
             type_op == LLM_FFN_SILU &&

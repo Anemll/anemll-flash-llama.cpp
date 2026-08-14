@@ -29,7 +29,7 @@ Per-model extract + run recipes in this document:
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | Tencent HY V3 ([IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | hy_v3 | [Export](#export-a-tencent-hy-v3-flash-package) | [Run](#export-a-tencent-hy-v3-flash-package) |
-| Qwen3.8-2.4T-A95B | qwen35moe | [Export](#export-a-qwen38-flash-package) | Runtime kernels pending |
+| Qwen3.8-2.4T-A95B | qwen35moe | [Export](#export-a-qwen38-flash-package) | [Run](#run-qwen38-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 | **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
 
@@ -59,11 +59,13 @@ PYTHON=python3 \
 
 ## Export a Qwen3.8 Flash package
 
-Qwen3.8-2.4T-A95B uses the existing `qwen35moe` architecture metadata with 512 routed experts and native top-10 routing. The helper walks all split GGUF shards and creates the standard one-root package:
+Qwen3.8-2.4T-A95B uses the existing `qwen35moe` architecture metadata with 512 routed experts and native top-10 routing. The checked model reports 93 blocks (including the trailing MTP block), embedding width 8192, and context length 262,144. Its `UD-Q1_0` source has ten GGUF shards. The preparation helper resolves all shards and creates the standard one-root package:
 
 - `model-dense.gguf` contains every non-routed and shared tensor
 - `sidecar/` contains exact routed tensor bytes in layer-major files
 - `flashmoe-package.json` records source, size, and runtime metadata
+
+Recommended one-pass sidecar + dense export:
 
 ```bash
 python3 ./tools/flashmoe-sidecar/qwen38_prepare.py \
@@ -73,7 +75,78 @@ python3 ./tools/flashmoe-sidecar/qwen38_prepare.py \
   --verify-bytes
 ```
 
-The checked `UD-Q1_0` source requires approximately 370 GiB for the generated package: `360,374,599,680` routed bytes plus `36,870,741,504` dense tensor bytes and small GGUF/manifest overhead. Its routed tensors use the new IQ1_XXXS type; exporting preserves them exactly, while actual inference still requires the matching CPU, CUDA, and Metal quantization kernels.
+For Qwen3.8-2.4T-A95B, the dense model and routed sidecar can be prepared independently. Extract and byte-verify only the routed sidecar first:
+
+```bash
+python3 ./tools/flashmoe-sidecar/qwen38_prepare.py \
+  --model /Volumes/TB36/Models/Qwen/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --out-dir ~/Models/Qwen3.8 \
+  --skip-dense \
+  --force \
+  --verify-bytes
+```
+
+Then reuse the verified `sidecar/` and export or rebuild only the dense/shared GGUF plus package metadata:
+
+```bash
+python3 ./tools/flashmoe-sidecar/qwen38_prepare.py \
+  --model /Volumes/TB36/Models/Qwen/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --out-dir ~/Models/Qwen3.8 \
+  --skip-sidecar \
+  --force
+```
+
+`--skip-sidecar` still validates the existing sidecar metadata before dense export. To perform a fast standalone metadata check without rewriting either artifact:
+
+```bash
+python3 ./tools/flashmoe-sidecar/flashmoe_sidecar.py verify \
+  --model /Volumes/TB36/Models/Qwen/Qwen3.8-2.4T-A95B-GGUF/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --sidecar ~/Models/Qwen3.8/sidecar \
+  --metadata-only
+```
+
+Resulting package layout:
+
+```text
+~/Models/Qwen3.8/
+├── model-dense.gguf
+├── flashmoe-package.json
+└── sidecar/
+    ├── manifest.json
+    └── layer_000.bin ... layer_092.bin
+```
+
+The checked package requires approximately 370 GiB: `360,374,599,680` routed tensor bytes plus `36,870,741,504` dense tensor bytes and small GGUF/manifest overhead. The dense GGUF uses F32, Q4_K, Q5_K, Q6_K, and Q8_0. Sidecar layers 0-91 use IQ1_XXXS routed tensors; layer 92 uses Q2_K. Shared experts remain in `model-dense.gguf`; only `ffn_gate_exps`, `ffn_up_exps`, and `ffn_down_exps` are externalized. Keep the ten original GGUF shards until the dense + sidecar pair passes inference on the target host.
+
+A metadata-only verification of the checked package resolves all ten shards and validates 279 routed sidecar entries against the source GGUFs.
+
+The Metal backend has ordinary matrix-vector kernels for every type in the package and a fused IQ1_XXXS single-token top-10 expert path. The complete prebuilt package is published at [`anemll/Qwen3.8-2.4T-A95B-FlashMoE-UD-Q1_0`](https://huggingface.co/anemll/Qwen3.8-2.4T-A95B-FlashMoE-UD-Q1_0).
+
+### Run Qwen3.8 with Flash-MoE
+
+Start with 32 slots on an M5 Max. `--slot10` selects the IQ1_XXXS fused operator on eligible native top-10 decode layers; unsupported shapes or quant combinations retain the reference operator fallback.
+
+```bash
+./build/bin/llama-cli \
+  -m ~/Models/Qwen3.8/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar ~/Models/Qwen3.8/sidecar \
+  --moe-slot-bank 32 \
+  --moe-topk 10 \
+  --slot10 \
+  --moe-cache-io-split 4 \
+  --moe-prefetch-temporal \
+  -fit on \
+  -ub 1 -b 1 \
+  -ngl 999 \
+  -c 128 \
+  --no-warmup \
+  -st \
+  -p "Hello" \
+  -n 64
+```
+
+At 32 slots the model is primarily SSD-I/O-bound. Increase the slot count only when the host has enough unified-memory reserve; the fused kernel changes routed compute, not the sidecar residency cost.
 
 ## Extract a Gemma4-26B-A4B sidecar
 

@@ -8179,6 +8179,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3.8 routes ten experts. Use two tokens so Metal exercises the generic
+    // mul_mv_id path rather than the single-token decode replay path.
+    for (ggml_type type_a : {GGML_TYPE_IQ1_XS, GGML_TYPE_IQ1_XXS, GGML_TYPE_IQ1_XXXS}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 10, false, 512, 2, 256));
+    }
+
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
