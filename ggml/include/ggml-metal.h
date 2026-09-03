@@ -44,6 +44,9 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init(void);
 
 GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
+// Returns true only for Metal buffers backed by CPU-visible shared memory.
+GGML_BACKEND_API bool ggml_backend_buffer_is_metal_shared(ggml_backend_buffer_t buffer);
+
 GGML_BACKEND_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
 
 // helper to check if the device supports a specific family

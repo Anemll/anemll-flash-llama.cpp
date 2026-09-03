@@ -681,6 +681,7 @@ struct common_params {
     bool        moe_trace_harness = false; // llama-cli raw non-interactive harness for long traces    // NOLINT
     bool        slot4 = false;           // fused single-kernel top-4 routed-expert FFN (Metal)         // NOLINT
     bool        slot8 = false;           // fused single-kernel top-8 routed-expert FFN (Metal)         // NOLINT
+    bool        fp16_head = false;       // convert an F32 output head to F16 at load, file unchanged      // NOLINT
     bool        slot10 = false;          // fused top-10 routed-expert FFN operator (Metal)              // NOLINT
 
     // retrieval params

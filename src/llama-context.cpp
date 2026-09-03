@@ -306,6 +306,19 @@ static bool flash_moe_env_flag_enabled(const char * env_name, bool default_value
     return true;
 }
 
+static bool flash_moe_macos_ssd_slot_io_defaults_enabled(const llama_model & model) {
+#if defined(__APPLE__) && defined(GGML_USE_METAL)
+    // The ordinary slot-bank path streams misses from the sidecar. Resident and
+    // oracle modes are special-purpose baselines and retain their old defaults.
+    return !model.flash_moe_resident_source_enabled() &&
+           !model.flash_moe_oracle_all_hit_enabled() &&
+           !model.flash_moe_oracle_prefetch_enabled();
+#else
+    GGML_UNUSED(model);
+    return false;
+#endif
+}
+
 static bool flash_moe_prefill_verbose_layer_stats_enabled() {
     static int enabled = -1;
     if (enabled == -1) {
@@ -899,7 +912,8 @@ public:
               prefill_next_hot_exclusive_drives(transient_shared_scratch && model.flash_moe_prefill_next_hot_exclusive_drives_enabled()),
               perf_profile(perf_profile),
               async_slot_upload(async_slot_upload_enabled()),
-              parallel_slot_reads(parallel_slot_reads_enabled()),
+              parallel_slot_reads(parallel_slot_reads_enabled(flash_moe_macos_ssd_slot_io_defaults_enabled(model))),
+              cpu_visible_slot_writes(cpu_visible_slot_writes_enabled(flash_moe_macos_ssd_slot_io_defaults_enabled(model))),
               mixed_slot_buffer(mixed_slot_buffer_enabled()),
               cache_io_split(std::max<int32_t>(
                       transient_shared_scratch ?
@@ -2290,6 +2304,7 @@ private:
     bool perf_profile = false;
     bool async_slot_upload = false;
     bool parallel_slot_reads = false;
+    bool cpu_visible_slot_writes = false;
     bool mixed_slot_buffer = false;
     int32_t cache_io_split = 1;
     int32_t prefetch_cache_io_split = 1;
@@ -4742,9 +4757,9 @@ private:
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }
 
-    static bool parallel_slot_reads_enabled() {
-        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    static bool parallel_slot_reads_enabled(bool default_value) {
+        return flash_moe_env_flag_enabled(
+                "LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS", default_value);
     }
 
     static bool batched_install_reads_enabled() {
@@ -5284,9 +5299,9 @@ private:
         return (size_t) std::max(1, std::atoi(value));
     }
 
-    static bool cpu_visible_slot_writes_enabled() {
-        const char * value = std::getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    static bool cpu_visible_slot_writes_enabled(bool default_value) {
+        return flash_moe_env_flag_enabled(
+                "LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES", default_value);
     }
 
     static bool force_backend_tensor_writes_enabled() {
@@ -6976,7 +6991,7 @@ private:
                 parallel_slot_reads ? "on" : "off",
                 effective_batched_install_reads() ? "on" : "off",
                 mixed_slot_buffer ? "on" : "off",
-                cpu_visible_slot_writes_enabled() ? "on" : "off",
+                cpu_visible_slot_writes ? "on" : "off",
                 demand_concurrent_enabled ? "on" : "off");
         if (total.concurrent_races > 0) {
             LLAMA_LOG_INFO("%s: Flash-MoE concurrent demand races=%" PRIu64 " primary-win=%" PRIu64 " secondary-win=%" PRIu64 " pending-reads=%zu\n",
@@ -7378,7 +7393,7 @@ private:
         return static_cast<uint8_t *>(tensor->data);
     }
 
-    static uint8_t * tensor_cpu_visible_data(ggml_tensor * tensor) {
+    uint8_t * tensor_cpu_visible_data(ggml_tensor * tensor) const {
         if (tensor == nullptr || tensor->data == nullptr) {
             return nullptr;
         }
@@ -7392,17 +7407,19 @@ private:
             return static_cast<uint8_t *>(tensor->data);
         }
 
-        if (cpu_visible_slot_writes_enabled() && ggml_backend_buffer_get_base(buf) != nullptr) {
+#ifdef GGML_USE_METAL
+        if (cpu_visible_slot_writes && ggml_backend_buffer_is_metal_shared(buf)) {
             return static_cast<uint8_t *>(tensor->data);
         }
+#endif
 
         return nullptr;
     }
 
-    static uint8_t * tensor_slot_cpu_visible_data(
+    uint8_t * tensor_slot_cpu_visible_data(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
-            int32_t slot) {
+            int32_t slot) const {
         if (entry == nullptr || slot < 0) {
             return nullptr;
         }
@@ -7418,11 +7435,11 @@ private:
         return tensor_host_data(const_cast<ggml_tensor *>(tensor));
     }
 
-    static void read_tensor_slot_bytes(
+    void read_tensor_slot_bytes(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
             int32_t slot,
-            std::vector<uint8_t> & out) {
+            std::vector<uint8_t> & out) const {
         GGML_ASSERT(tensor != nullptr);
         GGML_ASSERT(entry != nullptr);
         GGML_ASSERT(slot >= 0);

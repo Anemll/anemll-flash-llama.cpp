@@ -2397,6 +2397,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT8"));
     add_opt(common_arg(
+        {"--fp16-head", "--fp16head"},
+        {"--no-fp16-head"},
+        string_format("convert an F32 output head (lm_head) to F16 once at load time; the model file is unchanged (default: %s)", params.fp16_head ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.fp16_head = value;
+        }
+    ).set_env("LLAMA_ARG_FP16_HEAD"));
+    add_opt(common_arg(
         {"--slot10"},
         {"--no-slot10"},
         string_format("Flash-MoE: collapse a native top-10 routed-expert FFN into the fused Metal operator (gate/up/swiglu/down/weighted-sum over all 10 experts); optimized for Qwen3.8 IQ1_XXXS routed weights, also supports IQ1_M, and falls back to the reference operator on other quant combinations (default: %s)", params.slot10 ? "enabled" : "disabled"),

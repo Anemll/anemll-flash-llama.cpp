@@ -403,6 +403,7 @@ extern "C" {
         bool slot8; // fuse a top-8 routed-expert FFN into a single Metal kernel (gate/up/swiglu/down/weighted-sum)
         bool slot4; // fuse a top-4 routed-expert FFN into the width-generic Metal operator
         bool slot10; // fuse a top-10 routed-expert FFN into the width-generic Metal operator
+        bool fp16_output_head; // convert an F32 output head (lm_head) to F16 once at load; the file is unchanged
     };
 
     struct llama_sampler_seq_config {

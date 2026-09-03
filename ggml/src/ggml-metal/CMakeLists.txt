@@ -13,6 +13,10 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-ops.cpp
                         )
 
+if (LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+    target_compile_definitions(ggml-metal PRIVATE LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=1)
+endif()
+
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
                       ${METAL_FRAMEWORK}
@@ -77,6 +81,10 @@ else()
         set(XC_FLAGS -fno-fast-math -fno-inline)
     else()
         set(XC_FLAGS -O3)
+    endif()
+
+    if (LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        list(APPEND XC_FLAGS -DLLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=1)
     endif()
 
     # Append macOS metal versioning flags

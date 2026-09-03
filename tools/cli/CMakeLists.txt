@@ -8,6 +8,11 @@ if (LLAMA_FLASH_MOE_GPU_BANK)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_FLASH_MOE_GPU_BANK=1)
 endif()
 
+# cli.cpp reports the compiled HY4 IQ2 LUT path in the Flash-MoE startup block
+if (LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT AND GGML_METAL)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=1)
+endif()
+
 include_directories(../server)
 
 if(LLAMA_TOOLS_INSTALL)

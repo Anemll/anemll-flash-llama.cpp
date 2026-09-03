@@ -203,6 +203,21 @@ static const char * ggml_metal_flash_moe_disable_shared_types_env(void) {
     return getenv("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_SHARED_TYPES");
 }
 
+// True when any Flash-MoE Metal isolation switch is set. Evaluated once: the per-op name scans
+// and getenv() calls in ggml_metal_device_supports_op are only needed for those debug modes,
+// and they run for every node of every graph encode otherwise.
+static bool ggml_metal_flash_moe_isolation_active(void) {
+    static int active = -1;
+    if (active < 0) {
+        active = (ggml_metal_flash_moe_disable_routed_enabled() ||
+                  ggml_metal_flash_moe_routed_only_enabled() ||
+                  ggml_metal_flash_moe_disable_routed_post_enabled() ||
+                  ggml_metal_flash_moe_disable_routed_types_env() != NULL ||
+                  ggml_metal_flash_moe_disable_shared_types_env() != NULL) ? 1 : 0;
+    }
+    return active == 1;
+}
+
 static bool ggml_metal_tensor_type_matches_env_list(const struct ggml_tensor * t, const char * list) {
     if (t == NULL || list == NULL || list[0] == '\0') {
         return false;
@@ -310,6 +325,12 @@ struct ggml_metal_library {
 ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     id<MTLLibrary> library = nil;
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+    GGML_LOG_INFO("%s: HY4 IQ2 LUT: ENABLED (direct constant-memory LUT, compile-time)\n", __func__);
+#else
+    GGML_LOG_INFO("%s: HY4 IQ2 LUT: DISABLED (threadgroup LUT, compile-time)\n", __func__);
+#endif
 
     // load library
     //
@@ -427,6 +448,10 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 
 #if GGML_METAL_EMBED_LIBRARY
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
+#endif
+
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+                [prep setObject:@"1" forKey:@"LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT"];
 #endif
 
                 MTLCompileOptions * options = [MTLCompileOptions new];
@@ -1388,31 +1413,33 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
-    const bool flash_moe_routed        = ggml_metal_flash_moe_op_is_routed(op);
-    const bool flash_moe_routed_post   = ggml_metal_flash_moe_op_is_routed_post(op);
-    const bool flash_moe_shared        = ggml_metal_flash_moe_op_is_shared(op);
-    const bool flash_moe_isolation_eligible = op->op != GGML_OP_NONE && (flash_moe_routed || flash_moe_shared);
+    if (ggml_metal_flash_moe_isolation_active()) {
+        const bool flash_moe_routed        = ggml_metal_flash_moe_op_is_routed(op);
+        const bool flash_moe_routed_post   = ggml_metal_flash_moe_op_is_routed_post(op);
+        const bool flash_moe_shared        = ggml_metal_flash_moe_op_is_shared(op);
+        const bool flash_moe_isolation_eligible = op->op != GGML_OP_NONE && (flash_moe_routed || flash_moe_shared);
 
-    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_enabled() && flash_moe_routed) {
-        return false;
-    }
+        if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_enabled() && flash_moe_routed) {
+            return false;
+        }
 
-    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_routed_only_enabled() && !flash_moe_routed) {
-        return false;
-    }
+        if (flash_moe_isolation_eligible && ggml_metal_flash_moe_routed_only_enabled() && !flash_moe_routed) {
+            return false;
+        }
 
-    if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_post_enabled() && flash_moe_routed_post) {
-        return false;
-    }
+        if (flash_moe_isolation_eligible && ggml_metal_flash_moe_disable_routed_post_enabled() && flash_moe_routed_post) {
+            return false;
+        }
 
-    if (flash_moe_isolation_eligible && flash_moe_routed &&
-        ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_routed_types_env())) {
-        return false;
-    }
+        if (flash_moe_isolation_eligible && flash_moe_routed &&
+            ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_routed_types_env())) {
+            return false;
+        }
 
-    if (flash_moe_isolation_eligible && flash_moe_shared &&
-        ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_shared_types_env())) {
-        return false;
+        if (flash_moe_isolation_eligible && flash_moe_shared &&
+            ggml_metal_flash_moe_op_matches_type_filter(op, ggml_metal_flash_moe_disable_shared_types_env())) {
+            return false;
+        }
     }
 
     if (!has_bfloat) {

@@ -43,13 +43,33 @@ DSA behavior.
 
 ## Build the runtime
 
-Build from the `HY4-1.25-bit` worktree with Metal enabled:
+Build from the `HY4-1.25-bit` checkout with Metal and the Flash-MoE GPU bank
+enabled:
 
 ```bash
-cmake -S . -B build -DGGML_METAL=ON -DLLAMA_BUILD_TESTS=ON -DBUILD_TESTING=ON
-cmake --build build --target llama-cli test-quantize-fns test-flashmoe-split-repack test-flashmoe-slot8-hyv4 -j 8
+cmake -S . -B build \
+  -DGGML_METAL=ON \
+  -DLLAMA_FLASH_MOE_GPU_BANK=ON \
+  -DLLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=ON \
+  -DLLAMA_BUILD_TESTS=ON \
+  -DBUILD_TESTING=ON
+cmake --build build \
+  --target llama-cli test-quantize-fns test-flashmoe-split-repack test-flashmoe-slot8-hyv4 \
+  -j 12
 ctest --test-dir build --output-on-failure -R '^(test-quantize-fns|test-flashmoe-split-repack|test-flashmoe-slot8-hyv4)$'
 ```
+
+Metal initialization prints the selected compile-time IQ2 implementation on
+every startup:
+
+```text
+ggml_metal_library_init: HY4 IQ2 LUT: ENABLED (direct constant-memory LUT, compile-time)
+```
+
+An OFF build prints `HY4 IQ2 LUT: DISABLED (threadgroup LUT, compile-time)`.
+The earlier `Flash-MoE settings:` block also reports
+`hy4-iq2-lut = direct-constant (compiled=on)` or
+`hy4-iq2-lut = threadgroup (compiled=off)` before model loading.
 
 Those are type/build preflights. The final inference check must run on a
 native Metal host rather than a sandbox without a Metal device.
@@ -168,32 +188,53 @@ conversion command above for a raw source-to-sidecar parity check;
 `--moe-cache-io-split 4` keeps sidecar reads page-aligned and bounded. A larger
 bank may reduce repeated SSD reads at the cost of unified-memory residency.
 
-For a 128 GB M5 Max throughput run, use `--moe-slot-bank 96`, add `--slot8`,
-and enable both fast I/O environment variables shown below. For the
-memory-saving configuration, use the same fast I/O settings with eight slots.
+For a 128 GB M5 Max throughput run, use `--moe-slot-bank 96` and add `--slot8`.
+The two fast I/O paths are automatic for this macOS Metal SSD-streaming mode.
+For the memory-saving configuration, use the same command with eight slots.
 Eight is the minimum slot count that preserves HY4's native top-8 routing.
 
 ```bash
-LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
-LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=1 \
 ./build/bin/llama-cli \
   -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
   --moe-mode slot-bank \
   --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar \
   --moe-slot-bank 96 --moe-topk 8 --moe-cache-io-split 4 --slot8 \
+  --fp16head \
   -fit on -ub 1 -b 1 -c 2048 -ngl 999 \
   --no-warmup -st --temp 0 --seed 1 \
   -p "Make a game of Tetris in HTML" -n 128 --perf
 ```
 
-CPU-visible slot writes direct `pread()` into the Metal shared slot buffer and
-remove the staging-to-bank copy. Parallel slot reads issue independent miss
-chunks concurrently. The checked 96-slot run improved from about 3.8-3.9 to
-4.7 generation tokens/s and from 2.0 to 3.2 prompt tokens/s. Confirm the
-summary says `cpuvis=on preads=on batchrd=on` and reports zero expert-upload
-time. The temporal-prefetch heuristic refreshes the current token's experts to
-bias later slot residency; it is not a future-router predictor and did not help
-the checked HY4 trace, so the fast command omits it.
+The three fast-path settings have separate jobs:
+
+- `--fp16head` (also spelled `--fp16-head`) converts an untied F32 output head
+  to F16 once at load time. The checked HY4 dense GGUF has a 2.77 GiB F32
+  `output.weight`; its runtime F16 copy is about 1.38 GiB. This does not rewrite
+  the GGUF or sidecar. Omit the option (or use `--no-fp16-head`) to keep F32;
+  expect a one-time startup conversion and small logit-rounding differences.
+  A successful conversion logs `converted output.weight F32 -> F16`.
+- CPU-visible slot writes let `pread()` write directly into the Metal shared
+  slot buffer, eliminating the staging-to-bank copy and its expert-upload time.
+- Parallel slot reads issue independent SSD miss chunks concurrently. With
+  `--moe-cache-io-split 4`, the runtime also batches the split install reads.
+
+Both I/O paths turn on automatically for ordinary macOS Metal SSD `slot-bank`
+streaming. The existing environment variables remain explicit overrides for
+A/B testing: set
+`LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=0` or
+`LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=0` to disable the respective
+default, and set either to `1` to force it on. Direct slot writes engage only
+when the routed buffer is actually Metal shared memory; private Metal buffers
+fall back safely to staging/upload. Startup should report
+`parallel-reads = on (default)` and `cpu-vis-writes = on (default)`. With I/O
+split 4, confirm the final summary says `cpuvis=on preads=on batchrd=on` and
+reports zero expert-upload time.
+
+The checked 96-slot run with these paths improved from about 3.8-3.9 to 4.7
+generation tokens/s and from 2.0 to 3.2 prompt tokens/s. The temporal-prefetch
+heuristic refreshes the current token's experts to bias later slot residency;
+it is not a future-router predictor and did not help the checked HY4 trace, so
+the fast command omits it.
 
 With this conservative `-b/-ub 1` smoke configuration, `-ngl 999` offloads
 dense/shared work to Metal while the generic sidecar-routed path runs the
@@ -214,7 +255,11 @@ On Metal that operator has two implementations:
   the down type (`IQ3_XXS` or `IQ4_XS`). All four possible combinations are
   covered (the published package exercises three); the per-row dot products mirror the canonical
   `kernel_mul_mv_*` lane mapping and F32 accumulation order, so the fused output
-  is bit-identical to the reference encoder below.
+  is bit-identical to the reference encoder below. IQ2_XXS Phase A reads its
+  immutable grid/sign LUTs directly from Metal constant memory; this is the
+  compiled default and requires no environment variable. Configure with
+  `-DLLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=OFF` to compile the original
+  threadgroup-copy LUT path for A/B testing.
 - **Reference encoder**: the existing `mul_mv`, `swiglu` and weighted-sum
   kernels orchestrated inside the same operator. It is the correctness oracle
   and the automatic fallback for any other type triplet or for dims that are not
@@ -231,7 +276,15 @@ ggml_metal_op_flashmoe_slot8_log_stats: flashmoe_slot8 fused=2849 [iq1=0 stq1_0/
 
 For the STQ1_0 package that is 37 tokens x 77 layers, split into 29 STQ1_0/IQ3_XXS
 layers, 45 IQ2_XXS/IQ3_XXS layers and 3 IQ2_XXS/IQ4_XS layers; `reference` must
-be 0 for a fully fused run.
+be 0 for a fully fused run. A run that exercises IQ2 layers also reports:
+
+```text
+flashmoe_slot8 HY4 IQ2 LUT=direct-constant dispatches=N
+```
+
+with `N > 0`. An OFF build reports `LUT=threadgroup` instead. This is a CMake
+compile-time selection; `LLAMA_FLASH_MOE_EXPERIMENTAL_HY4_DIRECT_IQ2_LUT` is
+not a runtime switch.
 
 `test-flashmoe-slot8-hyv4` (built with `LLAMA_BUILD_TESTS=ON`, needs a Metal
 device) checks every combination at a small shape, at the real HY4 routed shape

@@ -315,13 +315,12 @@ types and two down types (the published package exercises three of them). On an
 M5 Max with 128 GB unified memory, start with 96 slots:
 
 ```bash
-LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
-LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=1 \
 ./build/bin/llama-cli \
   -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
   --moe-mode slot-bank \
   --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar \
   --moe-slot-bank 96 --moe-topk 8 --moe-cache-io-split 4 --slot8 \
+  --fp16head \
   -fit on -ub 1 -b 1 -c 2048 -ngl 999 \
   --no-warmup -st --temp 0 --seed 1 \
   -p "Make a game of Tetris in HTML" -n 128 --perf
@@ -331,18 +330,36 @@ Use `--moe-slot-bank 8` with the same command to minimize memory. Eight is the
 minimum for native top-8 routing; it saves about 66 GiB of slot-bank residency
 relative to 96 slots, at the cost of more SSD misses. At shutdown, a fully
 fused run must report `flashmoe_slot8 fused=N ... reference=0` with `N > 0`.
+IQ2 layers use direct Metal constant-memory LUT access by default and report
+`flashmoe_slot8 HY4 IQ2 LUT=direct-constant dispatches=N`. Configure with
+`-DLLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT=OFF` to compile the original threadgroup
+LUT path; it reports `LUT=threadgroup`.
 The temporal-prefetch flag biases the cache toward the current token's experts;
 compare warm `--perf` runs with and without it because it is not a future-router
 predictor.
 
-The two environment variables are the measured HY4 fast I/O path. CPU-visible
-slot writes let `pread()` target the Metal shared bank directly, eliminating the
-staging-to-bank copy. Parallel slot reads issue independent miss chunks
-concurrently. On the checked 96-slot trace, they improved generation from about
+`--fp16head` is an alias for `--fp16-head`. It converts the untied F32 output
+head to F16 once at load time without rewriting the dense GGUF or sidecar. For
+this HY4 artifact, `output.weight` falls from about 2.77 GiB to 1.38 GiB in the
+runtime; omit the option or use `--no-fp16-head` to preserve F32. The conversion
+adds startup work and can introduce small logit-rounding differences.
+
+On macOS Metal, ordinary SSD `slot-bank` streaming automatically enables
+CPU-visible shared-buffer writes and parallel slot reads. CPU-visible writes
+let `pread()` target the Metal shared bank directly, eliminating the
+staging-to-bank copy. Parallel reads issue independent miss chunks concurrently;
+with `--moe-cache-io-split 4`, split install reads are batched. Set
+`LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=0` or
+`LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=0` to disable either default
+for A/B testing; `1` forces it on. Private Metal buffers safely retain the
+staging/upload path.
+
+On the checked 96-slot trace, these paths improved generation from about
 3.8-3.9 to 4.7 tokens/s and prompt processing from 2.0 to 3.2 tokens/s. Confirm
-the startup/runtime summary says `cpuvis=on preads=on batchrd=on` and the final
-expert-upload time is zero. The current `--moe-prefetch-temporal` heuristic did
-not improve that trace, so it is intentionally omitted from the fast command.
+startup reports both settings as `on (default)` and the final summary says
+`cpuvis=on preads=on batchrd=on` with zero expert-upload time. The current
+`--moe-prefetch-temporal` heuristic did not improve that trace, so it is
+intentionally omitted from the fast command.
 
 The initial runtime keeps the DSA weights but uses full MLA attention, so keep
 the visible context at or below its 2048-key indexer window. See

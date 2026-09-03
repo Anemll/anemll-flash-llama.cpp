@@ -849,6 +849,18 @@ void llm_graph_input_moe_slot_ids::set_input(const llama_ubatch * /* ubatch */) 
     runtime->bind_slot_ids_input(layer, slot_ids);
 }
 
+// The slot-id input is filled by the runtime during compute (eval callback) and re-bound on
+// every set_input, so a previous graph can be reused whenever the token count is unchanged.
+bool llm_graph_input_moe_slot_ids::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= slot_ids != nullptr;
+    res &= runtime  == params.flash_moe_slot_runtime;
+    res &= slot_ids != nullptr && slot_ids->ne[1] == params.ubatch.n_tokens;
+
+    return res;
+}
+
 //
 // llm_graph_result
 //

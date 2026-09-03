@@ -3935,12 +3935,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 tn, ne, flags);
         };
 
+        // LLAMA_FLASH_MOE_DENSE_ONLY=1 lets a dense-only Flash-MoE GGUF (routed experts stripped)
+        // load in stock mode with no sidecar runtime and no slot bank, for --moe-shared-only /
+        // --moe-router-only measurements of the dense path. Routed tensors stay null.
+        static const bool flash_moe_dense_only = [] {
+            const char * v = std::getenv("LLAMA_FLASH_MOE_DENSE_ONLY");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        }();
         auto create_routed_expert_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             if (!flash_moe_slot_bank) {
                 // In-memory layer-major prefill stages expert slices from the
                 // resident tensor backend. Keep normal placement here so decode
                 // can still use the Metal mul_mat_id path when -ngl offloads.
-                return create_tensor(tn, ne, flags);
+                return create_tensor(tn, ne, flash_moe_dense_only ? (flags | TENSOR_NOT_REQUIRED) : flags);
             }
 
             const std::string tensor_name = tn.str();
@@ -9510,6 +9517,56 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("%s: tensor data load complete\n", __func__);
 
+    // --fp16-head: convert an F32 output head to F16 once after load. The file on disk is
+    // unchanged; the F16 copy lives in its own buffer of the same buffer type and the mapped F32
+    // pages are never touched again, so they do not stay resident.
+    if (params.fp16_output_head && output != nullptr && output != tok_embd && output->type == GGML_TYPE_F32) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx_f16 = ggml_init(ip);
+        ggml_tensor * out16 = ggml_new_tensor(ctx_f16, GGML_TYPE_F16, ggml_n_dims(output), output->ne);
+        ggml_set_name(out16, ggml_get_name(output));
+
+        ggml_backend_buffer_t buf_f16 = ggml_backend_alloc_ctx_tensors_from_buft(ctx_f16, buft);
+        if (buf_f16 == nullptr) {
+            LLAMA_LOG_WARN("%s: --fp16-head: failed to allocate an F16 buffer for %s; keeping F32\n", __func__, ggml_get_name(output));
+            ggml_free(ctx_f16);
+        } else {
+            const int64_t n_row  = output->ne[0];
+            const int64_t n_rows = ggml_nelements(output) / n_row;
+            const int64_t chunk  = 1024;
+
+            std::vector<float>       buf32(size_t(chunk) * size_t(n_row));
+            std::vector<ggml_fp16_t> buf16(size_t(chunk) * size_t(n_row));
+
+            for (int64_t r0 = 0; r0 < n_rows; r0 += chunk) {
+                const int64_t nr = std::min(chunk, n_rows - r0);
+                ggml_backend_tensor_get(output, buf32.data(), size_t(r0) * output->nb[1], size_t(nr) * size_t(n_row) * sizeof(float));
+                ggml_fp32_to_fp16_row(buf32.data(), buf16.data(), nr * n_row);
+                ggml_backend_tensor_set(out16, buf16.data(), size_t(r0) * out16->nb[1], size_t(nr) * size_t(n_row) * sizeof(ggml_fp16_t));
+            }
+
+            for (auto & kv : tensors_by_name) {
+                if (kv.second == output) {
+                    kv.second = out16;
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: --fp16-head: converted %s F32 -> F16 at load (%.2f GiB -> %.2f GiB), file unchanged\n",
+                    __func__, ggml_get_name(output),
+                    ggml_nbytes(output) / 1024.0 / 1024.0 / 1024.0, ggml_nbytes(out16) / 1024.0 / 1024.0 / 1024.0);
+
+            output = out16;
+            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx_f16), std::vector<ggml_backend_buffer_ptr>{});
+            pimpl->ctxs_bufs.back().second.emplace_back(buf_f16);
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -10857,6 +10914,7 @@ llama_model_params llama_model_default_params() {
         /*.slot8                       =*/ false,
         /*.slot4                       =*/ false,
         /*.slot10                      =*/ false,
+        /*.fp16_output_head            =*/ false,
     };
 
     return result;

@@ -2071,7 +2071,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
             break;
         case GGML_TYPE_IQ2_XXS:
             snprintf(base, 256, "kernel_hyv4_fused_phaseA_iq2_xxs");
+#if !defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
             smem = 256*8 + 128; // threadgroup copies of iq2xxs_grid + ksigns_iq2xs
+#endif
             nr0  = HYV4_FUSED_PHASEA_ROWS;
             break;
         default:

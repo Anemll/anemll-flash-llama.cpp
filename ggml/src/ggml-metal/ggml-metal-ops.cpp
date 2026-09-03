@@ -4872,6 +4872,19 @@ void ggml_metal_op_flashmoe_slot8_log_stats(void) {
             fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ3_XXS],
             fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ4_XS],
             reference);
+
+    const uint64_t hyv4_iq2 =
+            fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ3_XXS] +
+            fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ4_XS];
+    if (hyv4_iq2 > 0) {
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        const char * iq2_lut = "direct-constant";
+#else
+        const char * iq2_lut = "threadgroup";
+#endif
+        GGML_LOG_INFO("%s: flashmoe_slot8 HY4 IQ2 LUT=%s dispatches=%" PRIu64 "\n",
+                __func__, iq2_lut, hyv4_iq2);
+    }
 }
 
 void ggml_metal_op_flashmoe_slot8_reset_stats(void) {

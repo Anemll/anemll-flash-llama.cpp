@@ -906,6 +906,17 @@ int main(int argc, char ** argv) {
         auto env_flag = [&](const char * name) -> const char * {
             return env_enabled(name) ? "on" : "off";
         };
+        auto env_flag_with_default = [](const char * name, bool default_enabled) -> const char * {
+            const char * v = std::getenv(name);
+            if (v == nullptr || v[0] == '\0') {
+                return default_enabled ? "on (default)" : "off";
+            }
+            if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+                std::strcmp(v, "off") == 0 || std::strcmp(v, "no") == 0) {
+                return "off (env)";
+            }
+            return "on (env)";
+        };
         auto env_value = [](const char * name) -> const char * {
             const char * v = std::getenv(name);
             return (v && v[0] != '\0') ? v : "-";
@@ -921,6 +932,12 @@ int main(int argc, char ** argv) {
             }
             return "on (default)";
         };
+#if defined(__APPLE__) && defined(GGML_USE_METAL)
+        const bool macos_ssd_slot_io_defaults =
+                params.moe_mode == "slot-bank" && !params.moe_sidecar.empty();
+#else
+        const bool macos_ssd_slot_io_defaults = false;
+#endif
         fprintf(stderr, "\nFlash-MoE settings:\n");
         fprintf(stderr, "  mode             = %s\n", params.moe_mode.c_str());
         if (!params.moe_sidecar.empty()) {
@@ -993,8 +1010,14 @@ int main(int argc, char ** argv) {
                     gpu_bank_compiled ? "on" : "off",
                     gpu_bank_disabled ? "on" : "off");
         }
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        fprintf(stderr, "  hy4-iq2-lut      = direct-constant (compiled=on)\n");
+#else
+        fprintf(stderr, "  hy4-iq2-lut      = threadgroup (compiled=off)\n");
+#endif
         fprintf(stderr, "  ds2/kimi-gpu-bank = %s\n", deepseek2_gpu_bank_mode());
-        fprintf(stderr, "  parallel-reads   = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS"));
+        fprintf(stderr, "  parallel-reads   = %s\n", env_flag_with_default(
+                "LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS", macos_ssd_slot_io_defaults));
         fprintf(stderr, "  async-upload     = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_ASYNC_SLOT_UPLOAD"));
         fprintf(stderr, "  mixed-slot-buffer= %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_MIXED_SLOT_BUFFER"));
         fprintf(stderr, "  metal-slot-decode= %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_SLOT_DECODE"));
@@ -1010,7 +1033,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  metal-disable-routed-post = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_POST"));
         fprintf(stderr, "  metal-disable-routed-types = %s\n", env_value("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_ROUTED_TYPES"));
         fprintf(stderr, "  metal-disable-shared-types = %s\n", env_value("LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DISABLE_SHARED_TYPES"));
-        fprintf(stderr, "  cpu-vis-writes   = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES"));
+        fprintf(stderr, "  cpu-vis-writes   = %s\n", env_flag_with_default(
+                "LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES", macos_ssd_slot_io_defaults));
         fprintf(stderr, "\n");
     }
 

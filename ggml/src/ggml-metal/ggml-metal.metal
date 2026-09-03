@@ -10559,13 +10559,20 @@ static inline void hyv4_stq1_0_dot_rows(
 }
 
 // IQ2_XXS: one 32-value sub-block per lane per iteration (kernel_mul_mv_iq2_xxs_f32_impl).
-// svalues/ssigns are threadgroup copies of iq2xxs_grid / ksigns_iq2xs.
+// The default build reads the immutable grid/sign tables directly from Metal constant memory,
+// avoiding a 2,176-byte copy and barrier per Phase-A threadgroup. The compile-time fallback
+// retains the original threadgroup LUT path for controlled A/B testing.
 static inline float hyv4_iq2_xxs_dot_subblock(
         device const block_iq2_xxs * xr,
         int                          ib,
         thread const float         * yl,
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        constant const uint64_t    * svalues,
+        constant const uint8_t     * ssigns) {
+#else
         threadgroup const uint64_t * svalues,
         threadgroup const uint8_t  * ssigns) {
+#endif
     device const uint16_t * q2   = xr->qs + 4*ib;
     device const uint8_t  * aux8 = (device const uint8_t *) q2;
     const uint32_t aux32 = q2[2] | (q2[3] << 16);
@@ -10573,7 +10580,11 @@ static inline float hyv4_iq2_xxs_dot_subblock(
 
     float sum = 0.f;
     for (short l = 0; l < 4; ++l) {
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        constant const uint8_t * grid = (constant const uint8_t *)(svalues + aux8[l]);
+#else
         threadgroup const uint8_t * grid = (threadgroup const uint8_t *)(svalues + aux8[l]);
+#endif
         const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
         for (short j = 0; j < 8; ++j) {
             sum += yl[8*l + j] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
@@ -10592,8 +10603,13 @@ static inline void hyv4_iq2_xxs_dot_rows(
         int                          nrows,
         device const float         * y,
         int                          ne00,
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+        constant const uint64_t    * svalues,
+        constant const uint8_t     * ssigns,
+#else
         threadgroup const uint64_t * svalues,
         threadgroup const uint8_t  * ssigns,
+#endif
         ushort                       tiisg,
         thread float2              * sumf) {
     const int nb   = ne00 / QK_K;
@@ -10819,9 +10835,12 @@ kernel void kernel_hyv4_fused_phaseA_iq2_xxs_t(
         device const char * up,       // IQ2_XXS [n_embd, n_ff, n_slots]
         device const char * slot_ids, // i32 [n_used]
         device       char * h,        // f32 [n_ff, n_used]
+#if !defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
         threadgroup  char * shmem [[threadgroup(0)]],
+#endif
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
+#if !defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
     threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     for (int i = tiisg; i < 256; i += N_SIMDWIDTH) {
@@ -10831,7 +10850,7 @@ kernel void kernel_hyv4_fused_phaseA_iq2_xxs_t(
         ssigns[i] = ksigns_iq2xs[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
+#endif
     const int j0 = tgpig.x * NR;
     const int e  = tgpig.z;
     if (j0 >= args.n_ff || e >= args.n_used) {
@@ -10846,7 +10865,11 @@ kernel void kernel_hyv4_fused_phaseA_iq2_xxs_t(
     device const char  * up_base   = up   + slot*args.up_nb2   + (uint64_t) j0*args.up_nb1;
 
     float2 sumf[NR];
+#if defined(LLAMA_FLASH_MOE_HY4_DIRECT_IQ2_LUT)
+    hyv4_iq2_xxs_dot_rows<NR>(gate_base, up_base, args.gate_nb1, args.up_nb1, nrows, y, args.n_embd, iq2xxs_grid, ksigns_iq2xs, tiisg, sumf);
+#else
     hyv4_iq2_xxs_dot_rows<NR>(gate_base, up_base, args.gate_nb1, args.up_nb1, nrows, y, args.n_embd, svalues, ssigns, tiisg, sumf);
+#endif
 
     device float * hout = (device float *) h + (uint64_t) e*args.n_ff + j0;
     for (int r = 0; r < NR; ++r) {

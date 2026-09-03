@@ -616,6 +616,15 @@ bool ggml_backend_is_metal(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_metal_guid());
 }
 
+bool ggml_backend_buffer_is_metal_shared(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        return false;
+    }
+
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
+    return ggml_metal_buffer_is_shared(ctx);
+}
+
 void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

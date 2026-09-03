@@ -536,6 +536,7 @@ public:
     ~llm_graph_input_moe_slot_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * slot_ids = nullptr; // I32 [n_expert_used, n_tokens]
 
