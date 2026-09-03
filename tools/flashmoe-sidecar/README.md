@@ -29,6 +29,7 @@ Per-model extract + run recipes in this document:
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | Tencent HY V3 ([IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | hy_v3 | [Export](#export-a-tencent-hy-v3-flash-package) | [Run](#export-a-tencent-hy-v3-flash-package) |
+| Tencent HY4 preview ([STQ1_0 GGUF](https://huggingface.co/AngelSlim/Hy4-preview-GGUF)) | hyv4 | [Export](#export-a-tencent-hy4-preview-flash-package) | [Run](#export-a-tencent-hy4-preview-flash-package) |
 | Qwen3.8-2.4T-A95B | qwen35moe | [Export](#export-a-qwen38-flash-package) | [Run](#run-qwen38-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 | **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
@@ -286,6 +287,32 @@ substantial part of its cache at the default precision. `--slot4` versus
 KV-cache size. DeepSeek V4 users should also avoid `--swa-full` when minimizing
 memory. See [Hy3 KV-cache memory notes](./HY3.md#kv-cache-memory-notes) for the
 detailed explanation.
+
+## Export a Tencent HY4 preview Flash package
+
+HY4 is a distinct `hyv4` architecture, with a leading dense block, 77
+256-expert routed blocks, native top-8 routing, MLA/DSA attention, and iHC.
+The published `Hy4-preview-STQ1_0.gguf` is a mixed STQ1_0/IQ checkpoint: its
+STQ1_0 tensors use GGML type 43, not `TQ1_0`. The preparation helper copies
+each routed tensor byte-for-byte into an expert-major sidecar and emits the
+dense/shared GGUF under `~/Models/HY4/` by default.
+
+See [`HY4.md`](./HY4.md) for the required metadata preflight, one-layer canary,
+full conversion, capacity precautions, and native Metal SSD-streamed decode
+smoke test.
+
+```bash
+python3 ./tools/flashmoe-sidecar/hyv4_prepare.py \
+  --model /Volumes/TB36/Models/Hy4/Hy4-preview-GGUF/Hy4-preview-STQ1_0.gguf \
+  --out-dir ~/Models/HY4/Hy4-preview-Flash-STQ1_0
+```
+
+HY4 uses the generic mixed-quant separate gate/up/down slot-bank decode path.
+Preserve native routing with `--moe-slot-bank 8 --moe-topk 8 -ub 1`, and do
+not use the existing IQ-only `--slot4` or `--slot8` fused modes.
+The initial runtime keeps the DSA weights but uses full MLA attention, so keep
+the visible context at or below its 2048-key indexer window; see
+[`HY4.md`](./HY4.md) for that limitation and the native-DSA follow-up boundary.
 
 ## Export a dense-only GGUF (experimental)
 

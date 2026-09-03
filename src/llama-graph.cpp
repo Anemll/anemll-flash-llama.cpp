@@ -1754,7 +1754,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate_exps) {
-                if (arch == LLM_ARCH_DEEPSEEK4 && il >= 0) {
+                if ((arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_HYV4) && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {

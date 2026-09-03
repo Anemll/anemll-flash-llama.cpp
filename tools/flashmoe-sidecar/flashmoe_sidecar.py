@@ -278,8 +278,9 @@ def build_tensor_index(
     expert_count = reader_scalar(first_reader, f"{arch}.expert_count")
     expert_used_count = reader_scalar(first_reader, f"{arch}.expert_used_count")
     leading_dense = reader_scalar(first_reader, f"{arch}.leading_dense_block_count")
-    if arch == "hy_v3" and leading_dense is None:
-        # Early HY V3 conversions omitted this key, although blk.0 is dense.
+    if arch in ("hy_v3", "hyv4") and leading_dense is None:
+        # Early HY V3 conversions and the published HY4 preview omit this key,
+        # although blk.0 is a dense FFN in both layouts.
         leading_dense = 1
 
     tensors: dict[str, dict[str, Any]] = {}
@@ -298,10 +299,13 @@ def build_tensor_index(
             block_size, _ = GGML_QUANT_SIZES[tensor.tensor_type]
             shape = [int(v) for v in tensor.shape.tolist()]
             bytes_per_expert = None
+            entry_expert_count = None
             if len(shape) >= 3 and shape[2] > 0 and tensor.n_bytes % shape[2] == 0:
+                entry_expert_count = shape[2]
                 bytes_per_expert = tensor.n_bytes // shape[2]
             elif len(shape) == 1 and expert_count > 0 and tensor.n_bytes % expert_count == 0:
                 # 1D per-expert tensors (e.g. ffn_down_exps.scale)
+                entry_expert_count = expert_count
                 bytes_per_expert = tensor.n_bytes // expert_count
 
             tensors[tensor.name] = {
@@ -318,6 +322,9 @@ def build_tensor_index(
                 "source_offset": int(tensor.data_offset),
                 "shape": shape,
                 "bytes_per_expert": int(bytes_per_expert) if bytes_per_expert is not None else None,
+                # Kept per entry because expert-major manifests may be
+                # repacked or byte-verified without their source GGUF open.
+                "expert_count": int(entry_expert_count) if entry_expert_count is not None else None,
                 "quant_tier": None,
                 "projection_quant_kind": None,
                 "alternate_bank_offsets": None,
@@ -574,6 +581,23 @@ def compare_exact_bytes(
         remaining -= chunk_size
 
 
+def sidecar_entry_expert_count(entry: dict[str, Any]) -> int:
+    """Return an entry's expert count, accepting manifests written before v1.1."""
+    value = entry.get("expert_count")
+    if value is None:
+        shape = entry.get("shape")
+        if isinstance(shape, list) and len(shape) >= 3:
+            value = shape[2]
+    if value is None:
+        bpe = entry.get("bytes_per_expert")
+        nbytes = entry.get("exact_byte_length")
+        if bpe is not None and nbytes is not None and int(bpe) > 0 and int(nbytes) % int(bpe) == 0:
+            value = int(nbytes) // int(bpe)
+    if value is None or int(value) <= 0:
+        raise SystemExit(f"entry '{entry['tensor_name']}' is missing a valid expert_count")
+    return int(value)
+
+
 def compare_expert_major_bytes(
     source_handle: Any,
     source_offset: int,
@@ -582,7 +606,7 @@ def compare_expert_major_bytes(
     tensor_name: str,
 ) -> None:
     bytes_per_expert = int(entry["bytes_per_expert"])
-    expert_count = int(entry["expert_count"])
+    expert_count = sidecar_entry_expert_count(entry)
     for expert in range(expert_count):
         compare_exact_bytes(
             source_handle=source_handle,
@@ -708,7 +732,7 @@ def cmd_repack_expert_major(args: argparse.Namespace) -> int:
 
         for layer, layer_entries in sorted(by_layer.items()):
             layer_entries = sorted(layer_entries, key=lambda entry: FAMILY_ORDER.get(entry["tensor_family"], 99))
-            expert_counts = {int(entry["expert_count"]) for entry in layer_entries}
+            expert_counts = {sidecar_entry_expert_count(entry) for entry in layer_entries}
             if len(expert_counts) != 1:
                 raise SystemExit(f"layer {layer} has inconsistent expert counts: {sorted(expert_counts)}")
             expert_count = expert_counts.pop()

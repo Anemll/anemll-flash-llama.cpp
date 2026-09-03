@@ -753,6 +753,135 @@ static std::vector<size_t> unicode_regex_split_custom_afmoe(const std::string & 
     return bpe_offsets;
 }
 
+// HY4's third pre-tokenizer Split (Isolated), applied after the digit and CJK
+// splits.  std::regex does not preserve fancy-regex's leftmost-first behavior
+// for all adjacent punctuation/symbol runs, so keep this path explicit.
+static std::vector<size_t> unicode_regex_split_custom_hyv4(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    auto is_ascii_alpha = [] (const uint32_t c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    };
+    // [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]
+    auto is_ascii_punct = [] (const uint32_t c) {
+        return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) ||
+               (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+    };
+
+    size_t start = 0;
+    for (const auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        static const uint32_t out_of_range = 0xFFFFFFFF;
+        auto get_cpt = [&] (const size_t pos) -> uint32_t {
+            return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : out_of_range;
+        };
+        auto get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
+            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        };
+        size_t prev_end = offset_ini;
+        auto add_token = [&] (const size_t end) -> size_t {
+            assert(prev_end <= end && end <= offset_end);
+            const size_t len = end - prev_end;
+            if (len > 0) {
+                bpe_offsets.push_back(len);
+            }
+            prev_end = end;
+            return len;
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end; ) {
+            const uint32_t cpt = get_cpt(pos);
+            const auto flags = get_flags(pos);
+            size_t match_end = pos;
+
+            // [<ASCII punctuation>][A-Za-z]+
+            if (is_ascii_punct(cpt) && is_ascii_alpha(get_cpt(pos + 1))) {
+                size_t p = pos + 1;
+                while (is_ascii_alpha(get_cpt(p))) {
+                    ++p;
+                }
+                match_end = p;
+            }
+
+            // [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+            if (match_end == pos) {
+                const bool cur_lm = flags.is_letter || flags.is_accent_mark;
+                const bool cur_leadable = !(cpt == '\r' || cpt == '\n' ||
+                                            flags.is_letter || flags.is_punctuation || flags.is_symbol);
+                const auto next_flags = get_flags(pos + 1);
+                const bool next_lm = next_flags.is_letter || next_flags.is_accent_mark;
+                if (cur_lm || (cur_leadable && next_lm)) {
+                    size_t p = pos + 1;
+                    while (get_flags(p).is_letter || get_flags(p).is_accent_mark) {
+                        ++p;
+                    }
+                    match_end = p;
+                }
+            }
+
+            // <space>?[\p{P}\p{S}]+[\r\n]*
+            if (match_end == pos) {
+                const bool lead_space = cpt == ' ';
+                const auto first_flags = lead_space ? get_flags(pos + 1) : flags;
+                if (first_flags.is_punctuation || first_flags.is_symbol) {
+                    size_t p = pos + (lead_space ? 1 : 0);
+                    while (get_flags(p).is_punctuation || get_flags(p).is_symbol) {
+                        ++p;
+                    }
+                    uint32_t next_cpt = get_cpt(p);
+                    while (next_cpt == '\r' || next_cpt == '\n') {
+                        next_cpt = get_cpt(++p);
+                    }
+                    match_end = p;
+                }
+            }
+
+            // \s*[\r\n]+ | \s+(?!\S) | \s+
+            if (match_end == pos) {
+                size_t n_whitespace = 0;
+                size_t last_newline_end = 0;
+                while (get_flags(pos + n_whitespace).is_whitespace) {
+                    const uint32_t cpt2 = get_cpt(pos + n_whitespace);
+                    if (cpt2 == '\r' || cpt2 == '\n') {
+                        last_newline_end = pos + n_whitespace + 1;
+                    }
+                    ++n_whitespace;
+                }
+                if (last_newline_end > 0) {
+                    match_end = last_newline_end;
+                } else if (n_whitespace > 1 && get_cpt(pos + n_whitespace) != out_of_range) {
+                    match_end = pos + n_whitespace - 1;
+                } else if (n_whitespace > 0) {
+                    match_end = pos + n_whitespace;
+                }
+            }
+
+            if (match_end > pos) {
+                if (pos > prev_end) {
+                    add_token(pos);
+                }
+                pos = match_end;
+                add_token(pos);
+            } else {
+                ++pos;
+            }
+        }
+
+        if (offset_end > prev_end) {
+            add_token(offset_end);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -775,6 +904,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
         // Splits digits into groups of 3 from the right (e.g., 1234567 -> 1, 234, 567)
         // TODO: Revisit this regex, in case there are any subtle tokenization differences with the original regex.
         bpe_offsets = unicode_regex_split_custom_afmoe(text, offsets);
+    } else if (regex_expr == "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_hyv4(text, offsets);
     }
 
     return bpe_offsets;

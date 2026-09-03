@@ -10477,6 +10477,159 @@ kernel void kernel_flashmoe_slot8_phaseB_iq1_xxxs(
     }
 }
 
+// HYV4 fused routed-MoE Phase A.
+//
+// HY4 uses a fixed top-8, bias-free SwiGLU expert FFN.  The published mixed
+// STQ package has two uniform gate/up formats per layer: STQ1_0 or IQ2_XXS.
+// These kernels deliberately cover Phase A only (gate/up/SwiGLU), leaving the
+// generic slot-bank decoder as the active implementation until the matching
+// HYV4-specific op dispatch and Phase B quant specializations are wired up.
+//
+// They must not be used as a generic STQ path: the tensor type is selected by
+// the future HYV4 dispatcher after checking the exact, per-layer triplet.
+
+static inline float hyv4_dot16(const thread float4x4 & q, device const float * y) {
+    return dot(q[0], float4(y[ 0], y[ 1], y[ 2], y[ 3])) +
+           dot(q[1], float4(y[ 4], y[ 5], y[ 6], y[ 7])) +
+           dot(q[2], float4(y[ 8], y[ 9], y[10], y[11])) +
+           dot(q[3], float4(y[12], y[13], y[14], y[15]));
+}
+
+// One lane handles one 16-value quant sub-block.  A 32-lane simdgroup covers
+// two QK_K blocks per iteration, which is exact for HY4's 6144-wide input.
+static inline float2 hyv4_iq2_xxs_dot_row_pair(
+        device const block_iq2_xxs * gate_row,
+        device const block_iq2_xxs * up_row,
+        device const float         * y,
+        int                          ne00,
+        ushort                       tiisg) {
+    float2 sum = 0.0f;
+    const int nb = ne00 / QK_K;
+
+    for (int block0 = 0; block0 < nb; block0 += 2) {
+        const int block = block0 + tiisg / 16;
+        if (block >= nb) {
+            continue;
+        }
+
+        const short il = tiisg % 16;
+        float4x4 gate_q;
+        float4x4 up_q;
+        dequantize_iq2_xxs<float4x4>(gate_row + block, il, gate_q);
+        dequantize_iq2_xxs<float4x4>(up_row   + block, il, up_q);
+
+        const device float * yi = y + block * QK_K + il * 16;
+        sum[0] += hyv4_dot16(gate_q, yi);
+        sum[1] += hyv4_dot16(up_q,   yi);
+    }
+
+    return float2(simd_sum(sum[0]), simd_sum(sum[1]));
+}
+
+// STQ1_0 is structured ternary 3:4: each codebook entry represents four
+// activations strided by 16 within a 64-value chunk.  Assigning a lane to each
+// codebook group avoids materialising a dequantised row and preserves the
+// released type-43 layout byte-for-byte.
+static inline float2 hyv4_stq1_0_dot_row_pair(
+        device const block_stq1_0 * gate_row,
+        device const block_stq1_0 * up_row,
+        device const float        * y,
+        int                         ne00,
+        ushort                      tiisg) {
+    float2 sum = 0.0f;
+    const int nb = ne00 / QK_K;
+
+    for (int block = 0; block < nb; ++block) {
+        const int group0 = tiisg;
+        const int group1 = tiisg + 32;
+        const device block_stq1_0 * gate_b = gate_row + block;
+        const device block_stq1_0 * up_b   = up_row   + block;
+        const float gate_d = (float) gate_b->d;
+        const float up_d   = (float) up_b->d;
+
+        for (int group = group0; group <= group1; group += 32) {
+            const uint8_t gate_code = (gate_b->qs[group / 2] >> (4 * (group & 1))) & 0x0f;
+            const uint8_t up_code   = (up_b->qs[group / 2]   >> (4 * (group & 1))) & 0x0f;
+            const uint8_t gate_sign = (gate_b->sign[group / 8] >> (group & 7)) & 0x01;
+            const uint8_t up_sign   = (up_b->sign[group / 8]   >> (group & 7)) & 0x01;
+            const uint8_t gate_q    = stq1_0_codebook[(gate_sign << 4) | gate_code];
+            const uint8_t up_q      = stq1_0_codebook[(up_sign << 4) | up_code];
+            const int chunk = group / 16;
+            const int gloc  = group % 16;
+            const device float * yi = y + block * QK_K + chunk * 64 + gloc;
+
+            for (int p = 0; p < 4; ++p) {
+                const float a = yi[p * 16];
+                sum[0] += a * (float(int((gate_q >> (2 * p)) & 0x03) - 1)) * gate_d;
+                sum[1] += a * (float(int((up_q   >> (2 * p)) & 0x03) - 1)) * up_d;
+            }
+        }
+    }
+
+    return float2(simd_sum(sum[0]), simd_sum(sum[1]));
+}
+
+// Grid = (n_ff, 1, 8), exactly one simdgroup per routed expert row.
+[[host_name("kernel_hyv4_fused_phaseA_iq2_xxs")]]
+kernel void kernel_hyv4_fused_phaseA_iq2_xxs(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,
+        device const char * gate,
+        device const char * up,
+        device const char * slot_ids,
+        device       char * h,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int j = tgpig.x;
+    const int e = tgpig.z;
+    if (j >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+
+    const int slot = *(device const int *)(slot_ids + e * args.slot_nb0);
+    const device float * y = (device const float *) x;
+    const device block_iq2_xxs * gate_row =
+            (device const block_iq2_xxs *)(gate + slot * args.gate_nb2 + (uint64_t) j * args.gate_nb1);
+    const device block_iq2_xxs * up_row =
+            (device const block_iq2_xxs *)(up + slot * args.up_nb2 + (uint64_t) j * args.up_nb1);
+    const float2 gu = hyv4_iq2_xxs_dot_row_pair(gate_row, up_row, y, args.n_embd, tiisg);
+
+    if (tiisg == 0) {
+        ((device float *) h)[(uint64_t) e * args.n_ff + j] =
+                (gu[0] / (1.0f + exp(-gu[0]))) * gu[1];
+    }
+}
+
+[[host_name("kernel_hyv4_fused_phaseA_stq1_0")]]
+kernel void kernel_hyv4_fused_phaseA_stq1_0(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,
+        device const char * gate,
+        device const char * up,
+        device const char * slot_ids,
+        device       char * h,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int j = tgpig.x;
+    const int e = tgpig.z;
+    if (j >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+
+    const int slot = *(device const int *)(slot_ids + e * args.slot_nb0);
+    const device float * y = (device const float *) x;
+    const device block_stq1_0 * gate_row =
+            (device const block_stq1_0 *)(gate + slot * args.gate_nb2 + (uint64_t) j * args.gate_nb1);
+    const device block_stq1_0 * up_row =
+            (device const block_stq1_0 *)(up + slot * args.up_nb2 + (uint64_t) j * args.up_nb1);
+    const float2 gu = hyv4_stq1_0_dot_row_pair(gate_row, up_row, y, args.n_embd, tiisg);
+
+    if (tiisg == 0) {
+        ((device float *) h)[(uint64_t) e * args.n_ff + j] =
+                (gu[0] / (1.0f + exp(-gu[0]))) * gu[1];
+    }
+}
+
 template<int NR0, typename args_t>
 void kernel_mul_mv_iq4_nl_f32_impl(
         args_t args,
@@ -10699,6 +10852,90 @@ kernel void kernel_mul_mv_iq4_xs_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// STQ1_0 is 3:4 structured ternary.  Each lane owns two 4-value groups
+// (one in each 64-value chunk) and accumulates those strided values directly.
+template<int nr0, typename args_t>
+void kernel_mul_mv_stq1_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    GGML_METAL_MUL_MV_REBASE(args, src0, src1, dst);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int nb = args.ne00/QK_K;
+    const int ns01 = args.nb01/args.nb00;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_stq1_0 * x = (device const block_stq1_0 *) (src0 + offset0);
+    device const float        * y = (device const float        *) (src1 + offset1);
+
+    const int group0 = tiisg;
+    const int group1 = tiisg + N_SIMDWIDTH;
+    float sumf[nr0] = {0.f};
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int row = 0; row < nr0; ++row) {
+            device const block_stq1_0 & xb = x[row*ns01 + ib];
+            const float d = (float) xb.d;
+            float sum = 0.f;
+
+            for (int group = group0; group <= group1; group += N_SIMDWIDTH) {
+                const uint8_t code = (xb.qs[group/2] >> (4*(group & 1))) & 0x0f;
+                const uint8_t sign = (xb.sign[group/8] >> (group & 7)) & 0x01;
+                const uint8_t qpack = stq1_0_codebook[(sign << 4) | code];
+                const int chunk = group/16;
+                const int gloc = group%16;
+                device const float * yi = y + ib*QK_K + chunk*64 + gloc;
+
+                for (int p = 0; p < 4; ++p) {
+                    const int q = int((qpack >> (2*p)) & 0x03) - 1;
+                    sum += yi[p*16] * q;
+                }
+            }
+
+            sumf[row] += d * sum;
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_stq1_0_f32")]]
+kernel void kernel_mul_mv_stq1_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_stq1_0_f32_impl<N_R0_STQ1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int NR0, typename args_t>
@@ -12367,6 +12604,7 @@ template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>>>;
 template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
 template [[host_name("kernel_mul_mv_id_f8_e4m3_b128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_f8_e4m3_b128_f32_impl<N_R0_F8_E4M3_B128>>>;
+template [[host_name("kernel_mul_mv_id_stq1_0_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_stq1_0_f32_impl<N_R0_STQ1_0>>>;
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;

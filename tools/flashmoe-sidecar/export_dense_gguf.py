@@ -296,8 +296,9 @@ def build_package_metadata(
     expert_used_count = reader_scalar(first_reader, f"{arch}.expert_used_count")
     block_count = reader_scalar(first_reader, f"{arch}.block_count")
     leading_dense = reader_scalar(first_reader, f"{arch}.leading_dense_block_count")
-    if arch == "hy_v3" and leading_dense is None:
-        # Early HY V3 conversions omitted this key, although blk.0 is dense.
+    if arch in ("hy_v3", "hyv4") and leading_dense is None:
+        # Early HY V3 conversions and the published HY4 preview omit this key,
+        # although blk.0 is a dense FFN in both layouts.
         leading_dense = 1
 
     runtime_hint: dict[str, Any] | None = None
@@ -333,6 +334,23 @@ def build_package_metadata(
                 "LLAMA_FLASH_MOE_EXPERIMENTAL_METAL_DECODE_ICB": "0",
                 "LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES": "1",
             },
+        }
+    elif arch == "hyv4":
+        runtime_hint = {
+            "moe_mode": "slot-bank",
+            "moe_topk": int(expert_used_count) if expert_used_count is not None else 8,
+            "moe_slot_bank": 8,
+            "moe_cache_io_split": 4,
+            "moe_prefetch_temporal": True,
+            "ubatch": 1,
+            "fused_slot_modes": [],
+            "note": (
+                "HY4 uses mixed STQ1_0/IQ routed tensors. Use the generic "
+                "separate gate/up/down slot-bank decode path; --slot4/--slot8 "
+                "are not supported for this package. Dense/shared work can be "
+                "offloaded normally; opt into experimental Metal slot decode only "
+                "for a separately validated experiment."
+            ),
         }
     elif arch == "qwen35moe" and expert_count is not None and int(expert_count) >= 512:
         runtime_hint = {

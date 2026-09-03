@@ -1220,6 +1220,7 @@ public:
             case LLM_ARCH_GLM_DSA:
             case LLM_ARCH_DEEPSEEK2:
             case LLM_ARCH_DEEPSEEK4:
+            case LLM_ARCH_HYV4:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_HY_V3:
                 return separate_gate_up_down;
@@ -3061,7 +3062,7 @@ private:
                 up_entry == nullptr &&
                 down_entry != nullptr;
         const float swiglu_limit =
-                model.arch == LLM_ARCH_DEEPSEEK4 && layer >= 0 ?
+                (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_HYV4) && layer >= 0 ?
                         model.hparams.swiglu_clamp_exp[layer] :
                         0.0f;
         const bool use_limited_swiglu =
@@ -10239,7 +10240,7 @@ private:
                 state.up_tensor == nullptr &&
                 state.down_tensor != nullptr;
         const float swiglu_limit =
-                model.arch == LLM_ARCH_DEEPSEEK4 && layer >= 0 ?
+                (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_HYV4) && layer >= 0 ?
                         model.hparams.swiglu_clamp_exp[layer] :
                         0.0f;
         const bool use_limited_swiglu =
@@ -14248,7 +14249,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(n_tokens * 160, 96u * model.n_tensors());
     }
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_HY_V3) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_HY_V3 || model.arch == LLM_ARCH_HYV4) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());

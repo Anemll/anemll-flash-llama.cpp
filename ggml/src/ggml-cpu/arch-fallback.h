@@ -4,8 +4,9 @@
 // Rename `_generic` functions if no native implementation is available.
 // This effectively selects the generic implementation.
 
-// Narrow IQ1 currently has only the portable implementation on every CPU
-// architecture, so select it before the per-architecture fallback table.
+// STQ1_0 and narrow IQ1 currently have only portable implementations on every
+// CPU architecture, so select them before the per-architecture fallback table.
+#define ggml_vec_dot_stq1_0_q8_K_generic ggml_vec_dot_stq1_0_q8_K
 #define ggml_vec_dot_iq1_xs_q8_K_generic ggml_vec_dot_iq1_xs_q8_K
 #define ggml_vec_dot_iq1_xxs_q8_K_generic ggml_vec_dot_iq1_xxs_q8_K
 #define ggml_vec_dot_iq1_xxxs_q8_K_generic ggml_vec_dot_iq1_xxxs_q8_K

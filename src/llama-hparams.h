@@ -219,6 +219,8 @@ struct llama_hparams {
     uint32_t n_hc                    = 1;
     uint32_t hc_sinkhorn_iters       = 0;
     float    hc_eps                  = 0.0f;
+    // HY4 independent Hyper-Connections scale the post branch by this value.
+    float    hc_magnitude            = 0.0f;
     float    compress_rope_freq_base = 0.0f;
     uint32_t dsv4_state_size         = 0;
     std::array<uint32_t, LLAMA_MAX_LAYERS> attn_compress_ratio;

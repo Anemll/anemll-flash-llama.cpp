@@ -2163,6 +2163,7 @@ static int ggml_metal_encode_mul_mat_from_tensors(
         !ggml_is_transposed(src0) &&
         !ggml_is_transposed(src1) &&
         !ggml_metal_type_is_narrow_iq1(src0->type) &&
+        src0->type != GGML_TYPE_STQ1_0 &&
         props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
         !ggml_metal_experimental_disable_mul_mm_enabled()) {
         g_ggml_metal_mul_mat_mm_count.fetch_add(1);
@@ -4572,6 +4573,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
         !ggml_metal_type_is_narrow_iq1(op->src[0]->type) &&
+        op->src[0]->type != GGML_TYPE_STQ1_0 &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
         props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
@@ -5155,6 +5157,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     }
 
     if (!ggml_metal_type_is_narrow_iq1(op->src[0]->type) &&
+        op->src[0]->type != GGML_TYPE_STQ1_0 &&
         props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min) &&
         !ggml_metal_experimental_disable_mul_mm_id_enabled()) {
         g_ggml_metal_mul_mat_id_generic_mm_count.fetch_add(1);

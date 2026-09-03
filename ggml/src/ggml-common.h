@@ -222,6 +222,16 @@ typedef struct {
 } block_f8_e4m3_b128;
 static_assert(sizeof(block_f8_e4m3_b128) == sizeof(uint8_t) + QK_F8_E4M3_B128, "wrong f8_e4m3_b128 block size/padding");
 
+// Structured ternary 3:4, 1.3125 bpw. Each of the 64 four-lane groups has
+// exactly one zero and three values in {-1, +1}; the lanes are strided by 16
+// within each 64-value chunk. This layout is the on-disk type 43 ABI.
+typedef struct {
+    uint8_t qs[QK_K/8];    // two 4-bit codebook slots per byte
+    uint8_t sign[QK_K/32]; // one codebook-half bit per group
+    ggml_half d;           // block scale
+} block_stq1_0;
+static_assert(sizeof(block_stq1_0) == sizeof(ggml_half) + QK_K/8 + QK_K/32, "wrong stq1_0 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -539,6 +549,15 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #endif
 
 #if defined(GGML_COMMON_IMPL)
+
+// Index is (sign << 4) | slot. Each packed byte encodes four ternary lanes
+// with 2-bit values: -1 -> 0b00, 0 -> 0b01, +1 -> 0b10.
+GGML_TABLE_BEGIN(uint8_t, stq1_0_codebook, 32)
+    0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06,
+    0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
+    0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4,
+    0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+GGML_TABLE_END()
 
 GGML_TABLE_BEGIN(uint8_t, kmask_iq2xs, 8)
     1, 2, 4, 8, 16, 32, 64, 128

@@ -653,6 +653,41 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class STQ1_0(__Quant, qtype=GGMLQuantizationType.STQ1_0):
+    # index = (sign << 4) | slot; mirrors stq1_0_codebook in ggml-common.h
+    _CODEBOOK = np.array([
+        0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06,
+        0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
+        0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4,
+        0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+    ], dtype=np.uint8)
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        # The C implementation owns STQ encoding. The Python reader needs only
+        # exact byte sizing and decode for inspection/conversion tooling.
+        raise NotImplementedError("STQ1_0 quantization is only implemented in C")
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        qs, sign, d = np.hsplit(blocks, [QK_K // 8, QK_K // 8 + QK_K // 32])
+        d = d.view(np.float16).astype(np.float32)
+
+        # Low slot nibble precedes high slot nibble in each byte.
+        code = np.stack([qs & 0x0F, qs >> 4], axis=-1).reshape((n_blocks, QK_K // 4))
+        sbit = (sign.reshape((n_blocks, -1, 1)) >> np.arange(8, dtype=np.uint8).reshape((1, 1, 8))) & 0x01
+        sbit = sbit.reshape((n_blocks, QK_K // 4))
+        qpack = cls._CODEBOOK[(sbit.astype(np.uint16) << 4) | code.astype(np.uint16)]
+
+        # group g of chunk c spans c*64 + (g % 16) + p*16 for p in 0..3.
+        lanes = qpack.reshape((n_blocks, QK_K // 4, 1)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4))
+        lanes = (lanes & 0x03).astype(np.int8) - np.int8(1)
+        out = lanes.reshape((n_blocks, QK_K // 64, 16, 4)).transpose(0, 1, 3, 2)
+
+        return d * out.reshape((n_blocks, QK_K)).astype(np.float32)
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf

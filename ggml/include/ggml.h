@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_RESERVED_41 = 41,
         GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
-        // IQ1_S's 8-element ternary codebook with narrower indices. 43..63
+        // Structured ternary 3:4 quantization: 1.3125 bpw, QK_K = 256.
+        // This is the upstream-assigned type id used by Hy4 GGUF files.
+        GGML_TYPE_STQ1_0  = 43,
+        // IQ1_S's 8-element ternary codebook with narrower indices. 44..63
         // remain available to upstream; fork-local types start at 64 so stock
         // readers reject these payloads instead of interpreting another type.
         GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
@@ -474,6 +477,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_STQ1_0  = 42, // except 1d tensors
         // Keep these aligned with the fork-local tensor and llama file-type ids.
         GGML_FTYPE_MOSTLY_IQ1_XS   = 64, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_XXS  = 65, // except 1d tensors

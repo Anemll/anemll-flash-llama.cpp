@@ -2396,6 +2396,184 @@ void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RE
     }
 }
 
+// Return the compact (slot, table-half) representation of a valid four-lane
+// STQ pattern. This only runs when creating STQ weights; decode uses the table
+// directly. The on-disk layout is fixed by the 32-entry codebook.
+static inline void stq1_0_encode_pattern(uint8_t qpack, uint8_t * code, uint8_t * sign) {
+    for (uint8_t i = 0; i < 32; ++i) {
+        if (stq1_0_codebook[i] == qpack) {
+            *code = i & 0x0f;
+            *sign = i >> 4;
+            return;
+        }
+    }
+    assert(!"invalid STQ1_0 ternary pattern");
+    *code = 0;
+    *sign = 0;
+}
+
+void quantize_row_stq1_0_ref(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        memset(y[i].qs,   0, sizeof(y[i].qs));
+        memset(y[i].sign, 0, sizeof(y[i].sign));
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            const float a = fabsf(x[j]);
+            if (a > amax) amax = a;
+        }
+        y[i].d = GGML_FP32_TO_FP16(amax);
+
+        // Every four-lane group is strided by 16 within its 64-value chunk.
+        // One lane is forced to zero; the other three preserve their signs.
+        for (int g = 0; g < QK_K/4; ++g) {
+            const int chunk = g / 16;
+            const int gloc  = g % 16;
+            const float * base = x + chunk*64 + gloc;
+
+            int zero_pos = 0;
+            float min_abs = fabsf(base[0]);
+            for (int p = 1; p < 4; ++p) {
+                const float a = fabsf(base[p*16]);
+                if (a < min_abs) {
+                    min_abs = a;
+                    zero_pos = p;
+                }
+            }
+
+            uint8_t qpack = 0;
+            for (int p = 0; p < 4; ++p) {
+                const uint8_t lane = p == zero_pos ? 0x1 : (base[p*16] < 0.0f ? 0x0 : 0x2);
+                qpack |= (uint8_t) (lane << (2*p));
+            }
+
+            uint8_t code;
+            uint8_t sign;
+            stq1_0_encode_pattern(qpack, &code, &sign);
+            y[i].qs  [g/2] |= (uint8_t) ((code & 0x0f) << (4*(g & 1)));
+            y[i].sign[g/8] |= (uint8_t) (sign << (g % 8));
+        }
+
+        x += QK_K;
+    }
+}
+
+// PTQ encoder for the released STQ1_0 representation.  It keeps the exact
+// 3:4 ternary layout while alternating the forced-zero choice and the weighted
+// least-squares scale, as the upstream STQ encoder does.
+static void quantize_row_stq1_0_impl(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y, int64_t k,
+                                     const float * GGML_RESTRICT quant_weights) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        memset(y[i].qs,   0, sizeof(y[i].qs));
+        memset(y[i].sign, 0, sizeof(y[i].sign));
+
+        const float * xb = x + QK_K*i;
+
+        float sumx2 = 0.f;
+        float amax  = 0.f;
+        for (int j = 0; j < QK_K; ++j) {
+            sumx2 += xb[j]*xb[j];
+            const float a = fabsf(xb[j]);
+            if (a > amax) {
+                amax = a;
+            }
+        }
+        if (!(amax > 0.f)) {
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            continue;
+        }
+
+        const float sigma2 = 2.f*sumx2/QK_K;
+        float weight[QK_K];
+        if (quant_weights) {
+            const float * qw = quant_weights + QK_K*i;
+            for (int j = 0; j < QK_K; ++j) {
+                weight[j] = qw[j]*sqrtf(sigma2 + xb[j]*xb[j]);
+            }
+        } else {
+            for (int j = 0; j < QK_K; ++j) {
+                weight[j] = sqrtf(sigma2 + xb[j]*xb[j]);
+            }
+        }
+
+        int8_t sel[QK_K];
+        float d = amax;
+
+        for (int iter = 0; iter < 3; ++iter) {
+            for (int g = 0; g < QK_K/4; ++g) {
+                const int chunk = g/16;
+                const int gloc  = g%16;
+                const int base  = chunk*64 + gloc;
+
+                int zero_pos = 0;
+                float best_cost = FLT_MAX;
+                for (int p = 0; p < 4; ++p) {
+                    const int j = base + p*16;
+                    const float ax = fabsf(xb[j]);
+                    const float cost = weight[j]*(xb[j]*xb[j] - (ax - d)*(ax - d));
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        zero_pos = p;
+                    }
+                }
+
+                for (int p = 0; p < 4; ++p) {
+                    const int j = base + p*16;
+                    sel[j] = p == zero_pos ? 0 : (xb[j] < 0.f ? -1 : 1);
+                }
+            }
+
+            float sumqx = 0.f;
+            float sumq2 = 0.f;
+            for (int j = 0; j < QK_K; ++j) {
+                const float q = sel[j];
+                sumqx += weight[j]*q*xb[j];
+                sumq2 += weight[j]*q*q;
+            }
+            if (!(sumq2 > 0.f)) {
+                break;
+            }
+
+            const float dnew = sumqx/sumq2;
+            if (!(dnew > 0.f)) {
+                break;
+            }
+            if (fabsf(dnew - d) <= 1e-6f*d) {
+                d = dnew;
+                break;
+            }
+            d = dnew;
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int g = 0; g < QK_K/4; ++g) {
+            const int chunk = g/16;
+            const int gloc  = g%16;
+            const int base  = chunk*64 + gloc;
+            uint8_t qpack = 0;
+
+            for (int p = 0; p < 4; ++p) {
+                const int8_t s = sel[base + p*16];
+                const uint8_t lane = s == 0 ? 0x1 : (s < 0 ? 0x0 : 0x2);
+                qpack |= (uint8_t) (lane << (2*p));
+            }
+
+            uint8_t code;
+            uint8_t sign;
+            stq1_0_encode_pattern(qpack, &code, &sign);
+            y[i].qs  [g/2] |= (uint8_t) ((code & 0x0f) << (4*(g & 1)));
+            y[i].sign[g/8] |= (uint8_t) (sign << (g % 8));
+        }
+    }
+}
+
 size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
@@ -2407,6 +2585,17 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_0, n_per_row);
     quantize_row_tq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_STQ1_0, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_stq1_0_impl(src, (block_stq1_0 *) qrow, n_per_row, quant_weights);
+        src  += n_per_row;
+        qrow += row_size;
+    }
     return nrow * row_size;
 }
 
@@ -2465,6 +2654,30 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
                 }
             }
         }
+    }
+}
+
+void dequantize_row_stq1_0(const block_stq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int g = 0; g < QK_K/4; ++g) {
+            const uint8_t code = (x[i].qs[g/2] >> (4*(g & 1))) & 0x0f;
+            const uint8_t sign = (x[i].sign[g/8] >> (g % 8)) & 0x01;
+            const uint8_t qpack = stq1_0_codebook[(sign << 4) | code];
+            const int chunk = g / 16;
+            const int gloc  = g % 16;
+
+            for (int p = 0; p < 4; ++p) {
+                const int q = (qpack >> (2*p)) & 0x03;
+                y[chunk*64 + gloc + p*16] = (float) (q - 1) * d;
+            }
+        }
+
+        y += QK_K;
     }
 }
 
@@ -5845,6 +6058,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_STQ1_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_stq1_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

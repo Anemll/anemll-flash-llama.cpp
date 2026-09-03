@@ -58,6 +58,8 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_TINY_AYA        = 47,
     LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM       = 48,
     LLAMA_VOCAB_PRE_TYPE_JAIS2           = 49,
+    // HY4 uses the same three-stage BPE split family as DeepSeek-V3/Hunyuan.
+    LLAMA_VOCAB_PRE_TYPE_HYV4            = 50,
 };
 
 struct LLM_KV;

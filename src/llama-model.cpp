@@ -2324,6 +2324,83 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 type = LLM_TYPE_UNKNOWN;
             } break;
+        case LLM_ARCH_HYV4:
+            {
+                // HY4 is a distinct MLA + iHC MoE architecture.  Its sparse
+                // indexer schedule is retained in hparams even though this
+                // branch currently executes the exact full-attention fallback
+                // (the existing DSA cache implementation is not available in
+                // this fork yet).
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps, false);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv, false);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp, hparams.n_layer, false);
+
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,     hparams.n_hc, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,       hparams.hc_eps, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_MAGNITUDE, hparams.hc_magnitude, false);
+
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+
+                if (hparams.n_layer_dense_lead == 0) {
+                    // The published preview has blk.0 as the single dense FFN.
+                    hparams.n_layer_dense_lead = 1;
+                }
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+                }
+                if (hparams.n_hc == 0) {
+                    hparams.n_hc = 4;
+                }
+                if (hparams.hc_eps == 0.0f) {
+                    hparams.hc_eps = 1.0e-6f;
+                }
+                if (hparams.hc_magnitude == 0.0f) {
+                    hparams.hc_magnitude = 2.0f;
+                }
+
+                if (!hparams.is_mla()) {
+                    throw std::runtime_error("HY4 requires MLA key/value dimensions");
+                }
+                if (hparams.n_expert == 0 || hparams.n_expert_used == 0 || hparams.n_ff_exp == 0) {
+                    throw std::runtime_error("HY4 requires routed-expert count, top-k, and expert FFN dimensions");
+                }
+
+                hparams.indexer_is_full.fill(false);
+                if (hparams.indexer_top_k > 0) {
+                    std::array<uint32_t, LLAMA_MAX_LAYERS> indexer_is_full = {};
+                    if (!ml.get_key_or_arr(
+                                LLM_KV_ATTENTION_INDEXER_IS_FULL,
+                                indexer_is_full,
+                                hparams.n_layer,
+                                false)) {
+                        throw std::runtime_error("HY4 DSA metadata is missing attention.indexer.is_full");
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        if (indexer_is_full[il] > 1) {
+                            throw std::runtime_error(format("HY4 indexer.is_full[%u] must be 0 or 1", il));
+                        }
+                        hparams.indexer_is_full[il] = indexer_is_full[il] != 0;
+                    }
+                    if (!hparams.indexer_is_full[0]) {
+                        throw std::runtime_error("HY4 layer 0 must own an indexer");
+                    }
+                    // The indexer k-norm is LayerNorm (rather than RMSNorm).
+                    hparams.f_norm_eps = hparams.f_norm_rms_eps;
+                }
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_PLM:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3993,6 +4070,85 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
                         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
                         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,   n_ff_exp * n_expert_shared}, 0);
+                    }
+                } break;
+            case LLM_ARCH_HYV4:
+                {
+                    const int64_t n_embd_head_k_mla   = hparams.n_embd_head_k_mla();
+                    const int64_t n_embd_head_v_mla   = hparams.n_embd_head_v_mla();
+                    const int64_t n_embd_head_qk_rope = n_rot;
+                    const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope;
+                    const int64_t q_lora_rank         = hparams.n_lora_q;
+                    const int64_t kv_lora_rank        = hparams.n_lora_kv;
+                    const int64_t n_ff_exp            = hparams.n_ff_exp;
+                    const int64_t n_expert_shared     = hparams.n_expert_shared;
+                    const int64_t n_hc                = hparams.n_hc;
+
+                    if (n_embd_head_qk_nope <= 0 || q_lora_rank <= 0 || kv_lora_rank <= 0 || n_hc <= 0) {
+                        throw std::runtime_error("HY4 has invalid MLA or iHC dimensions");
+                    }
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, 0);
+                    output_hc_base  = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_BASE,  "weight"), {n_hc}, 0);
+                    output_hc_fn    = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_FN,    "weight"), {n_hc * n_embd, n_hc}, 0);
+                    output_hc_scale = create_tensor(tn(LLM_TENSOR_OUTPUT_HC_SCALE, "weight"), {1}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
+                        layer.attn_sinks     = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head}, 0);
+                        layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, 0);
+                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
+
+                        layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, 0);
+                        layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla}, 0);
+                        layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + n_embd_head_qk_rope}, 0);
+                        layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B,      "weight", i), {n_embd_head_qk_nope, kv_lora_rank, n_head}, 0);
+                        layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B,      "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, 0);
+                        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {n_head * n_embd_head_v_mla, n_embd}, 0);
+                        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE,     "weight", i), {n_embd, n_head * n_embd_head_v_mla}, 0);
+
+                        // The first HY4 graph uses full MLA attention.  Consume the
+                        // sparse-indexer tensors so compact dense GGUF validation stays
+                        // strict, but do not put them in the graph until this fork gains
+                        // a compatible DSA KV cache.
+                        if (hparams.indexer_top_k > 0 && hparams.indexer_is_full[i]) {
+                            create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size}, TENSOR_SKIP);
+                            create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, hparams.indexer_head_size}, TENSOR_SKIP);
+                            create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {hparams.indexer_head_size}, TENSOR_SKIP);
+                            create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {hparams.indexer_head_size}, TENSOR_SKIP);
+                            create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, TENSOR_SKIP);
+                        }
+
+                        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {2 * n_hc}, 0);
+                        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {n_hc * n_embd, 2 * n_hc}, 0);
+                        layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {2}, 0);
+                        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {2 * n_hc}, 0);
+                        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {n_hc * n_embd, 2 * n_hc}, 0);
+                        layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {2}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        if ((uint32_t) i < hparams.n_layer_dense_lead) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        } else {
+                            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                            // Selection bias is present in the published preview.
+                            // Keep it optional for compatible HY4 conversions which
+                            // omit it; build_moe_ffn handles the unbiased route when
+                            // this tensor is absent.
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_gate_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_up_exps   = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps = create_routed_expert_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
+                        }
                     }
                 } break;
             case LLM_ARCH_LLAMA:
@@ -10382,6 +10538,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_deepseek4>(*this, params);
             } break;
+        case LLM_ARCH_HYV4:
+            {
+                llm = std::make_unique<llm_build_hyv4>(*this, params);
+            } break;
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_MISTRAL4:
@@ -10821,6 +10981,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_HYV4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

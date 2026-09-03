@@ -3938,6 +3938,7 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     F8_E4M3_B128 = 42
+    STQ1_0  = 43
     # Unsloth narrow-index IQ1 variants.  These deliberately use fork-local
     # IDs above the upstream range so stock readers reject, rather than
     # misinterpret, their tensor payloads.
@@ -3998,6 +3999,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_F8_E4M3_MXFP4 = 41  # except 1d tensors
+    MOSTLY_STQ1_0        = 42  # except 1d tensors
     MOSTLY_IQ1_XS        = 64  # except 1d tensors
     MOSTLY_IQ1_XXS       = 65  # except 1d tensors
     MOSTLY_IQ1_XXXS      = 66  # except 1d tensors
@@ -4110,6 +4112,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.F8_E4M3_B128: (128, 1 + 128),
+    GGMLQuantizationType.STQ1_0:  (256, 2 + QK_K // 8 + QK_K // 32),
     GGMLQuantizationType.IQ1_XS:   (256, 2 + QK_K // 8 + QK_K // 32 + QK_K // 64),
     GGMLQuantizationType.IQ1_XXS:  (256, 2 + QK_K // 8 + QK_K // 32),
     GGMLQuantizationType.IQ1_XXXS: (256, 2 + QK_K // 8 + QK_K // 64),

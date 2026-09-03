@@ -351,6 +351,14 @@ struct llm_build_hy_v3 : public llm_graph_context {
     llm_build_hy_v3(const llama_model & model, const llm_graph_params & params);
 };
 
+// HY4 uses MLA attention with an independent Hyper-Connections residual
+// layout and routed MoE experts. DSA metadata is retained by the loader; the
+// first implementation uses the exact dense attention fallback until a native
+// sparse-indexer cache is available in this fork.
+struct llm_build_hyv4 : public llm_graph_context {
+    llm_build_hyv4(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_internlm2 : public llm_graph_context {
     llm_build_internlm2(const llama_model & model, const llm_graph_params & params);
 };
