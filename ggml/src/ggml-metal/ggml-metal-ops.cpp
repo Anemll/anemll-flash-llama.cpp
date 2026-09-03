@@ -4778,23 +4778,113 @@ size_t ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(const ggml_tensor * op) {
     const size_t ff_bytes      = GGML_PAD(size_t(n_ff)   * sizeof(float), TENSOR_ALIGNMENT);
     const size_t experts_bytes = GGML_PAD(size_t(n_embd) * size_t(n_used) * sizeof(float), TENSOR_ALIGNMENT);
 
-    // gate_tmp + up_tmp + act_tmp (each [n_ff]) + per-expert down outputs [n_embd, n_used]
-    return 3 * ff_bytes + experts_bytes;
+    // reference encode: gate_tmp + up_tmp + act_tmp (each [n_ff]) + per-expert down outputs [n_embd, n_used]
+    const size_t reference_bytes = 3 * ff_bytes + experts_bytes;
+
+    // fused encode: h[n_ff, n_used] (exceeds the reference scratch when n_ff > n_embd)
+    const size_t fused_bytes = GGML_PAD(size_t(n_ff) * size_t(n_used) * sizeof(float), TENSOR_ALIGNMENT);
+
+    return std::max(reference_bytes, fused_bytes);
 }
 
+// LLAMA_FLASH_MOE_SLOT8_REFERENCE=1 forces the mul_mat reference encoder for A/B testing.
+// Re-read on every encode (a handful of calls per token) so tests can toggle it in-process.
 static bool ggml_metal_slot8_use_reference(void) {
-    static int enabled = -1;
-    if (enabled == -1) {
-        const char * value = getenv("LLAMA_FLASH_MOE_SLOT8_REFERENCE");
-        enabled = (value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    const char * value = getenv("LLAMA_FLASH_MOE_SLOT8_REFERENCE");
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+// --slot8 dispatch accounting. Only these counters prove which Metal path ran: the graph-side
+// "slot8 eligible" log proves operator selection, not the kernel that executed.
+enum ggml_metal_slot8_kind {
+    GGML_METAL_SLOT8_KIND_IQ1 = 0,
+    GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ3_XXS,
+    GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ4_XS,
+    GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ3_XXS,
+    GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ4_XS,
+    GGML_METAL_SLOT8_KIND_COUNT,
+};
+
+static const char * const ggml_metal_slot8_kind_names[GGML_METAL_SLOT8_KIND_COUNT] = {
+    "iq1",
+    "hyv4:stq1_0/iq3_xxs",
+    "hyv4:stq1_0/iq4_xs",
+    "hyv4:iq2_xxs/iq3_xxs",
+    "hyv4:iq2_xxs/iq4_xs",
+};
+
+static std::atomic<uint64_t> g_ggml_metal_slot8_fused_count[GGML_METAL_SLOT8_KIND_COUNT] = {};
+static std::atomic<uint64_t> g_ggml_metal_slot8_reference_count { 0 };
+static std::atomic<bool>     g_ggml_metal_slot8_announced[GGML_METAL_SLOT8_KIND_COUNT] = {};
+
+// Returns the fused kernel family for this op's (gate, up, down) type triplet, or -1 when the
+// triplet must use the reference encoder. Gate and up must share a type.
+static int ggml_metal_slot8_fused_kind(const ggml_tensor * op) {
+    const ggml_type tg = op->src[1]->type;
+    const ggml_type tu = op->src[2]->type;
+    const ggml_type td = op->src[3]->type;
+
+    if (tg != tu) {
+        return -1;
     }
-    return enabled == 1;
+
+    if ((tg == GGML_TYPE_IQ1_M    && td == GGML_TYPE_IQ1_M) ||
+        (tg == GGML_TYPE_IQ1_XXXS && td == GGML_TYPE_IQ1_XXXS)) {
+        return GGML_METAL_SLOT8_KIND_IQ1;
+    }
+
+    // HY4 mixed STQ package: gate/up are STQ1_0 or IQ2_XXS, down is IQ3_XXS or IQ4_XS.
+    if (tg == GGML_TYPE_STQ1_0 && td == GGML_TYPE_IQ3_XXS) {
+        return GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ3_XXS;
+    }
+    if (tg == GGML_TYPE_STQ1_0 && td == GGML_TYPE_IQ4_XS) {
+        return GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ4_XS;
+    }
+    if (tg == GGML_TYPE_IQ2_XXS && td == GGML_TYPE_IQ3_XXS) {
+        return GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ3_XXS;
+    }
+    if (tg == GGML_TYPE_IQ2_XXS && td == GGML_TYPE_IQ4_XS) {
+        return GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ4_XS;
+    }
+
+    return -1;
+}
+
+void ggml_metal_op_flashmoe_slot8_log_stats(void) {
+    uint64_t fused_total = 0;
+    uint64_t fused[GGML_METAL_SLOT8_KIND_COUNT];
+    for (int k = 0; k < GGML_METAL_SLOT8_KIND_COUNT; ++k) {
+        fused[k] = g_ggml_metal_slot8_fused_count[k].load();
+        fused_total += fused[k];
+    }
+    const uint64_t reference = g_ggml_metal_slot8_reference_count.load();
+
+    if (fused_total == 0 && reference == 0) {
+        return;
+    }
+
+    GGML_LOG_INFO("%s: flashmoe_slot8 fused=%" PRIu64 " [iq1=%" PRIu64 " stq1_0/iq3_xxs=%" PRIu64 " stq1_0/iq4_xs=%" PRIu64
+            " iq2_xxs/iq3_xxs=%" PRIu64 " iq2_xxs/iq4_xs=%" PRIu64 "] reference=%" PRIu64 "\n",
+            __func__, fused_total,
+            fused[GGML_METAL_SLOT8_KIND_IQ1],
+            fused[GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ3_XXS],
+            fused[GGML_METAL_SLOT8_KIND_HYV4_STQ1_0_IQ4_XS],
+            fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ3_XXS],
+            fused[GGML_METAL_SLOT8_KIND_HYV4_IQ2_XXS_IQ4_XS],
+            reference);
+}
+
+void ggml_metal_op_flashmoe_slot8_reset_stats(void) {
+    for (int k = 0; k < GGML_METAL_SLOT8_KIND_COUNT; ++k) {
+        g_ggml_metal_slot8_fused_count[k].store(0);
+    }
+    g_ggml_metal_slot8_reference_count.store(0);
 }
 
 // --slot8 reference encode (Stage 3a): orchestrate the existing mul_mat / GLU / weighted-sum
 // kernels for the 8 experts as ONE graph op. Removes the per-expert graph nodes and the
 // mul_mat_id decode replay/ICB cache. Used as the correctness oracle and the fallback when the
-// weights are not IQ1_M or dims are not a multiple of the super-block.
+// weight triplet has no fused kernel family or dims are not a multiple of the super-block.
 static int ggml_metal_op_flashmoe_slot8_ffn_reference(ggml_metal_op_t ctx, ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
 
@@ -4899,11 +4989,12 @@ static int ggml_metal_op_flashmoe_slot8_ffn_reference(ggml_metal_op_t ctx, ggml_
     return 1;
 }
 
-// Fused encode (Stage 3b): two purpose-built IQ1_M / IQ1_XXXS kernels that collapse all selected experts
-// and the 3 projections into 2 dispatches.
+// Fused encode (Stage 3b): two purpose-built kernels that collapse all selected experts and the
+// 3 projections into 2 dispatches. Kernel families: all-IQ1_M, all-IQ1_XXXS, and the HY4 mixed
+// STQ1_0|IQ2_XXS gate/up with IQ3_XXS|IQ4_XS down (Phase A and Phase B selected independently).
 //   Phase A: h[j,e] = silu(gate_e . x) * (up_e . x)        for j in n_ff, e in n_used  -> h scratch
 //   Phase B: moe_out[r] = sum_e weights[e] * (down_e[r] . h[:,e])  for r in n_embd     -> dst
-static int ggml_metal_op_flashmoe_slot8_ffn_fused(ggml_metal_op_t ctx, ggml_tensor * op) {
+static int ggml_metal_op_flashmoe_slot8_ffn_fused(ggml_metal_op_t ctx, ggml_tensor * op, int kind) {
     const ggml_tensor * x         = op->src[0];
     const ggml_tensor * gate_exps = op->src[1];
     const ggml_tensor * up_exps   = op->src[2];
@@ -4932,32 +5023,48 @@ static int ggml_metal_op_flashmoe_slot8_ffn_fused(ggml_metal_op_t ctx, ggml_tens
         /*.slot_nb0 =*/ slot_ids->nb[0],
     };
 
-    // Phase A: gate/up/swiglu -> h[n_ff, n_used].  One simdgroup per (j, e).
+    if (!g_ggml_metal_slot8_announced[kind].exchange(true)) {
+        GGML_LOG_INFO("%s: --slot8 fused Metal kernels active: family=%s gate/up=%s down=%s n_embd=%lld n_ff=%lld n_used=%lld\n",
+                __func__, ggml_metal_slot8_kind_names[kind],
+                ggml_type_name(gate_exps->type), ggml_type_name(down_exps->type),
+                (long long) n_embd, (long long) n_ff, (long long) n_used);
+    }
+    g_ggml_metal_slot8_fused_count[kind].fetch_add(1);
+
+    // Phase A: gate/up/swiglu -> h[n_ff, n_used].  One simdgroup per (nr0 rows j, expert e).
     {
         auto pipeline = ggml_metal_library_get_pipeline_flashmoe_slot8_phaseA(ctx->lib, op);
+        const int nr0 = std::max(1, pipeline.nr0);
         ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        if (pipeline.smem > 0) {
+            ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, pipeline.smem, 0);
+        }
         ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(x),         1);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(gate_exps), 2);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(up_exps),   3);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(slot_ids),  4);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(&h),        5);
-        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) n_ff, 1, (int) n_used, 32, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((n_ff + nr0 - 1) / nr0), 1, (int) n_used, 32, 1, 1);
     }
 
     ggml_metal_op_concurrency_reset(ctx);
 
-    // Phase B: down + weighted sum -> moe_out[n_embd].  One simdgroup per output row.
+    // Phase B: down + weighted sum -> moe_out[n_embd].  One simdgroup per nr0 output rows.
     {
         auto pipeline = ggml_metal_library_get_pipeline_flashmoe_slot8_phaseB(ctx->lib, op);
+        const int nr0 = std::max(1, pipeline.nr0);
         ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        if (pipeline.smem > 0) {
+            ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, pipeline.smem, 0);
+        }
         ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(&h),        1);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(down_exps), 2);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(slot_ids),  3);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(weights),   4);
         ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op),        5);
-        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) n_embd, 1, 1, 32, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((n_embd + nr0 - 1) / nr0), 1, 1, 32, 1, 1);
     }
 
     return 1;
@@ -4967,22 +5074,19 @@ int ggml_metal_op_flashmoe_slot8_ffn(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
     GGML_ASSERT(op->op == GGML_OP_FLASHMOE_SLOT8_FFN);
 
-    // The fused kernels handle IQ1_M or IQ1_XXXS gate/up/down with super-block-aligned dims.
-    // Anything else (or the explicit A/B toggle) uses the mul_mat reference path.
+    // The fused kernels handle all-IQ1_M / all-IQ1_XXXS triplets and the four HY4 mixed
+    // combinations (STQ1_0 or IQ2_XXS gate/up with IQ3_XXS or IQ4_XS down), all with
+    // super-block-aligned dims. Anything else (or the explicit A/B toggle) uses the mul_mat
+    // reference path.
     constexpr int64_t kSuperBlock = 256; // QK_K
-    const bool all_iq1m =
-            op->src[1]->type == GGML_TYPE_IQ1_M &&
-            op->src[2]->type == GGML_TYPE_IQ1_M &&
-            op->src[3]->type == GGML_TYPE_IQ1_M;
-    const bool all_iq1xxxs =
-            op->src[1]->type == GGML_TYPE_IQ1_XXXS &&
-            op->src[2]->type == GGML_TYPE_IQ1_XXXS &&
-            op->src[3]->type == GGML_TYPE_IQ1_XXXS;
+    const int  kind    = ggml_metal_slot8_fused_kind(op);
     const bool dims_ok = (op->ne[0] % kSuperBlock == 0) && (op->src[1]->ne[1] % kSuperBlock == 0);
 
-    if ((all_iq1m || all_iq1xxxs) && dims_ok && !ggml_metal_slot8_use_reference()) {
-        return ggml_metal_op_flashmoe_slot8_ffn_fused(ctx, op);
+    if (kind >= 0 && dims_ok && !ggml_metal_slot8_use_reference()) {
+        return ggml_metal_op_flashmoe_slot8_ffn_fused(ctx, op, kind);
     }
+
+    g_ggml_metal_slot8_reference_count.fetch_add(1);
 
     return ggml_metal_op_flashmoe_slot8_ffn_reference(ctx, op);
 }

@@ -10477,158 +10477,512 @@ kernel void kernel_flashmoe_slot8_phaseB_iq1_xxxs(
     }
 }
 
-// HYV4 fused routed-MoE Phase A.
+// HYV4 fused routed-MoE FFN (--slot8).
 //
-// HY4 uses a fixed top-8, bias-free SwiGLU expert FFN.  The published mixed
-// STQ package has two uniform gate/up formats per layer: STQ1_0 or IQ2_XXS.
-// These kernels deliberately cover Phase A only (gate/up/SwiGLU), leaving the
-// generic slot-bank decoder as the active implementation until the matching
-// HYV4-specific op dispatch and Phase B quant specializations are wired up.
+// HY4 uses a fixed top-8, bias-free SwiGLU expert FFN. The published mixed STQ
+// package has two uniform gate/up formats per layer (STQ1_0 or IQ2_XXS) and two
+// down formats (IQ3_XXS or IQ4_XS). The host dispatcher checks the exact per-op
+// triplet and selects these kernels only for those four combinations.
 //
-// They must not be used as a generic STQ path: the tensor type is selected by
-// the future HYV4 dispatcher after checking the exact, per-layer triplet.
+//   Phase A: h[j,e] = silu(gate_e[j] . x) * (up_e[j] . x)   grid = (n_ff/NR, 1, n_used)
+//   Phase B: dst[r] = sum_e w[e] * (down_e[r] . h[:,e])      grid = (n_embd/NR, 1, 1)
+//
+// One simdgroup handles NR consecutive rows (HYV4_FUSED_PHASEA_ROWS gate/up rows j,
+// HYV4_FUSED_PHASEB_ROWS output rows r) so every activation load is shared across the
+// rows, the same amortisation kernel_mul_mv_*_impl gets from N_R0_*. Each per-row dot is
+// the single-row form of the matching mul_mv kernel: same lane -> sub-block mapping, same
+// per-block scale factoring and the same F32 accumulation order, so the fused output is
+// bit-identical to the reference operator (per-expert mul_mv + GLU + weighted sum).
 
-static inline float hyv4_dot16(const thread float4x4 & q, device const float * y) {
-    return dot(q[0], float4(y[ 0], y[ 1], y[ 2], y[ 3])) +
-           dot(q[1], float4(y[ 4], y[ 5], y[ 6], y[ 7])) +
-           dot(q[2], float4(y[ 8], y[ 9], y[10], y[11])) +
-           dot(q[3], float4(y[12], y[13], y[14], y[15]));
-}
-
-// One lane handles one 16-value quant sub-block.  A 32-lane simdgroup covers
-// two QK_K blocks per iteration, which is exact for HY4's 6144-wide input.
-static inline float2 hyv4_iq2_xxs_dot_row_pair(
-        device const block_iq2_xxs * gate_row,
-        device const block_iq2_xxs * up_row,
-        device const float         * y,
-        int                          ne00,
-        ushort                       tiisg) {
-    float2 sum = 0.0f;
+// STQ1_0: 64 codebook groups per QK_K block. Group g covers y[chunk*64 + g%16 + p*16],
+// p = 0..3, chunk = g/16. Lane t owns groups t and t+32 (kernel_mul_mv_stq1_0_f32_impl).
+// Computes gate and up dots for rows j0..j0+nrows-1 (row stride nb1) against y[ne00].
+template <int NR>
+static inline void hyv4_stq1_0_dot_rows(
+        device const char  * gate_base,
+        device const char  * up_base,
+        uint64_t             gate_nb1,
+        uint64_t             up_nb1,
+        int                  nrows,
+        device const float * y,
+        int                  ne00,
+        ushort               tiisg,
+        thread float2      * sumf) {
     const int nb = ne00 / QK_K;
 
-    for (int block0 = 0; block0 < nb; block0 += 2) {
-        const int block = block0 + tiisg / 16;
-        if (block >= nb) {
-            continue;
-        }
-
-        const short il = tiisg % 16;
-        float4x4 gate_q;
-        float4x4 up_q;
-        dequantize_iq2_xxs<float4x4>(gate_row + block, il, gate_q);
-        dequantize_iq2_xxs<float4x4>(up_row   + block, il, up_q);
-
-        const device float * yi = y + block * QK_K + il * 16;
-        sum[0] += hyv4_dot16(gate_q, yi);
-        sum[1] += hyv4_dot16(up_q,   yi);
+    for (int r = 0; r < NR; ++r) {
+        sumf[r] = 0.0f;
     }
 
-    return float2(simd_sum(sum[0]), simd_sum(sum[1]));
+    for (int ib = 0; ib < nb; ++ib) {
+        device const float * yb = y + ib*QK_K;
+
+        // activation taps for groups tiisg and tiisg + 32, shared by all rows
+        float yv[2][4];
+        for (int gi = 0; gi < 2; ++gi) {
+            const int group = tiisg + N_SIMDWIDTH*gi;
+            device const float * yi = yb + (group/16)*64 + (group%16);
+            for (int p = 0; p < 4; ++p) {
+                yv[gi][p] = yi[p*16];
+            }
+        }
+
+        for (int r = 0; r < NR; ++r) {
+            if (r >= nrows) {
+                break;
+            }
+
+            device const block_stq1_0 & gb = ((device const block_stq1_0 *)(gate_base + r*gate_nb1))[ib];
+            device const block_stq1_0 & ub = ((device const block_stq1_0 *)(up_base   + r*up_nb1))[ib];
+
+            float2 sum = 0.0f;
+
+            for (int gi = 0; gi < 2; ++gi) {
+                const int group = tiisg + N_SIMDWIDTH*gi;
+                const uint8_t gcode = (gb.qs[group/2] >> (4*(group & 1))) & 0x0f;
+                const uint8_t ucode = (ub.qs[group/2] >> (4*(group & 1))) & 0x0f;
+                const uint8_t gsign = (gb.sign[group/8] >> (group & 7)) & 0x01;
+                const uint8_t usign = (ub.sign[group/8] >> (group & 7)) & 0x01;
+                const uint8_t gq = stq1_0_codebook[(gsign << 4) | gcode];
+                const uint8_t uq = stq1_0_codebook[(usign << 4) | ucode];
+
+                for (int p = 0; p < 4; ++p) {
+                    sum[0] += yv[gi][p] * float(int((gq >> (2*p)) & 0x03) - 1);
+                    sum[1] += yv[gi][p] * float(int((uq >> (2*p)) & 0x03) - 1);
+                }
+            }
+
+            sumf[r][0] += (float) gb.d * sum[0];
+            sumf[r][1] += (float) ub.d * sum[1];
+        }
+    }
 }
 
-// STQ1_0 is structured ternary 3:4: each codebook entry represents four
-// activations strided by 16 within a 64-value chunk.  Assigning a lane to each
-// codebook group avoids materialising a dequantised row and preserves the
-// released type-43 layout byte-for-byte.
-static inline float2 hyv4_stq1_0_dot_row_pair(
-        device const block_stq1_0 * gate_row,
-        device const block_stq1_0 * up_row,
-        device const float        * y,
-        int                         ne00,
-        ushort                      tiisg) {
-    float2 sum = 0.0f;
+// IQ2_XXS: one 32-value sub-block per lane per iteration (kernel_mul_mv_iq2_xxs_f32_impl).
+// svalues/ssigns are threadgroup copies of iq2xxs_grid / ksigns_iq2xs.
+static inline float hyv4_iq2_xxs_dot_subblock(
+        device const block_iq2_xxs * xr,
+        int                          ib,
+        thread const float         * yl,
+        threadgroup const uint64_t * svalues,
+        threadgroup const uint8_t  * ssigns) {
+    device const uint16_t * q2   = xr->qs + 4*ib;
+    device const uint8_t  * aux8 = (device const uint8_t *) q2;
+    const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    const float d = (float) xr->d * (0.5f + (aux32 >> 28));
+
+    float sum = 0.f;
+    for (short l = 0; l < 4; ++l) {
+        threadgroup const uint8_t * grid = (threadgroup const uint8_t *)(svalues + aux8[l]);
+        const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
+        for (short j = 0; j < 8; ++j) {
+            sum += yl[8*l + j] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+        }
+    }
+
+    return d * sum;
+}
+
+template <int NR>
+static inline void hyv4_iq2_xxs_dot_rows(
+        device const char          * gate_base,
+        device const char          * up_base,
+        uint64_t                     gate_nb1,
+        uint64_t                     up_nb1,
+        int                          nrows,
+        device const float         * y,
+        int                          ne00,
+        threadgroup const uint64_t * svalues,
+        threadgroup const uint8_t  * ssigns,
+        ushort                       tiisg,
+        thread float2              * sumf) {
+    const int nb   = ne00 / QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    float yl[32];
+
+    for (int r = 0; r < NR; ++r) {
+        sumf[r] = 0.0f;
+    }
+
+    device const float * y4 = y + 32*tiisg;
+
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        for (int r = 0; r < NR; ++r) {
+            if (r >= nrows) {
+                break;
+            }
+            sumf[r][0] += hyv4_iq2_xxs_dot_subblock((device const block_iq2_xxs *)(gate_base + r*gate_nb1) + ibl, ib, yl, svalues, ssigns);
+            sumf[r][1] += hyv4_iq2_xxs_dot_subblock((device const block_iq2_xxs *)(up_base   + r*up_nb1)   + ibl, ib, yl, svalues, ssigns);
+        }
+
+        y4 += 32*32;
+    }
+}
+
+// IQ3_XXS: one 32-value sub-block per lane per iteration (kernel_mul_mv_iq3_xxs_f32_impl).
+// svalues/ssigns are threadgroup copies of iq3xxs_grid / ksigns_iq2xs.
+static inline float hyv4_iq3_xxs_dot_subblock(
+        device const block_iq3_xxs * xr,
+        int                          ib,
+        thread const float         * yl,
+        threadgroup const uint32_t * svalues,
+        threadgroup const uint8_t  * ssigns) {
+    device const uint8_t  * q3  = xr->qs + 8*ib;
+    device const uint16_t * gas = (device const uint16_t *)(xr->qs + QK_K/4) + 2*ib;
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float) xr->d * (0.5f + (aux32 >> 28));
+
+    float2 sum = 0.f;
+    for (short l = 0; l < 4; ++l) {
+        threadgroup const uint8_t * grid1 = (threadgroup const uint8_t *)(svalues + q3[2*l+0]);
+        threadgroup const uint8_t * grid2 = (threadgroup const uint8_t *)(svalues + q3[2*l+1]);
+        const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
+        for (short j = 0; j < 4; ++j) {
+            sum[0] += yl[8*l + j + 0] * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+            sum[1] += yl[8*l + j + 4] * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+        }
+    }
+
+    return d * (sum[0] + sum[1]);
+}
+
+// down rows r0..r0+nrows-1 (row stride nb1) against y[ne00]; returns the unscaled per-lane
+// partial sums (caller applies simd_sum and the 0.5 factor per row).
+template <int NR>
+static inline void hyv4_iq3_xxs_dot_rows(
+        device const char          * base,
+        uint64_t                     nb1,
+        int                          nrows,
+        device const float         * y,
+        int                          ne00,
+        threadgroup const uint32_t * svalues,
+        threadgroup const uint8_t  * ssigns,
+        ushort                       tiisg,
+        thread float               * sumf) {
+    const int nb   = ne00 / QK_K;
+    const int nb32 = nb * (QK_K / 32);
+
+    float yl[32];
+
+    for (int r = 0; r < NR; ++r) {
+        sumf[r] = 0.f;
+    }
+
+    device const float * y4 = y + 32*tiisg;
+
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        for (int r = 0; r < NR; ++r) {
+            if (r >= nrows) {
+                break;
+            }
+            sumf[r] += hyv4_iq3_xxs_dot_subblock((device const block_iq3_xxs *)(base + r*nb1) + ibl, ib, yl, svalues, ssigns);
+        }
+
+        y4 += 32*32;
+    }
+}
+
+// IQ4_XS: 16 lanes per QK_K block, two blocks per iteration; each lane owns one
+// 8-value low/high nibble half of a 32-value sub-block (kernel_mul_mv_iq4_xs_f32_impl).
+// shmem_f32 holds kvalues_iq4nl_f[t % 16] for t in 0..31.
+template <int NR>
+static inline void hyv4_iq4_xs_dot_rows(
+        device const char        * base,
+        uint64_t                   nb1,
+        int                        nrows,
+        device const float       * y,
+        int                        ne00,
+        threadgroup const float  * shmem_f32,
+        ushort                     tiisg,
+        thread float             * sumf) {
     const int nb = ne00 / QK_K;
 
-    for (int block = 0; block < nb; ++block) {
-        const int group0 = tiisg;
-        const int group1 = tiisg + 32;
-        const device block_stq1_0 * gate_b = gate_row + block;
-        const device block_stq1_0 * up_b   = up_row   + block;
-        const float gate_d = (float) gate_b->d;
-        const float up_d   = (float) up_b->d;
+    const short ix = tiisg/16;  // 0 or 1
+    const short it = tiisg%16;  // 0...15
+    const short ib = it/2;
+    const short il = it%2;
 
-        for (int group = group0; group <= group1; group += 32) {
-            const uint8_t gate_code = (gate_b->qs[group / 2] >> (4 * (group & 1))) & 0x0f;
-            const uint8_t up_code   = (up_b->qs[group / 2]   >> (4 * (group & 1))) & 0x0f;
-            const uint8_t gate_sign = (gate_b->sign[group / 8] >> (group & 7)) & 0x01;
-            const uint8_t up_sign   = (up_b->sign[group / 8]   >> (group & 7)) & 0x01;
-            const uint8_t gate_q    = stq1_0_codebook[(gate_sign << 4) | gate_code];
-            const uint8_t up_q      = stq1_0_codebook[(up_sign << 4) | up_code];
-            const int chunk = group / 16;
-            const int gloc  = group % 16;
-            const device float * yi = y + block * QK_K + chunk * 64 + gloc;
+    float4 yl[4];
 
-            for (int p = 0; p < 4; ++p) {
-                const float a = yi[p * 16];
-                sum[0] += a * (float(int((gate_q >> (2 * p)) & 0x03) - 1)) * gate_d;
-                sum[1] += a * (float(int((up_q   >> (2 * p)) & 0x03) - 1)) * up_d;
+    for (int r = 0; r < NR; ++r) {
+        sumf[r] = 0.f;
+    }
+
+    device const float * yb = y + ix*QK_K + ib*32 + il*8;
+
+    uint32_t aux32[2];
+    thread const uint8_t * q8 = (thread const uint8_t *) aux32;
+
+    float4 qf1, qf2;
+
+    for (int ibl = ix; ibl < nb; ibl += 2) {
+        device const float4 * y4 = (device const float4 *) yb;
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (int r = 0; r < NR; ++r) {
+            if (r >= nrows) {
+                break;
+            }
+
+            device const block_iq4_xs & xb = ((device const block_iq4_xs *)(base + r*nb1))[ibl];
+            device const uint32_t * q4 = (device const uint32_t *)(xb.qs + 16*ib + 8*il);
+
+            float4 acc1 = {0.f}, acc2 = {0.f};
+
+            aux32[0] = (q4[0]     ) & 0x0f0f0f0f;
+            aux32[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
+            qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = (q4[1]     ) & 0x0f0f0f0f;
+            aux32[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
+            qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+
+            const int ls = (((xb.scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((xb.scales_h >> 2*ib) & 3) << 4)) - 32;
+            sumf[r] += (float) xb.d * ls * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+
+        yb += 2*QK_K;
+    }
+}
+
+// Phase A, STQ1_0 gate/up. Grid = (ceil(n_ff/NR), 1, n_used), one simdgroup per NR rows of one expert.
+template <int NR>
+kernel void kernel_hyv4_fused_phaseA_stq1_0_t(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,        // [n_embd] f32
+        device const char * gate,     // STQ1_0 [n_embd, n_ff, n_slots]
+        device const char * up,       // STQ1_0 [n_embd, n_ff, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device       char * h,        // f32 [n_ff, n_used]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int j0 = tgpig.x * NR;
+    const int e  = tgpig.z;
+    if (j0 >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+    const int nrows = min(NR, (int) (args.n_ff - j0));
+
+    const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+    device const float * y         = (device const float *) x;
+    device const char  * gate_base = gate + slot*args.gate_nb2 + (uint64_t) j0*args.gate_nb1;
+    device const char  * up_base   = up   + slot*args.up_nb2   + (uint64_t) j0*args.up_nb1;
+
+    float2 sumf[NR];
+    hyv4_stq1_0_dot_rows<NR>(gate_base, up_base, args.gate_nb1, args.up_nb1, nrows, y, args.n_embd, tiisg, sumf);
+
+    device float * hout = (device float *) h + (uint64_t) e*args.n_ff + j0;
+    for (int r = 0; r < NR; ++r) {
+        if (r < nrows) {
+            const float g = simd_sum(sumf[r][0]);
+            const float u = simd_sum(sumf[r][1]);
+            if (tiisg == 0) {
+                hout[r] = (g / (1.0f + exp(-g))) * u;
+            }
+        }
+    }
+}
+
+// Phase A, IQ2_XXS gate/up. Grid = (ceil(n_ff/NR), 1, n_used), one simdgroup per NR rows of one expert.
+template <int NR>
+kernel void kernel_hyv4_fused_phaseA_iq2_xxs_t(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * x,        // [n_embd] f32
+        device const char * gate,     // IQ2_XXS [n_embd, n_ff, n_slots]
+        device const char * up,       // IQ2_XXS [n_embd, n_ff, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device       char * h,        // f32 [n_ff, n_used]
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
+    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
+    for (int i = tiisg; i < 256; i += N_SIMDWIDTH) {
+        svalues[i] = iq2xxs_grid[i];
+    }
+    for (int i = tiisg; i < 128; i += N_SIMDWIDTH) {
+        ssigns[i] = ksigns_iq2xs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int j0 = tgpig.x * NR;
+    const int e  = tgpig.z;
+    if (j0 >= args.n_ff || e >= args.n_used) {
+        return;
+    }
+    const int nrows = min(NR, (int) (args.n_ff - j0));
+
+    const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+    device const float * y         = (device const float *) x;
+    device const char  * gate_base = gate + slot*args.gate_nb2 + (uint64_t) j0*args.gate_nb1;
+    device const char  * up_base   = up   + slot*args.up_nb2   + (uint64_t) j0*args.up_nb1;
+
+    float2 sumf[NR];
+    hyv4_iq2_xxs_dot_rows<NR>(gate_base, up_base, args.gate_nb1, args.up_nb1, nrows, y, args.n_embd, svalues, ssigns, tiisg, sumf);
+
+    device float * hout = (device float *) h + (uint64_t) e*args.n_ff + j0;
+    for (int r = 0; r < NR; ++r) {
+        if (r < nrows) {
+            const float g = simd_sum(sumf[r][0]) * 0.25f;
+            const float u = simd_sum(sumf[r][1]) * 0.25f;
+            if (tiisg == 0) {
+                hout[r] = (g / (1.0f + exp(-g))) * u;
+            }
+        }
+    }
+}
+
+// Phase B, IQ3_XXS down. Grid = (ceil(n_embd/NR), 1, 1), one simdgroup per NR output rows.
+template <int NR>
+kernel void kernel_hyv4_fused_phaseB_iq3_xxs_t(
+        constant ggml_metal_kargs_flashmoe_slot8 & args,
+        device const char * h,        // f32 [n_ff, n_used]
+        device const char * down,     // IQ3_XXS [n_ff, n_embd, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device const char * weights,  // f32 [1, n_used, 1]
+        device       char * dst,      // f32 [n_embd]
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
+    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
+    for (int i = tiisg; i < 256; i += N_SIMDWIDTH) {
+        svalues[i] = iq3xxs_grid[i];
+    }
+    for (int i = tiisg; i < 128; i += N_SIMDWIDTH) {
+        ssigns[i] = ksigns_iq2xs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r0 = tgpig.x * NR;
+    if (r0 >= args.n_embd) {
+        return;
+    }
+    const int nrows = min(NR, (int) (args.n_embd - r0));
+
+    float acc[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = 0.f;
+    }
+
+    for (int e = 0; e < args.n_used; ++e) {
+        const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+        device const char  * dbase = down + slot*args.down_nb2 + (uint64_t) r0*args.down_nb1;
+        device const float * he    = (device const float *) h + (uint64_t) e*args.n_ff;
+
+        float sumf[NR];
+        hyv4_iq3_xxs_dot_rows<NR>(dbase, args.down_nb1, nrows, he, args.n_ff, svalues, ssigns, tiisg, sumf);
+
+        const float w = *(device const float *)(weights + (uint64_t) e*args.w_nb1);
+        for (int r = 0; r < NR; ++r) {
+            if (r < nrows) {
+                const float d = simd_sum(sumf[r]) * 0.5f;
+                acc[r] += w * d;
             }
         }
     }
 
-    return float2(simd_sum(sum[0]), simd_sum(sum[1]));
+    if (tiisg == 0) {
+        for (int r = 0; r < NR; ++r) {
+            if (r < nrows) {
+                ((device float *) dst)[r0 + r] = acc[r];
+            }
+        }
+    }
 }
 
-// Grid = (n_ff, 1, 8), exactly one simdgroup per routed expert row.
-[[host_name("kernel_hyv4_fused_phaseA_iq2_xxs")]]
-kernel void kernel_hyv4_fused_phaseA_iq2_xxs(
+// Phase B, IQ4_XS down. Grid = (ceil(n_embd/NR), 1, 1), one simdgroup per NR output rows.
+template <int NR>
+kernel void kernel_hyv4_fused_phaseB_iq4_xs_t(
         constant ggml_metal_kargs_flashmoe_slot8 & args,
-        device const char * x,
-        device const char * gate,
-        device const char * up,
-        device const char * slot_ids,
-        device       char * h,
+        device const char * h,        // f32 [n_ff, n_used]
+        device const char * down,     // IQ4_XS [n_ff, n_embd, n_slots]
+        device const char * slot_ids, // i32 [n_used]
+        device const char * weights,  // f32 [1, n_used, 1]
+        device       char * dst,      // f32 [n_embd]
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
-    const int j = tgpig.x;
-    const int e = tgpig.z;
-    if (j >= args.n_ff || e >= args.n_used) {
+    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+    shmem_f32[tiisg] = kvalues_iq4nl_f[tiisg%16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r0 = tgpig.x * NR;
+    if (r0 >= args.n_embd) {
         return;
     }
+    const int nrows = min(NR, (int) (args.n_embd - r0));
 
-    const int slot = *(device const int *)(slot_ids + e * args.slot_nb0);
-    const device float * y = (device const float *) x;
-    const device block_iq2_xxs * gate_row =
-            (device const block_iq2_xxs *)(gate + slot * args.gate_nb2 + (uint64_t) j * args.gate_nb1);
-    const device block_iq2_xxs * up_row =
-            (device const block_iq2_xxs *)(up + slot * args.up_nb2 + (uint64_t) j * args.up_nb1);
-    const float2 gu = hyv4_iq2_xxs_dot_row_pair(gate_row, up_row, y, args.n_embd, tiisg);
+    float acc[NR];
+    for (int r = 0; r < NR; ++r) {
+        acc[r] = 0.f;
+    }
+
+    for (int e = 0; e < args.n_used; ++e) {
+        const int slot = *(device const int *)(slot_ids + e*args.slot_nb0);
+
+        device const char  * dbase = down + slot*args.down_nb2 + (uint64_t) r0*args.down_nb1;
+        device const float * he    = (device const float *) h + (uint64_t) e*args.n_ff;
+
+        float sumf[NR];
+        hyv4_iq4_xs_dot_rows<NR>(dbase, args.down_nb1, nrows, he, args.n_ff, shmem_f32, tiisg, sumf);
+
+        const float w = *(device const float *)(weights + (uint64_t) e*args.w_nb1);
+        for (int r = 0; r < NR; ++r) {
+            if (r < nrows) {
+                const float d = simd_sum(sumf[r]);
+                acc[r] += w * d;
+            }
+        }
+    }
 
     if (tiisg == 0) {
-        ((device float *) h)[(uint64_t) e * args.n_ff + j] =
-                (gu[0] / (1.0f + exp(-gu[0]))) * gu[1];
+        for (int r = 0; r < NR; ++r) {
+            if (r < nrows) {
+                ((device float *) dst)[r0 + r] = acc[r];
+            }
+        }
     }
 }
 
-[[host_name("kernel_hyv4_fused_phaseA_stq1_0")]]
-kernel void kernel_hyv4_fused_phaseA_stq1_0(
-        constant ggml_metal_kargs_flashmoe_slot8 & args,
-        device const char * x,
-        device const char * gate,
-        device const char * up,
-        device const char * slot_ids,
-        device       char * h,
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]]) {
-    const int j = tgpig.x;
-    const int e = tgpig.z;
-    if (j >= args.n_ff || e >= args.n_used) {
-        return;
-    }
+typedef decltype(kernel_hyv4_fused_phaseA_stq1_0_t<1>)  kernel_hyv4_fused_phaseA_stq1_0_fn;
+typedef decltype(kernel_hyv4_fused_phaseA_iq2_xxs_t<1>) kernel_hyv4_fused_phaseA_iq2_xxs_fn;
+typedef decltype(kernel_hyv4_fused_phaseB_iq3_xxs_t<1>) kernel_hyv4_fused_phaseB_iq3_xxs_fn;
+typedef decltype(kernel_hyv4_fused_phaseB_iq4_xs_t<1>)  kernel_hyv4_fused_phaseB_iq4_xs_fn;
 
-    const int slot = *(device const int *)(slot_ids + e * args.slot_nb0);
-    const device float * y = (device const float *) x;
-    const device block_stq1_0 * gate_row =
-            (device const block_stq1_0 *)(gate + slot * args.gate_nb2 + (uint64_t) j * args.gate_nb1);
-    const device block_stq1_0 * up_row =
-            (device const block_stq1_0 *)(up + slot * args.up_nb2 + (uint64_t) j * args.up_nb1);
-    const float2 gu = hyv4_stq1_0_dot_row_pair(gate_row, up_row, y, args.n_embd, tiisg);
-
-    if (tiisg == 0) {
-        ((device float *) h)[(uint64_t) e * args.n_ff + j] =
-                (gu[0] / (1.0f + exp(-gu[0]))) * gu[1];
-    }
-}
+template [[host_name("kernel_hyv4_fused_phaseA_stq1_0")]]  kernel kernel_hyv4_fused_phaseA_stq1_0_fn  kernel_hyv4_fused_phaseA_stq1_0_t<HYV4_FUSED_PHASEA_ROWS>;
+template [[host_name("kernel_hyv4_fused_phaseA_iq2_xxs")]] kernel kernel_hyv4_fused_phaseA_iq2_xxs_fn kernel_hyv4_fused_phaseA_iq2_xxs_t<HYV4_FUSED_PHASEA_ROWS>;
+template [[host_name("kernel_hyv4_fused_phaseB_iq3_xxs")]] kernel kernel_hyv4_fused_phaseB_iq3_xxs_fn kernel_hyv4_fused_phaseB_iq3_xxs_t<HYV4_FUSED_PHASEB_ROWS>;
+template [[host_name("kernel_hyv4_fused_phaseB_iq4_xs")]]  kernel kernel_hyv4_fused_phaseB_iq4_xs_fn  kernel_hyv4_fused_phaseB_iq4_xs_t<HYV4_FUSED_PHASEB_ROWS>;
 
 template<int NR0, typename args_t>
 void kernel_mul_mv_iq4_nl_f32_impl(

@@ -59,6 +59,10 @@ size_t ggml_metal_op_flashmoe_split_glu_extra_tmp(const struct ggml_tensor * op)
 // temporary buffers for the fused single-token routed MoE FFN (--slot8)
 size_t ggml_metal_op_flashmoe_slot8_ffn_extra_tmp(const struct ggml_tensor * op);
 
+// --slot8 dispatch counters (fused kernel family vs reference encoder)
+void ggml_metal_op_flashmoe_slot8_log_stats(void);
+void ggml_metal_op_flashmoe_slot8_reset_stats(void);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 

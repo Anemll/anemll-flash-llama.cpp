@@ -2053,12 +2053,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
     char base[256];
     char name[256];
 
+    // Phase A is selected from the gate type; the caller guarantees gate and up share it.
+    // nr0 = gate/up rows per simdgroup (the dispatch grid is n_ff / nr0).
+    size_t smem = 0;
+    int    nr0  = 1;
+
     switch (op->src[1]->type) {
         case GGML_TYPE_IQ1_M:
             snprintf(base, 256, "kernel_flashmoe_slot8_phaseA");
             break;
         case GGML_TYPE_IQ1_XXXS:
             snprintf(base, 256, "kernel_flashmoe_slot8_phaseA_iq1_xxxs");
+            break;
+        case GGML_TYPE_STQ1_0:
+            snprintf(base, 256, "kernel_hyv4_fused_phaseA_stq1_0");
+            nr0 = HYV4_FUSED_PHASEA_ROWS;
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            snprintf(base, 256, "kernel_hyv4_fused_phaseA_iq2_xxs");
+            smem = 256*8 + 128; // threadgroup copies of iq2xxs_grid + ksigns_iq2xs
+            nr0  = HYV4_FUSED_PHASEA_ROWS;
             break;
         default:
             GGML_ABORT("unsupported fused Flash-MoE gate type: %s", ggml_type_name(op->src[1]->type));
@@ -2070,6 +2084,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
+    res.smem = smem;
+    res.nr0  = nr0;
+
     return res;
 }
 
@@ -2079,12 +2096,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
     char base[256];
     char name[256];
 
+    // Phase B is selected independently from the down type.
+    // nr0 = output rows per simdgroup (the dispatch grid is n_embd / nr0).
+    size_t smem = 0;
+    int    nr0  = 1;
+
     switch (op->src[3]->type) {
         case GGML_TYPE_IQ1_M:
             snprintf(base, 256, "kernel_flashmoe_slot8_phaseB");
             break;
         case GGML_TYPE_IQ1_XXXS:
             snprintf(base, 256, "kernel_flashmoe_slot8_phaseB_iq1_xxxs");
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            snprintf(base, 256, "kernel_hyv4_fused_phaseB_iq3_xxs");
+            smem = 256*4 + 128; // threadgroup copies of iq3xxs_grid + ksigns_iq2xs
+            nr0  = HYV4_FUSED_PHASEB_ROWS;
+            break;
+        case GGML_TYPE_IQ4_XS:
+            snprintf(base, 256, "kernel_hyv4_fused_phaseB_iq4_xs");
+            smem = 32*sizeof(float); // kvalues_iq4nl_f lookup table
+            nr0  = HYV4_FUSED_PHASEB_ROWS;
             break;
         default:
             GGML_ABORT("unsupported fused Flash-MoE down type: %s", ggml_type_name(op->src[3]->type));
@@ -2095,6 +2127,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flashmoe_slot8_p
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
+
+    res.smem = smem;
+    res.nr0  = nr0;
 
     return res;
 }

@@ -81,6 +81,10 @@
 #define N_SG_IQ4_XS 2
 
 #define N_R0_STQ1_0 4
+
+// rows per simdgroup for the HY4 fused --slot8 kernels (Phase A gate/up rows, Phase B output rows)
+#define HYV4_FUSED_PHASEA_ROWS 4
+#define HYV4_FUSED_PHASEB_ROWS 4
 #define N_SG_STQ1_0 2
 
 // function constants offsets

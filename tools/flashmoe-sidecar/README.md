@@ -29,7 +29,7 @@ Per-model extract + run recipes in this document:
 | Kimi K2 / K2.5 | deepseek2 (MLA) | [Extract](#extract-only-selected-layers) | [Run](#estimate-persistent-bank-cost-and-coverage) |
 | MiniMax-M2.7 | minimax-m2 | [Export](#export-a-minimax-m27-flash-package) | [Run](#run-minimax-m27-with-flash-moe) |
 | Tencent HY V3 ([IQ1_M GGUF](https://huggingface.co/AngelSlim/Hy3-GGUF/blob/main/Hy3-IQ1_M.gguf)) | hy_v3 | [Export](#export-a-tencent-hy-v3-flash-package) | [Run](#export-a-tencent-hy-v3-flash-package) |
-| Tencent HY4 preview ([STQ1_0 GGUF](https://huggingface.co/AngelSlim/Hy4-preview-GGUF)) | hyv4 | [Export](#export-a-tencent-hy4-preview-flash-package) | [Run](#export-a-tencent-hy4-preview-flash-package) |
+| Tencent HY4 preview, 1.25-bit ([STQ1_0 GGUF](https://huggingface.co/AngelSlim/Hy4-preview-GGUF)) | hyv4 | [Export](./HY4.md#full-conversion) | [Run](./HY4.md#ssd-streamed-decode-smoke-test) |
 | Qwen3.8-2.4T-A95B | qwen35moe | [Export](#export-a-qwen38-flash-package) | [Run](#run-qwen38-with-flash-moe) |
 | **GLM-5.1** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-51-sidecar) | [**Run**](#run-glm-51-with-the-sidecar) |
 | **GLM-5.2** | **glm-dsa (MLA + DSA indexer)** | [**Extract**](#extract-a-glm-52-sidecar) | [**Run**](#run-glm-52-with-the-sidecar) |
@@ -307,12 +307,47 @@ python3 ./tools/flashmoe-sidecar/hyv4_prepare.py \
   --out-dir ~/Models/HY4/Hy4-preview-Flash-STQ1_0
 ```
 
-HY4 uses the generic mixed-quant separate gate/up/down slot-bank decode path.
-Preserve native routing with `--moe-slot-bank 8 --moe-topk 8 -ub 1`, and do
-not use the existing IQ-only `--slot4` or `--slot8` fused modes.
+The checked package is also published at
+[`anemll/Hy4-preview-FlashMoE-STQ1_0`](https://huggingface.co/anemll/Hy4-preview-FlashMoE-STQ1_0).
+Preserve native routing with `--moe-topk 8`; `--slot4` does not apply to HY4.
+The fused `--slot8` operator supports all four combinations of the two gate/up
+types and two down types (the published package exercises three of them). On an
+M5 Max with 128 GB unified memory, start with 96 slots:
+
+```bash
+LLAMA_FLASH_MOE_EXPERIMENTAL_CPU_VISIBLE_SLOT_WRITES=1 \
+LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS=1 \
+./build/bin/llama-cli \
+  -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar \
+  --moe-slot-bank 96 --moe-topk 8 --moe-cache-io-split 4 --slot8 \
+  -fit on -ub 1 -b 1 -c 2048 -ngl 999 \
+  --no-warmup -st --temp 0 --seed 1 \
+  -p "Make a game of Tetris in HTML" -n 128 --perf
+```
+
+Use `--moe-slot-bank 8` with the same command to minimize memory. Eight is the
+minimum for native top-8 routing; it saves about 66 GiB of slot-bank residency
+relative to 96 slots, at the cost of more SSD misses. At shutdown, a fully
+fused run must report `flashmoe_slot8 fused=N ... reference=0` with `N > 0`.
+The temporal-prefetch flag biases the cache toward the current token's experts;
+compare warm `--perf` runs with and without it because it is not a future-router
+predictor.
+
+The two environment variables are the measured HY4 fast I/O path. CPU-visible
+slot writes let `pread()` target the Metal shared bank directly, eliminating the
+staging-to-bank copy. Parallel slot reads issue independent miss chunks
+concurrently. On the checked 96-slot trace, they improved generation from about
+3.8-3.9 to 4.7 tokens/s and prompt processing from 2.0 to 3.2 tokens/s. Confirm
+the startup/runtime summary says `cpuvis=on preads=on batchrd=on` and the final
+expert-upload time is zero. The current `--moe-prefetch-temporal` heuristic did
+not improve that trace, so it is intentionally omitted from the fast command.
+
 The initial runtime keeps the DSA weights but uses full MLA attention, so keep
-the visible context at or below its 2048-key indexer window; see
-[`HY4.md`](./HY4.md) for that limitation and the native-DSA follow-up boundary.
+the visible context at or below its 2048-key indexer window. See
+[`HY4.md`](./HY4.md) for conversion, byte verification, numerical testing,
+fused/reference A/B testing, and the native-DSA follow-up boundary.
 
 ## Export a dense-only GGUF (experimental)
 
@@ -646,7 +681,7 @@ GLM-5.1 specific notes:
 
 - **`--moe-topk 4`** is a reduction-only override of the model's native K=8. On IQ1_M/IQ2_XXS quants the K=4 vs K=8 quality gap is within noise for general use, while halving per-token expert I/O for ~2× decode. Drop the flag to use native K=8 if you need maximum fidelity.
 - **`--moe-slot-bank 64`** is the starting point. With native K=8 the bank has only 8× headroom; if you have RAM, try `128` or `256` for higher reuse on warm caches.
-- **`--moe-prefetch-temporal`** is the single biggest knob — it overlaps next-layer expert `pread`s with current-layer GPU compute.
+- **`--moe-prefetch-temporal`** refreshes the current token's expert set after decode to bias later slot residency. It does not overlap next-layer `pread`s with current-layer GPU compute and is not a future-router predictor; benchmark it both on and off for the selected model and bank size.
 - **`--moe-prefetch-sidecar PATH`** is optional. When set, prefetch reads use that alternate sidecar directory or manifest path while demand misses continue to use `--moe-sidecar`. This is useful when you keep a second sidecar copy on another SSD.
 - **`--perf`** is recommended for tuning. In this CLI it prints the Flash-MoE routed breakdown (`Expert I/O source`, `Expert upload`), cached expert hit rate, and Metal replay cache hit rate, plus the prompt/generation throughput summary. It does not currently print `load time` on exit.
 - **The best-known fast path on this branch is higher than the older baseline.** With dense-only export, Metal replay, CPU-visible slot writes, predictor off, and a `90` to `96` slot bank, GLM-5.1 IQ1_M is currently landing around `6.5` to `6.7 tok/s` on M5 Max 128 GB steady-state runs. Older full-GGUF or smaller-bank recipes remain useful as simpler baselines.
