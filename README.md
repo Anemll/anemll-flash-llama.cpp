@@ -47,6 +47,14 @@ A prebuilt GLM-5.2 `UD-IQ1_M` sidecar (dense GGUF + per-layer routed experts) is
 The prebuilt HY4 preview mixed `STQ1_0` package is published at
 [`anemll/Hy4-preview-FlashMoE-STQ1_0`](https://huggingface.co/anemll/Hy4-preview-FlashMoE-STQ1_0).
 
+For HY4, exact shared-FFN/SSD-read overlap and iHC post broadcasting are now
+enabled by default. Overlap still requires the eligible Metal `--slot8` SSD
+path; other architectures and the existing safety fallbacks are unchanged.
+Set `LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP=0` or
+`LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST=0` to disable either optimization.
+No environment prefix is needed for their defaults; see the
+[HY4 runtime guide](./tools/flashmoe-sidecar/HY4.md#exact-ihc-post-graph-simplification-hy4-default).
+
 ## Current Model Support
 
 - **`Qwen3.5` GGUF MoE** is the current anchor path for bring-up and regression work. Stable.

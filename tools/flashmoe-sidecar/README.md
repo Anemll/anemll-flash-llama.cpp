@@ -354,7 +354,16 @@ with `--moe-cache-io-split 4`, split install reads are batched. Set
 for A/B testing; `1` forces it on. Private Metal buffers safely retain the
 staging/upload path.
 
-On the checked 96-slot trace, these paths improved generation from about
+HY4 also defaults to exact shared-FFN/SSD-read overlap on the eligible
+`--slot8` path and to iHC post broadcasting. No environment variables are
+needed. Startup shows `hy4-shared-io = on (default)` and
+`hy4-hc-post = broadcast (default)`, both labeled HY4-only. Set
+`LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP=0` or
+`LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST=0` to disable either; `=1` remains an
+explicit enable. Overlap retains its direct-buffer/batched-read safety checks
+and synchronous fallback. See [HY4 runtime details](./HY4.md#exact-demand-readshared-ffn-overlap-hy4-default).
+
+On the earlier checked 96-slot trace, the direct-write and parallel-read paths improved generation from about
 3.8-3.9 to 4.7 tokens/s and prompt processing from 2.0 to 3.2 tokens/s. Confirm
 startup reports both settings as `on (default)` and the final summary says
 `cpuvis=on preads=on batchrd=on` with zero expert-upload time. The current

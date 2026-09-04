@@ -60,6 +60,15 @@ static void signal_handler(int) {
 
 namespace {
 
+void print_response_timings(const result_timings & timings, bool detailed) {
+    console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ] [ tokens - prefill: %d, decode: %d ]\n",
+            timings.prompt_per_second, timings.predicted_per_second, timings.prompt_n, timings.predicted_n);
+    if (detailed) {
+        console::log("[ Timing: prefill %.3f ms | decode %.3f ms | generation %.6f t/s ]\n",
+                timings.prompt_ms, timings.predicted_ms, timings.predicted_per_second);
+    }
+}
+
 std::string oracle_sanitize_name(const std::string & name) {
     std::string out;
     out.reserve(name.size());
@@ -1016,6 +1025,16 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  hy4-iq2-lut      = threadgroup (compiled=off)\n");
 #endif
         fprintf(stderr, "  ds2/kimi-gpu-bank = %s\n", deepseek2_gpu_bank_mode());
+        {
+            const char * overlap = std::getenv("LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP");
+            fprintf(stderr, "  hy4-shared-io   = %s (HY4 only; requires slot8 and direct shared-buffer reads)\n",
+                    overlap == nullptr ? "on (default)" :
+                    std::string_view(overlap) == "1" ? "on (env)" : "off (env)");
+            const char * hc_post = std::getenv("LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST");
+            fprintf(stderr, "  hy4-hc-post     = %s (HY4 only)\n",
+                    hc_post == nullptr ? "broadcast (default)" :
+                    std::string_view(hc_post) == "1" ? "broadcast (env)" : "stream-loop (env)");
+        }
         fprintf(stderr, "  parallel-reads   = %s\n", env_flag_with_default(
                 "LLAMA_FLASH_MOE_EXPERIMENTAL_PARALLEL_SLOT_READS", macos_ssd_slot_io_defaults));
         fprintf(stderr, "  async-upload     = %s\n", env_flag("LLAMA_FLASH_MOE_EXPERIMENTAL_ASYNC_SLOT_UPLOAD"));
@@ -1126,11 +1145,7 @@ int main(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ] [ tokens - prefill: %d, decode: %d ]\n",
-                    timings.prompt_per_second,
-                    timings.predicted_per_second,
-                    timings.prompt_n,
-                    timings.predicted_n);
+            print_response_timings(timings, !params.no_perf);
             console::set_display(DISPLAY_TYPE_RESET);
         }
 
@@ -1274,11 +1289,7 @@ int main(int argc, char ** argv) {
         if (params.show_timings) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
-            console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ] [ tokens - prefill: %d, decode: %d ]\n",
-                    timings.prompt_per_second,
-                    timings.predicted_per_second,
-                    timings.prompt_n,
-                    timings.predicted_n);
+            print_response_timings(timings, !params.no_perf);
             console::set_display(DISPLAY_TYPE_RESET);
         }
 

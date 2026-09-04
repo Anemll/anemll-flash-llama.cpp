@@ -293,19 +293,267 @@ dequantized weights, and compares fused, reference and generic outputs with each
 other. Measured on an M5 Max: fused and reference differ by exactly 0, and all
 three Metal paths stay within 2.5e-7 of the exact result relative to the output
 maximum. `test-flashmoe-slot8-hyv4 --bench 50` also reports per-layer operator
-timings at the HY4 shape: the fused kernels take 0.25-0.32 ms of GPU time per
-layer versus 0.58-0.63 ms for the reference encoder and 0.26-0.31 ms for the
-generic `mul_mat_id` graph.
+timings at the HY4 shape: the fused kernels take approximately 0.25-0.32 ms
+per layer versus 0.58-0.63 ms for the reference encoder and 0.26-0.31 ms for
+the generic `mul_mat_id` graph. These are marginal wall-time estimates from
+chained operations with submission amortized, not hardware GPU timestamps.
 
-Expectations for end-to-end decode with the 8-slot bank: the profile is SSD
-bound (roughly 80% expert I/O, 20% upload), so `--slot8` does not change the
-tokens-per-second figure; it removes about 25 ms per token relative to the
-reference encoder and is on par with the generic path. Greedy text can differ
-from the generic path after a few tokens: the operator outputs differ only by F32
-reordering (about 1e-7 relative), but a near-tie in the router or the sampler
-can flip a token, after which the sequences diverge. The reference encoder shows
-the same behaviour, and a teacher-forced comparison of the two paths agrees to
-5e-5 in the logits on the first decoded token.
+End-to-end decode is substantially affected by SSD misses and per-layer GPU
+synchronization. Kernel-only timings are not a whole-model speedup, and OS
+page-cache changes must not be attributed to fusion. With direct shared-buffer
+writes, expert-upload time should be zero.
+
+Earlier end-to-end results predate the slot-reservation correction described
+below. Do not attribute unexplained output differences only to F32 rounding:
+first verify the expert-to-slot mapping. Small differences between generic and
+fused arithmetic can still change near-tied routing decisions; numerical and
+token-equivalence tests are both required.
+
+### Slot reservation correctness (2026-09-04)
+
+The runtime now protects **all requested resident experts before reserving any
+misses**. Previously, an early miss could evict an expert needed later in the
+same top-8 request, assigning two different experts to the same slot. This
+affected both generic and fused slot-bank execution, not the packed sidecar
+format. The same protection is applied to temporal/oracle prefetch reservations.
+No model conversion or re-download is needed; rebuild the runtime.
+
+```bash
+cmake -S . -B build -DGGML_METAL=ON -DLLAMA_FLASH_MOE_GPU_BANK=ON \
+  -DLLAMA_BUILD_TESTS=ON -DBUILD_TESTING=ON
+cmake --build build --target llama-cli test-flashmoe-slot-reservation \
+  test-flashmoe-slot8-hyv4 test-quantize-fns test-flashmoe-split-repack -j 12
+ctest --test-dir build --output-on-failure \
+  -R '^(test-flashmoe-slot-reservation|test-flashmoe-slot8-hyv4|test-quantize-fns|test-flashmoe-split-repack)$'
+```
+
+The reservation regression test uses the production protection/eviction
+helpers and covers 8/16/96-slot banks, repeated IDs, overflow, epoch wrap, and
+40,000 randomized requests. It can additionally replay an expert trace:
+
+```bash
+./build/bin/test-flashmoe-slot-reservation --trace /path/to/recorded.trace.jsonl
+```
+
+The checked HY4 `Hello` raw completion produced the same 16 greedy token IDs
+with 8 slots, 96 slots, the generic path, the one-op reference path, and an
+all-resident replay. The formerly failing 12,012-call trace now passes the
+reservation test with no expert-slot aliases. These are bounded checks, not
+a claim of full-model quality evaluation.
+
+The final rebuilt runtime also passed a 64-token raw `Hello` comparison:
+fused 8-slot, fused 96-slot and reference 96-slot execution produced identical
+greedy token IDs and bit-identical captured top-32 logits at every step. Each
+path emitted exactly 64 output-logit callbacks, with zero expert-slot aliases.
+
+The batched-read `source_wall` counter now measures elapsed batch time instead
+of falling back to the sum of parallel workers' service times. `source` remains
+summed service time and can exceed total runtime. Use `install`/`source_wall`
+for elapsed I/O comparisons. All-hit replay remains a diagnostic, not a
+deployable SSD throughput claim.
+
+The September 4 optimization sweep retained the correctness and profiling
+fixes and the shared-FFN overlap described below (now default-on for eligible HY4). Keep 96 slots and
+I/O split 4. More read workers,
+vectored reads, read-advice hints, alternate fused-kernel row counts and
+command-buffer scheduling were tested without a convincing improvement and
+are **not deployed switches**. A 104-slot bank consumed another 6.02 GiB but
+did not consistently improve TPS. These tests did not purge the OS page cache.
+
+The `--perf` table uses measured I/O wall time where available. The line
+`outside routed host` includes both dense and routed GPU execution, waits and
+graph scheduling; it must not be interpreted as dense-only kernel time.
+The downstream evaluation callback is also no longer invoked twice per output.
+
+### Exact demand-read/shared-FFN overlap (HY4 default)
+
+After the router has selected the **actual eight experts**, this path starts
+miss reads in the background while Metal runs the independent shared FFN in
+that layer. It joins the reads and publishes slot IDs **before** the routed
+FFN executes. This is not speculative next-layer prediction: it issues the same
+reads, preserves packed STQ1_0/IQ2_XXS/IQ3_XXS/IQ4_XS bytes, and does not change
+top-8, arithmetic, or the final shared+routed addition order.
+
+It is enabled by default for eligible HY4 runs; no environment prefix is needed:
+
+```bash
+./build/bin/llama-cli \
+  -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar \
+  --moe-slot-bank 96 --moe-topk 8 --moe-cache-io-split 4 --slot8 --fp16head \
+  -fit on -ub 1 -b 1 -c 2048 -ngl 999 \
+  --no-warmup -st --temp 0 --seed 1 \
+  -p "Make a game of Tetris in HTML" -n 128 --perf
+```
+
+Default is **ON for eligible HY4**. Set
+`LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP=0` to disable, `=1` to explicitly enable,
+or unset it to restore the default. This is a runtime switch, not a new CMake
+option. It requires HY4 single-token `--slot8`
+and direct CPU-visible bank writes with batched reads. Unsupported settings
+use synchronous installs: generic/non-slot8 execution, resident/oracle modes,
+runtime transcoding, staging copies, async upload, temporal/hidden prediction,
+and demand striping/distribution/racing are excluded. macOS SSD mode already
+defaults to CPU-visible slot writes and parallel reads; explicitly setting
+either existing option to `0` can disable eligibility.
+
+The CLI settings show `hy4-shared-io = on (default)` when unset, or
+`on (env)` / `off (env)` for an explicit override. The line labels the policy
+as HY4-only; other model architectures are unchanged. Actual execution
+is separately proven by this line (a requested setting alone is not proof):
+
+```text
+HY4 shared-FFN I/O overlap ACTIVE: exact demand reads, join before routed compute
+```
+
+The shutdown log reports overlap calls, join wait, and worker time completed
+outside the join. Hidden worker time is **not** the net TPS gain: thread launch,
+graph scheduling and GPU synchronization still cost time. With overlap on,
+`install`/`source_wall` retain worker elapsed time; the `--perf` table's
+`Expert I/O + join wait` row counts synchronous reads plus blocking join time,
+excluding overlapped worker work. `--perf` also prints precise decode elapsed
+milliseconds and generation TPS below the CLI's rounded timing summary.
+
+Matched OFF/ON/ON/OFF runs on the 128 GiB M5 Max, AC power, 96 slots, split 4,
+`--slot8 --fp16head`, context 2048 and 128 predictions measured:
+
+| Prompt | OFF TPS | ON TPS | Gain |
+|---|---:|---:|---:|
+| Tetris HTML | 4.920 | 5.009 | 1.8% |
+| SSD versus RAM | 4.676 | 4.777 | 2.2% |
+
+After cancellation/profiling hardening, a reversed ON/OFF/OFF/ON Tetris check
+on the final build confirmed **4.916 → 5.025 t/s (+2.2%)**, again with identical
+text, expert/slot traces and read volume.
+
+TPS is computed from the mean decode elapsed time for each pair (127 decode
+tokens). Both prompts produced identical text and expert/slot traces ON/OFF.
+Read volume and call counts were unchanged. These are repeated local runs,
+not controlled cold-SSD measurements, and the existing direct-IQ2-LUT CMake
+cache was OFF for both arms. Do not extrapolate this small gain into a claimed
+6–8 t/s result or a kernel-only speedup.
+
+The runtime drains outstanding work before context/graph reuse or destruction
+and invalidates affected slots if direct reads fail. Native interruption/reuse
+testing is available with the real local package (not part of default CTest
+model downloads):
+
+```bash
+cmake --build build --target test-flashmoe-hyv4-lifecycle -j 12
+./build/bin/test-flashmoe-hyv4-lifecycle \
+  -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
+  --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar
+```
+
+This test reports backend-abort coverage separately: Metal may not poll its
+abort callback in these tiny graph segments. A skipped polling case is not
+proof that backend cancellation was exercised.
+
+Final rebuilt numerical checks: overlap OFF/ON at 96 slots, overlap ON at
+8 slots, forced reference at 96 slots, and direct writes disabled at 96 slots
+all matched **64 greedy token IDs and all 2,048 captured top-32 logits
+bit-for-bit**. The generic fallback with overlap requested stayed synchronous
+and matched the first 16 greedy token IDs. Cold-bank exceptions, callback stop,
+and repeated exceptions preserved full-vocabulary logits after context reuse.
+The four quantization/sidecar/reservation/Metal tests passed. These bounded
+checks do not replace a full-model quality evaluation or SSD fault injection.
+
+### Exact iHC post graph simplification (HY4 default)
+
+HY4's independent Hyper-Connections apply a post gate to each residual stream.
+The original graph emits a multiply and add for each stream, then concatenates
+the results. The broadcast graph replaces those repeated operations with
+repeat, multiply and add, preserving the same separate F32 multiplication and
+addition and the original output dtype. It does not change the stream
+reduction, attention, routing, quantization, or packed expert bytes.
+
+Both optimizations are now enabled by default for HY4 (overlap still requires
+the eligible SSD path). Run the same command without either environment prefix:
+
+```bash
+./build/bin/llama-cli \
+  -m ~/Models/HY4/Hy4-preview-Flash-STQ1_0/model-dense.gguf \
+  --moe-mode slot-bank \
+  --moe-sidecar ~/Models/HY4/Hy4-preview-Flash-STQ1_0/sidecar \
+  --moe-slot-bank 96 --moe-topk 8 --moe-cache-io-split 4 --slot8 --fp16head \
+  -fit on -ub 1 -b 1 -c 2048 -ngl 999 \
+  --no-warmup -st --temp 0 --seed 1 \
+  -p "Make a game of Tetris in HTML" -n 128 --perf
+```
+
+The broadcast switch is runtime-only and defaults **ON for HY4**. Set
+`LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST=0` to use the original stream-loop graph;
+unset it to restore the default, or set it to `1` to explicitly enable.
+No new CMake option or model conversion is required. After rebuilding,
+startup settings show the default or explicit override:
+
+```text
+hy4-hc-post = broadcast (default) (HY4 only)
+hy4-hc-post = broadcast (env) (HY4 only)
+hy4-hc-post = stream-loop (env) (HY4 only)
+```
+
+The settings line is visible at the CLI's normal log level. With `--verbose`,
+actual HY4 graph selection additionally reports
+`HY4 iHC post broadcast graph enabled`. Other architectures are unchanged.
+With `-fit on`, that first graph can be the fit dry run, whose logs are
+debug-level; `-lv 3` alone may not show this one-time additional message.
+
+For a baseline with both optimizations disabled, prefix the same command with
+`LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP=0 LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST=0`.
+Existing `=1` commands still work unchanged. This default change does not alter
+your slot count, I/O split, `--fp16head`, or IQ2-LUT compile-time selection.
+
+Default-on validation also covered 100 slots with I/O split 8: unset and
+explicit-both-`1` matched 32 token IDs and all 1,024 captured top-32 logit values
+exactly. Independent `0` overrides and both disabled matched an eight-token
+check, with overlap activation and startup labels verified in every case.
+
+Native CPU/Metal fixtures compare the production helper against the original
+graph, including F32/F16, 1/2/4/8 streams, multi-token input, padded strides,
+and the full 6144-by-4 shape. All 68 cases (34 Metal) matched bit-for-bit.
+The full-shape graph has 12 nodes instead of 30, including views and casts;
+node counts are not GPU dispatch counts. Run the checks with:
+
+```bash
+cmake -S . -B build -DGGML_METAL=ON -DLLAMA_FLASH_MOE_GPU_BANK=ON \
+  -DLLAMA_BUILD_TESTS=ON -DBUILD_TESTING=ON
+cmake --build build --target llama-cli test-hyv4-hc-post -j 12
+./build/bin/test-hyv4-hc-post --require-metal --bench 100
+```
+
+On the AC-powered 128 GiB M5 Max, an OFF/ON/ON/OFF Tetris comparison measured
+**5.042 → 5.168 generation t/s (+2.5%)** and 3.066 → 3.103 prompt t/s.
+Both arms used shared-I/O overlap ON, 96 slots, split 4, `--slot8 --fp16head`,
+context 2048, single-token batches, and the existing direct-IQ2-LUT build
+cache OFF. All four runs had identical text, complete expert/slot traces,
+168.80 GiB of application-level reads, zero uploads and zero slot aliases.
+Separately, 64 greedy token IDs and all 2,048 captured top-32 logit values
+matched the validated original graph exactly. These are bounded, repeated
+local tests, not controlled cold-SSD measurements or a full quality evaluation.
+After removing the rejected kernel experiments and rebuilding, a reversed
+ON/OFF pair confirmed **5.018 → 5.147 t/s (+2.6%)**. The five targeted regression
+tests passed, and the 64-token/logit comparison was again exact. Eight-slot
+interruption/reuse checks with broadcasting enabled also retained bit-identical
+full-vocabulary logits; backend-abort polling remained unexercised as described
+above.
+
+The parallel dense audit tested 16 Q5_K/Q6_K row/threadgroup layouts using
+actual dense GGUF tensors. All 162 full outputs were identical, but there was
+no convincing performance gain; the original dense kernels remain unchanged.
+Routed testing includes **STQ1_0** (Sherry's 1.25-bit payload, 1.3125 stored bpw),
+IQ2_XXS, IQ3_XXS and IQ4_XS, not only the IQ2 path.
+Multiple-SIMD-group routed layouts also passed numerical checks, but the best
+microbenchmark candidate did not establish a full-model gain. Those layouts
+were removed too; neither tiling experiment is a deployed runtime switch.
+
+The interruption review confirmed that exact host routing still requires a
+GPU boundary at each routed layer. A second wait at the shared-I/O join may
+be avoidable, but safely removing it requires preserving in-flight Metal
+command-buffer lifetime and error checks. That scheduler change is **not
+implemented**. Existing graph reuse is supported; do not assume that every
+decoded token necessarily rebuilds the graph.
 
 Keep the smoke context at or below 2048 until native HY4 DSA cache support is
 implemented; raising `-c` alone does not make this first port equivalent to the

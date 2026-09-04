@@ -1,6 +1,11 @@
 #include "models.h"
+#include "hyv4-hc.h"
+#include "llama-impl.h"
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 // HY4 uses independent Hyper-Connections (iHC).  Unlike DeepSeek-V4 HC,
 // iHC has only a pre-reduction and per-stream post gate: it does not have the
@@ -84,6 +89,15 @@ static ggml_tensor * hyv4_hc_post(
         ggml_tensor * post,
         int64_t n_hc,
         int64_t n_embd) {
+    const char * broadcast = std::getenv("LLAMA_FLASH_MOE_HY4_HC_POST_BROADCAST");
+    // This helper is HY4-only. Preserve the original graph as an explicit opt-out.
+    if (broadcast == nullptr || std::strcmp(broadcast, "1") == 0) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+            LLAMA_LOG_INFO("HY4 iHC post broadcast graph enabled: F32 multiply then add, original stream order\n");
+        }
+        return hyv4_hc_post_broadcast(ctx, x, residual, post, n_hc, n_embd);
+    }
     const int64_t n_tokens = x->ne[1];
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == n_hc);
@@ -251,6 +265,14 @@ llm_build_hyv4::llm_build_hyv4(const llama_model & model, const llm_graph_params
                     layer.ffn_down_shexp, nullptr, nullptr,
                     nullptr,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
+            if (n_tokens == 1 && moe_out->op == GGML_OP_FLASHMOE_SLOT8_FFN &&
+                    flash_moe_slot_runtime != nullptr && flash_moe_slot_runtime->overlaps_shared_io(il)) {
+                // The top-k subtree has already been expanded by build_moe_ffn.
+                // Execute the independent shared FFN while its exact routed
+                // misses load, then join before expanding the routed FFN.
+                cb(shared_out, "ffn_moe_io_join", il);
+                ggml_build_forward_expand(gf, shared_out);
+            }
             cur = ggml_add(ctx0, moe_out, shared_out);
             cb(cur, "ffn_out", il);
         }

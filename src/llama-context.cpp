@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-flash-moe-slots.h"
 
 #include "llama-arch.h"
 #include "llama-impl.h"
@@ -1133,6 +1134,11 @@ public:
     }
 
     ~llama_flash_moe_slot_runtime() override {
+        // The reader uses this runtime's pool and file descriptors. Drain it
+        // before stopping either, including on cancellation/error paths.
+        if (shared_io_future.valid()) {
+            shared_io_future.wait();
+        }
         for (auto & slot : prefill_prefetch_stage_slots) {
             if (slot.future.valid()) {
                 slot.future.wait();
@@ -1195,6 +1201,23 @@ public:
         return uses_layer(layer) &&
                 (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_HY_V3) &&
                 !native_slot_map_disabled();
+    }
+
+    bool overlaps_shared_io(int layer) const override {
+        const char * enabled = std::getenv("LLAMA_FLASH_MOE_HY4_SHARED_IO_OVERLAP");
+        // Default on for eligible HY4 only; an explicit 0 keeps synchronous installs.
+        if ((enabled != nullptr && std::strcmp(enabled, "1") != 0) || model.arch != LLM_ARCH_HYV4 || fused_slot_experts != 8 ||
+                !uses_layer(layer) || transient_shared_scratch || resident_bank_source || oracle_all_hit || oracle_prefetch ||
+                temporal_prefetch || prediction_enabled() || hidden_predictor.enabled || async_slot_upload || mixed_slot_buffer ||
+                demand_stripe_enabled || demand_distribute_enabled || demand_concurrent_enabled ||
+                !effective_batched_install_reads() || force_backend_tensor_writes_enabled()) {
+            return false;
+        }
+        const auto & state = layers[layer];
+        return !layer_has_runtime_transcode(state) &&
+                tensor_slot_cpu_visible_data(state.gate_tensor, state.gate_entry, 0) != nullptr &&
+                tensor_slot_cpu_visible_data(state.up_tensor, state.up_entry, 0) != nullptr &&
+                tensor_slot_cpu_visible_data(state.down_tensor, state.down_entry, 0) != nullptr;
     }
 
     int32_t fused_slot_expert_count(int layer) const override {
@@ -1303,6 +1326,9 @@ public:
     bool wants_tensor(const ggml_tensor * tensor) const override {
         int layer = -1;
         const char * name = ggml_get_name(tensor);
+        if (std::strncmp(name, "ffn_moe_io_join-", 16) == 0 && sscanf(name + 16, "%d", &layer) == 1) {
+            return shared_io_future.valid() && shared_io_layer == layer;
+        }
         if (parse_topk_layer(name, layer)) {
             return uses_layer(layer) && !uses_native_slot_map(layer);
         }
@@ -1384,9 +1410,56 @@ public:
         oracle_primed = true;
     }
 
+    // Also called at the end of graph_compute: a downstream callback can stop
+    // evaluation between launch and join without destroying this context.
+    void finish_shared_io() {
+        if (!shared_io_future.valid()) {
+            return;
+        }
+        const int layer = shared_io_layer;
+        const int64_t join_start_us = ggml_time_us();
+        install_metrics install;
+        try {
+            install = shared_io_future.get();
+        } catch (...) {
+            // A failed direct read may have partially overwritten a victim.
+            // Invalidate every destination; none may subsequently be a hit.
+            auto & state = layers[layer];
+            for (const auto & load : loads) {
+                const int32_t old = state.slot_to_expert[load.second];
+                if (old >= 0) {
+                    state.expert_to_slot[old] = -1;
+                }
+                state.expert_to_slot[load.first] = -1;
+                state.slot_to_expert[load.second] = -1;
+            }
+            state.resident_count = std::count_if(state.slot_to_expert.begin(), state.slot_to_expert.end(),
+                    [](int32_t expert) { return expert >= 0; });
+            shared_io_layer = -1;
+            shared_io_ids = nullptr;
+            throw;
+        }
+        const int64_t wait_us = ggml_time_us() - join_start_us;
+        shared_io_wait_us += wait_us;
+        shared_io_hidden_us += std::max<int64_t>(0, install.install_us - wait_us);
+        auto & stats = layers[layer].stats;
+        stats.async_install_us += install.install_us;
+        stats.async_source_wall_us += install.source_wall_us;
+        stats.async_join_us += wait_us;
+        finish_topk_install(layer, shared_io_ids, shared_io_topk, 1, install, join_start_us - shared_io_prepare_us);
+        shared_io_layer = -1;
+        shared_io_ids = nullptr;
+    }
+
     bool handle_tensor(ggml_tensor * tensor) override {
         int layer = -1;
         const char * name = ggml_get_name(tensor);
+        if (std::strncmp(name, "ffn_moe_io_join-", 16) == 0 &&
+                sscanf(name + 16, "%d", &layer) == 1 && shared_io_future.valid()) {
+            GGML_ASSERT(shared_io_layer == layer);
+            finish_shared_io();
+            return true;
+        }
         if (hidden_predictor.enabled && parse_attn_norm_layer(name, layer)) {
             const int target_layer = hidden_predictor_target_layer(layer);
             if (target_layer >= 0) {
@@ -1452,6 +1525,7 @@ private:
     };
 
     struct layer_state;
+    struct install_metrics;
 
     struct reserved_slot {
         int32_t slot = -1;
@@ -1512,6 +1586,7 @@ private:
         reserved_slot result;
         result.slot = state.expert_to_slot[expert];
         if (result.slot >= 0) {
+            GGML_ASSERT(state.slot_to_expert[result.slot] == expert);
             state.slot_reserved_epoch[result.slot] = epoch;
             return result;
         }
@@ -1568,6 +1643,7 @@ private:
     void process_topk_tensor(int layer, const ggml_tensor * tensor, ggml_tensor * slot_ids_tensor) {
         GGML_ASSERT(uses_layer(layer));
         GGML_ASSERT(slot_ids_tensor != nullptr);
+        GGML_ASSERT(!shared_io_future.valid());
 
         auto & state = layers[layer];
 
@@ -1680,6 +1756,7 @@ private:
         const uint32_t epoch = next_request_epoch();
 
         const int64_t t_resolve_start_us = ggml_time_us();
+        flash_moe_protect_request_slots(topk_ids, state.expert_to_slot, state.slot_reserved_epoch, epoch);
         for (size_t i = 0; i < n_ids; ++i) {
             const int32_t expert = topk_ids[i];
             if (expert < 0 || expert >= expert_count) {
@@ -1716,7 +1793,30 @@ private:
         state.stats.miss_experts += loads.size();
         state.stats.hit_experts += touched_slots.size() - loads.size();
 
-        const install_metrics install = install_loads(state, loads);
+        if (n_tokens == 1 && n_expert_used == 8 && !loads.empty() && overlaps_shared_io(layer)) {
+            if (shared_io_calls == 0) {
+                std::fprintf(stderr, "%s: HY4 shared-FFN I/O overlap ACTIVE: exact demand reads, join before routed compute\n", __func__);
+            }
+            shared_io_layer = layer;
+            shared_io_ids = slot_ids_tensor;
+            shared_io_topk = n_expert_used;
+            shared_io_future = std::async(std::launch::async, [this, layer, pending = loads] {
+                return install_loads(layers[layer], pending);
+            });
+            shared_io_prepare_us = ggml_time_us() - t_handle_start_us;
+            ++shared_io_calls;
+            return;
+        }
+        finish_topk_install(layer, slot_ids_tensor, n_expert_used, n_tokens,
+                install_loads(state, loads), t_handle_start_us);
+    }
+
+    void finish_topk_install(int layer, ggml_tensor * slot_ids_tensor, int64_t n_expert_used, int64_t n_tokens,
+            const install_metrics & install, int64_t t_handle_start_us) {
+        auto & state = layers[layer];
+        for (size_t i = 0; i < topk_ids.size(); ++i) {
+            GGML_ASSERT(state.slot_to_expert[slot_ids[i]] == topk_ids[i]);
+        }
         state.stats.bytes_loaded += install.bytes;
         state.stats.pread_ops += install.pread_ops;
         state.stats.resident_copy_ops += install.resident_copy_ops;
@@ -1971,6 +2071,11 @@ private:
         uint64_t cold_loads = 0;
         uint64_t evict_loads = 0;
         int64_t total_us = 0;
+        // Worker service is retained above; these separate overlapped installs
+        // from time actually blocking the graph/decode thread.
+        int64_t async_install_us = 0;
+        int64_t async_source_wall_us = 0;
+        int64_t async_join_us = 0;
         int64_t topk_read_us = 0;
         int64_t slot_resolve_us = 0;
         int64_t install_us = 0;
@@ -2388,6 +2493,14 @@ private:
     size_t oracle_cursor = 0;
     FILE * trace_fp = nullptr;
     uint64_t trace_seq = 0;
+    std::future<install_metrics> shared_io_future;
+    int shared_io_layer = -1;
+    ggml_tensor * shared_io_ids = nullptr;
+    int64_t shared_io_topk = 0;
+    int64_t shared_io_prepare_us = 0;
+    uint64_t shared_io_calls = 0;
+    int64_t shared_io_wait_us = 0;
+    int64_t shared_io_hidden_us = 0;
 
     int32_t dedicated_prefill_layer_count() const {
         int32_t count = 0;
@@ -4838,11 +4951,14 @@ private:
             return double(bytes) / (1024.0 * 1024.0) / double(routed_layers);
         };
 
-        const int64_t source_accounted_us = prefill_profile ?
-                (total.source_wall_us > 0 ? total.source_wall_us : total.source_us) :
-                total.source_us;
+        const bool source_has_wall = total.source_wall_us > 0;
+        const bool shared_overlap = total.async_install_us > 0;
+        const int64_t source_accounted_us = shared_overlap ?
+                total.source_wall_us - total.async_source_wall_us + total.async_join_us :
+                source_has_wall ? total.source_wall_us : total.source_us;
+        const int64_t host_install_us = total.install_us - total.async_install_us + total.async_join_us;
         const int64_t routing_us = total.topk_read_us + total.slot_resolve_us;
-        const int64_t install_overhead_us = total.install_us - source_accounted_us - total.upload_us;
+        const int64_t install_overhead_us = host_install_us - source_accounted_us - total.upload_us;
         const int64_t slot_meta_us = total.slot_write_us + total.trace_write_us;
         const int64_t prefill_stage_us = total.prefill_stage_us;
         const int64_t prefill_replay_us = total.prefill_replay_us;
@@ -4852,7 +4968,7 @@ private:
                 total.total_us - routing_us - source_accounted_us - total.upload_us -
                         prefill_stage_us - prefill_replay_us - prefill_compute_us -
                         prefill_setup_us - slot_meta_us :
-                total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us -
+                total.total_us - total.topk_read_us - total.slot_resolve_us - host_install_us -
                         total.slot_write_us - total.trace_write_us;
 
         const int64_t breakdown_total_us = prefill_profile ?
@@ -4890,7 +5006,8 @@ private:
                 __func__, prefill_profile ? "ms/prompt" : "ms/token");
         LLAMA_LOG_INFO("%s: -----------------------------------------------------------------------------\n", __func__);
         log_row(prefill_profile ? "Routing + dedup plan" : "Routing + slot resolve", routing_us, 0);
-        log_row(prefill_profile ? "Expert I/O wall" : "Expert I/O source", source_accounted_us, total.bytes_loaded);
+        log_row(shared_overlap ? "Expert I/O + join wait" : source_has_wall ? "Expert I/O wall" : "Expert I/O service",
+                source_accounted_us, total.bytes_loaded);
         if (prefill_profile) {
             log_row("Expert staging", prefill_stage_us, total.prefill_stage_bytes);
             log_row("Bank replay", prefill_replay_us, total.prefill_replay_bytes);
@@ -4915,7 +5032,8 @@ private:
                 total_bytes_per_token_gib,
                 prefill_profile ?
                         " (prefill source row uses wall time; overlap details below)" :
-                        " (source/upload may exceed wall time under split/overlap)");
+                        shared_overlap ? " (I/O row = synchronous reads + async join wait; overlapped worker time excluded)" :
+                        " (I/O row uses measured wall time when available; source= summed worker service time)");
 
         if (prefill_profile) {
             const uint64_t dedup_saved = total.token_refs > total.unique_experts ? total.token_refs - total.unique_experts : 0;
@@ -5152,7 +5270,7 @@ private:
             const double dense_decode_pct =
                     have_overall_decode && overall_decode_ms > 0.0 ? 100.0 * dense_decode_ms / overall_decode_ms : 0.0;
             if (have_overall_decode) {
-                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s %.3f ms (%.1f%%), %srouted MoE:%s %.3f ms (%.1f%%)\n",
+                LLAMA_LOG_INFO("%s:   %soutside routed host:%s %.3f ms (%.1f%%), %srouted host:%s %.3f ms (%.1f%%)\n",
                         __func__,
                         ansi_label,
                         ansi_reset,
@@ -5162,8 +5280,9 @@ private:
                         ansi_reset,
                         routed_decode_ms,
                         routed_decode_pct);
+                LLAMA_LOG_INFO("%s:   outside routed host includes dense/routed GPU work, synchronization and graph scheduling; it is not dense-only GPU time\n", __func__);
             } else {
-                LLAMA_LOG_INFO("%s:   %sdense outside MoE:%s unavailable, %srouted MoE:%s %.3f ms\n",
+                LLAMA_LOG_INFO("%s:   %soutside routed host:%s unavailable, %srouted host:%s %.3f ms\n",
                         __func__,
                         ansi_label,
                         ansi_reset,
@@ -6370,6 +6489,7 @@ private:
         touched_slots.reserve(experts.size());
         loads.reserve(experts.size());
 
+        flash_moe_protect_request_slots(experts, state.expert_to_slot, state.slot_reserved_epoch, epoch);
         for (const int32_t expert : experts) {
             if (expert < 0 || expert >= expert_count) {
                 throw std::runtime_error(format(
@@ -6447,6 +6567,7 @@ private:
         touched_slots.reserve(record.experts.size());
         loads.reserve(record.experts.size());
 
+        flash_moe_protect_request_slots(record.experts, state.expert_to_slot, state.slot_reserved_epoch, epoch);
         for (const int32_t expert : record.experts) {
             if (expert < 0 || expert >= expert_count) {
                 throw std::runtime_error(format(
@@ -6835,6 +6956,9 @@ private:
         dst.cold_loads += src.cold_loads;
         dst.evict_loads += src.evict_loads;
         dst.total_us += src.total_us;
+        dst.async_install_us += src.async_install_us;
+        dst.async_source_wall_us += src.async_source_wall_us;
+        dst.async_join_us += src.async_join_us;
         dst.topk_read_us += src.topk_read_us;
         dst.slot_resolve_us += src.slot_resolve_us;
         dst.install_us += src.install_us;
@@ -6947,6 +7071,10 @@ private:
     }
 
     void log_runtime_summary() const {
+        if (shared_io_calls > 0) {
+            LLAMA_LOG_INFO("%s: HY4 shared-FFN I/O overlap calls=%" PRIu64 " join-wait=%.3f ms worker-time-hidden=%.3f ms\n",
+                    __func__, shared_io_calls, shared_io_wait_us / 1000.0, shared_io_hidden_us / 1000.0);
+        }
         routed_metrics total;
         std::vector<std::pair<int32_t, routed_metrics>> layer_metrics;
         layer_metrics.reserve(layers.size());
@@ -6973,7 +7101,8 @@ private:
         const double miss_per_call = total.calls > 0 ? double(total.miss_experts) / double(total.calls) : 0.0;
         const double miss_bytes_gib = total.bytes_loaded / 1024.0 / 1024.0 / 1024.0;
         const int64_t source_wall_us = total.source_wall_us > 0 ? total.source_wall_us : total.source_us;
-        const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
+        const int64_t host_install_us = total.install_us - total.async_install_us + total.async_join_us;
+        const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - host_install_us - total.slot_write_us - total.trace_write_us;
 
         LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms source_wall=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s concurrent=%s\n",
                 __func__,
@@ -7359,25 +7488,7 @@ private:
     }
 
     static int32_t select_slot(const layer_state & state, uint32_t epoch) {
-        for (int32_t slot = 0; slot < state.n_slots; ++slot) {
-            if (state.slot_reserved_epoch[slot] != epoch && state.slot_to_expert[slot] < 0) {
-                return slot;
-            }
-        }
-
-        int32_t victim = -1;
-        uint64_t oldest = std::numeric_limits<uint64_t>::max();
-        for (int32_t slot = 0; slot < state.n_slots; ++slot) {
-            if (state.slot_reserved_epoch[slot] == epoch) {
-                continue;
-            }
-            if (state.slot_age[slot] < oldest) {
-                oldest = state.slot_age[slot];
-                victim = slot;
-            }
-        }
-
-        return victim;
+        return flash_moe_select_slot(state.slot_to_expert, state.slot_age, state.slot_reserved_epoch, epoch);
     }
 
     static uint8_t * tensor_host_data(ggml_tensor * tensor) {
@@ -8603,7 +8714,9 @@ private:
                         }
                     }
 
+                    const int64_t t_source_start_us = ggml_time_us();
                     execute_pread_tasks(tasks);
+                    totals.source_wall_us += ggml_time_us() - t_source_start_us;
 
                     for (auto & slot_buffer : slot_buffers) {
                         for (const auto & install_field : slot_buffer.fields) {
@@ -8724,7 +8837,9 @@ private:
                         queue_chunk(load, state.down_tensor,    entries.down,    routed_family::down);
                     }
 
+                    const int64_t t_source_start_us = ggml_time_us();
                     execute_pread_tasks(tasks);
+                    totals.source_wall_us += ggml_time_us() - t_source_start_us;
 
                     for (auto & chunk : chunks) {
                         install_metrics metrics;
@@ -14380,10 +14495,10 @@ llm_graph_params llama_context::graph_params(
 
 bool llama_context::flash_moe_eval_cb(ggml_tensor * t, bool ask) {
     const bool internal_need = flash_moe_active_runtime && flash_moe_active_runtime->wants_tensor(t);
-    const bool downstream_need = flash_moe_cb_eval_downstream ?
-        flash_moe_cb_eval_downstream(t, ask, flash_moe_cb_eval_downstream_user_data) : false;
 
     if (ask) {
+        const bool downstream_need = flash_moe_cb_eval_downstream ?
+            flash_moe_cb_eval_downstream(t, true, flash_moe_cb_eval_downstream_user_data) : false;
         return internal_need || downstream_need;
     }
 
@@ -14393,6 +14508,11 @@ bool llama_context::flash_moe_eval_cb(ggml_tensor * t, bool ask) {
     }
     if (flash_moe_cb_eval_downstream) {
         ok = ok && flash_moe_cb_eval_downstream(t, ask, flash_moe_cb_eval_downstream_user_data);
+    }
+    if (!ok && flash_moe_slot_runtime) {
+        // The scheduler may advance to another split after an eval-callback
+        // stop, so do not leave a layer's reads pending across that boundary.
+        flash_moe_slot_runtime->finish_shared_io();
     }
 
     return ok;
@@ -14429,6 +14549,18 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: Flash-MoE graph compute failed: %s\n", __func__, err.what());
         set_last_error(err.what());
         status = GGML_STATUS_FAILED;
+    }
+
+    // Drain before graph buffers can be reset/reused, on success, early eval
+    // callback exit, backend cancellation, or an exception elsewhere in graph.
+    if (flash_moe_slot_runtime) {
+        try {
+            flash_moe_slot_runtime->finish_shared_io();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: Flash-MoE pending I/O failed: %s\n", __func__, err.what());
+            set_last_error(err.what());
+            status = GGML_STATUS_FAILED;
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

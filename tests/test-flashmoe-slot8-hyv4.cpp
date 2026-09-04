@@ -161,8 +161,8 @@ struct metal_case {
     ggml_tensor * ids = nullptr, * w = nullptr;
     ggml_tensor * out_op = nullptr, * out_generic = nullptr;
     ggml_cgraph * gf_op = nullptr, * gf_generic = nullptr;
-    // chained graphs (bench only): K dependent copies so per-op GPU time can be separated
-    // from the fixed command-buffer submit cost
+    // Chained graphs (bench only): estimate marginal per-op wall cost with K
+    // dependent copies. This amortizes submission, but is not a GPU timestamp.
     int chain_k = 0;
     ggml_tensor * out_chain_op = nullptr, * out_chain_generic = nullptr;
     ggml_cgraph * gf_chain_op = nullptr, * gf_chain_generic = nullptr;
@@ -376,7 +376,7 @@ static bool run_case(const case_spec & c, ggml_backend_t backend, int bench_iter
             unsetenv("LLAMA_FLASH_MOE_SLOT8_REFERENCE");
             const double generic_chain_ms = time_graph_ms(backend, m.gf_chain_generic, bench_iters);
             const double k1 = m.chain_k - 1;
-            printf("    per-op GPU time from %d chained ops (submit cost removed): fused=%.3f ms reference=%.3f ms generic=%.3f ms\n",
+            printf("    per-op wall estimate from %d chained ops (submission amortized): fused=%.3f ms reference=%.3f ms generic=%.3f ms\n",
                     m.chain_k,
                     (fused_chain_ms - fused_ms) / k1,
                     (reference_chain_ms - reference_ms) / k1,

@@ -31,6 +31,7 @@ struct llm_flash_moe_slot_runtime_i {
     virtual ~llm_flash_moe_slot_runtime_i() = default;
     virtual bool uses_layer(int layer) const = 0;
     virtual bool uses_native_slot_map(int layer) const = 0;
+    virtual bool overlaps_shared_io(int layer) const { (void) layer; return false; }
     // Returns the requested fused routed width (4 or 8) for a slot-bank layer.
     // Graph-shape and exact effective top-K eligibility are checked in build_moe_ffn.
     virtual int32_t fused_slot_expert_count(int layer) const { (void) layer; return 0; }
