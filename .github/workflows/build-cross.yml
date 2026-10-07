@@ -12,8 +12,8 @@ on:
       'ggml/src/arch/loongarch/*'
     ]
   # run once every week
-  schedule:
-    - cron: '0 0 * * 0'
+  # schedule:  # disabled to stop Actions email spam
+    # - cron: '0 0 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
